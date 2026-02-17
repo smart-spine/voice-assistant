@@ -233,7 +233,96 @@ async function openMeetPage({ browser, config }) {
   await clickJoinButton(page);
   void keepMicUnmuted(page, 120000);
 
-  return page;
+  const joinState = await waitForMeetJoinState(page, { timeoutMs: 18000 });
+  return { page, joinState };
+}
+
+async function waitForMeetJoinState(page, { timeoutMs = 18000, pollMs = 900 } = {}) {
+  const startedAt = Date.now();
+  let lastState = {
+    status: "unknown",
+    url: "",
+    matched: []
+  };
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      lastState = await detectMeetJoinState(page);
+    } catch (_) {
+      // Ignore transient navigation/evaluation failures.
+    }
+
+    if (lastState.status === "joined" || lastState.status === "auth_required") {
+      return lastState;
+    }
+
+    await sleep(pollMs);
+  }
+
+  return lastState;
+}
+
+async function detectMeetJoinState(page) {
+  return page.evaluate(() => {
+    const url = String(window.location.href || "");
+    const normalizedUrl = url.toLowerCase();
+
+    const authRequiredByUrl =
+      normalizedUrl.includes("accounts.google.com") ||
+      normalizedUrl.includes("/signin") ||
+      normalizedUrl.includes("servicelogin");
+
+    const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
+    const labels = controls.map((el) =>
+      `${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .trim()
+    );
+
+    const hasAny = (phrases) =>
+      phrases.some((phrase) => labels.some((label) => label.includes(phrase)));
+
+    const hasLeaveControl = hasAny([
+      "leave call",
+      "hang up",
+      "end call",
+      "покинуть звонок",
+      "покинуть встречу",
+      "завершить звонок",
+      "отключиться"
+    ]);
+
+    const hasJoinControl = hasAny([
+      "join now",
+      "ask to join",
+      "присоединиться",
+      "попросить присоединиться"
+    ]);
+
+    const bodyText = String(document.body?.innerText || "")
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+    const authRequiredByText =
+      bodyText.includes("sign in") ||
+      bodyText.includes("войдите") ||
+      bodyText.includes("войти");
+
+    let status = "unknown";
+    if (hasLeaveControl) {
+      status = "joined";
+    } else if (authRequiredByUrl || authRequiredByText) {
+      status = "auth_required";
+    } else if (hasJoinControl) {
+      status = "prejoin";
+    }
+
+    return {
+      status,
+      url,
+      matched: labels.filter(Boolean).slice(0, 30)
+    };
+  });
 }
 
 async function tryTypeBotName(page, botName) {

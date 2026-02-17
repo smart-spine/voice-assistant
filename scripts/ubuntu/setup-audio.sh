@@ -4,9 +4,11 @@ set -euo pipefail
 SINK_RX_NAME="${SINK_RX_NAME:-meet_rx}"
 SINK_TX_NAME="${SINK_TX_NAME:-meet_tx}"
 SOURCE_TX_NAME="${SOURCE_TX_NAME:-meet_tx_mic}"
+SOURCE_RX_NAME="${SOURCE_RX_NAME:-meet_rx_in}"
 SINK_RX_DESC="${SINK_RX_DESC:-Meet-RX}"
 SINK_TX_DESC="${SINK_TX_DESC:-Meet-TX}"
 SOURCE_TX_DESC="${SOURCE_TX_DESC:-Meet-TX-Mic}"
+SOURCE_RX_DESC="${SOURCE_RX_DESC:-Meet-RX-In}"
 
 if ! command -v pulseaudio >/dev/null 2>&1; then
   echo "[audio] pulseaudio is not installed."
@@ -62,6 +64,7 @@ ensure_source() {
 ensure_sink "$SINK_RX_NAME" "$SINK_RX_DESC"
 ensure_sink "$SINK_TX_NAME" "$SINK_TX_DESC"
 ensure_source "$SOURCE_TX_NAME" "$SOURCE_TX_DESC" "$SINK_TX_NAME.monitor"
+ensure_source "$SOURCE_RX_NAME" "$SOURCE_RX_DESC" "$SINK_RX_NAME.monitor"
 
 pactl set-default-sink "$SINK_RX_NAME" || true
 pactl set-default-source "$SOURCE_TX_NAME" || true
@@ -75,5 +78,5 @@ echo "[audio] sources:"
 pactl list short sources
 echo
 echo "[audio] recommended env:"
-echo "OPENAI_STT_DEVICE_LABEL=Monitor of $SINK_RX_DESC"
+echo "OPENAI_STT_DEVICE_LABEL=$SOURCE_RX_DESC"
 echo "BRIDGE_TTS_OUTPUT_DEVICE_LABEL=$SINK_TX_DESC"

@@ -50,7 +50,7 @@ export OPENAI_STT_PREFER_LOOPBACK="${OPENAI_STT_PREFER_LOOPBACK:-true}"
 export CHROME_USER_DATA_DIR="${CHROME_USER_DATA_DIR:-.chrome-profile}"
 
 if [[ -z "${OPENAI_STT_DEVICE_LABEL:-}" ]] || [[ "${OPENAI_STT_DEVICE_LABEL,,}" == *"blackhole"* ]]; then
-  export OPENAI_STT_DEVICE_LABEL="Monitor of Meet-RX"
+  export OPENAI_STT_DEVICE_LABEL="Meet-RX-In"
 fi
 
 if [[ -z "${BRIDGE_TTS_OUTPUT_DEVICE_LABEL:-}" ]] || [[ "${BRIDGE_TTS_OUTPUT_DEVICE_LABEL,,}" == *"blackhole"* ]]; then

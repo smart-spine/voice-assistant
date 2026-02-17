@@ -446,12 +446,30 @@ class BotSession {
       });
 
       this.info("Opening Google Meet...");
-      const meetPage = await openMeetPage({
+      const meetResult = await openMeetPage({
         browser: this.browser,
         config: this.sessionConfig
       });
+      const meetPage = meetResult?.page || meetResult;
+      const meetJoinState =
+        meetResult && typeof meetResult === "object"
+          ? meetResult.joinState
+          : undefined;
       this.meetPage = meetPage;
-      this.info("Meet page ready (join attempt executed).");
+      if (meetJoinState?.status === "joined") {
+        this.info("Meet joined successfully.");
+      } else if (meetJoinState?.status === "auth_required") {
+        const joinUrl = String(meetJoinState?.url || this.sessionConfig.meetUrl || "");
+        throw new Error(
+          `Meet authentication is required before joining (${joinUrl}). Log in with the same CHROME_USER_DATA_DIR and retry.`
+        );
+      } else {
+        this.info(
+          `Meet page ready (join attempt executed, state=${String(
+            meetJoinState?.status || "unknown"
+          )}).`
+        );
+      }
 
       const openAiTurnSilenceMs = Math.max(
         150,

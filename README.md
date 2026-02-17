@@ -91,8 +91,9 @@ What this script does:
   - sink `meet_rx` (`Meet-RX`) for incoming call audio,
   - sink `meet_tx` (`Meet-TX`) for bot TTS out,
   - source `meet_tx_mic` (`Meet-TX-Mic`) for Meet microphone,
+  - source `meet_rx_in` (`Meet-RX-In`) for STT capture from remote participants,
 - exports defaults:
-  - `OPENAI_STT_DEVICE_LABEL=Monitor of Meet-RX`
+  - `OPENAI_STT_DEVICE_LABEL=Meet-RX-In`
   - `BRIDGE_TTS_OUTPUT_DEVICE_LABEL=Meet-TX`
 
 Recommended first-run check:
