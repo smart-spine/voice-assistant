@@ -1,0 +1,14 @@
+services:
+  meet-voice-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: meet-voice-bot
+    env_file:
+      - .env
+    volumes:
+      - ./.chrome-profile:/app/.chrome-profile
+    shm_size: "1gb"
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

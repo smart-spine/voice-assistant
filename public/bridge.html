@@ -1,0 +1,999 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Meet Voice Bot Bridge</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --surface: #1e293b;
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --ok: #16a34a;
+        --warn: #ea580c;
+      }
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top right, #1d4ed8, var(--bg) 45%);
+        color: var(--text);
+      }
+      .panel {
+        max-width: 900px;
+        margin: 24px auto;
+        padding: 20px;
+        background: color-mix(in srgb, var(--surface) 88%, black);
+        border: 1px solid #334155;
+        border-radius: 12px;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 22px;
+      }
+      .status {
+        margin: 0 0 16px;
+        color: var(--muted);
+      }
+      .status strong {
+        color: var(--ok);
+      }
+      .status strong.warn {
+        color: var(--warn);
+      }
+      #log {
+        margin: 0;
+        padding: 12px;
+        white-space: pre-wrap;
+        font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: #020617;
+        border-radius: 8px;
+        min-height: 220px;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="panel">
+      <h1>Meet Voice Bot Bridge</h1>
+      <p class="status">
+        Recognition:
+        <strong id="recognitionState">starting...</strong>
+      </p>
+      <p class="status">
+        Speech synthesis:
+        <strong id="speechState">idle</strong>
+      </p>
+      <pre id="log"></pre>
+    </main>
+
+    <script>
+      (() => {
+        const state = {
+          speaking: false,
+          shouldListen: false,
+          audioUnlocked: false,
+          language: "en-US",
+          silenceMs: 1000,
+          turnSilenceMs: 700,
+          ttsOutputDeviceId: "",
+          ttsOutputDeviceLabel: "",
+          ttsOutputConfigured: false,
+          ttsOutputSupportLogged: false,
+          stt: {
+            active: false,
+            stream: null,
+            chunkMs: 1200,
+            deviceId: "",
+            audioContext: null,
+            sourceNode: null,
+            processorNode: null,
+            sinkNode: null,
+            flushTimer: null,
+            pcmFrames: [],
+            sampleRate: 48000,
+            flushInFlight: false,
+            preferLoopback: true,
+            signalPeak: 0,
+            gateUntilMs: 0,
+            minSignalPeak: 0.004,
+            lastSilenceDropLogAtMs: 0,
+            vadState: "idle",
+            lastVoiceAtMs: 0,
+            segmentStartedAtMs: 0,
+            bufferedSamples: 0,
+            vadThreshold: 0.015,
+            hangoverMs: 700,
+            segmentMinMs: 900,
+            segmentMaxMs: 7000,
+            lastSegmentDropLogAtMs: 0
+          },
+          currentPlayback: null
+        };
+
+        let unlockAudioContext = null;
+        const LOOPBACK_INPUT_REGEX =
+          /(blackhole|loopback|soundflower|vb-?cable|cable output|monitor of|virtual|aggregate)/i;
+
+        const recognitionStateEl = document.getElementById("recognitionState");
+        const speechStateEl = document.getElementById("speechState");
+        const logEl = document.getElementById("log");
+
+        function setRecognitionState(text, warning = false) {
+          recognitionStateEl.textContent = text;
+          recognitionStateEl.className = warning ? "warn" : "";
+        }
+
+        function setSpeechState(text, warning = false) {
+          speechStateEl.textContent = text;
+          speechStateEl.className = warning ? "warn" : "";
+        }
+
+        function addLog(message) {
+          const ts = new Date().toISOString();
+          const line = `[${ts}] ${message}`;
+          logEl.textContent = `${line}\n${logEl.textContent}`.slice(0, 10000);
+          if (typeof window.notifyBridgeLog === "function") {
+            Promise.resolve(window.notifyBridgeLog(message)).catch(() => {});
+          }
+        }
+
+        function parseQuery() {
+          const params = new URLSearchParams(window.location.search);
+          state.language = params.get("lang") || state.language;
+          state.silenceMs = Number(params.get("silenceMs")) || state.silenceMs;
+          state.turnSilenceMs =
+            Number(params.get("turnSilenceMs")) || state.turnSilenceMs;
+          state.ttsOutputDeviceId =
+            (params.get("ttsOutputDeviceId") || state.ttsOutputDeviceId || "").trim();
+          state.ttsOutputDeviceLabel =
+            (
+              params.get("ttsOutputDeviceLabel") ||
+              state.ttsOutputDeviceLabel ||
+              ""
+            ).trim();
+        }
+
+        function bytesToBase64(bytes) {
+          let binary = "";
+          const chunkSize = 0x8000;
+          for (let index = 0; index < bytes.length; index += chunkSize) {
+            const slice = bytes.subarray(index, index + chunkSize);
+            binary += String.fromCharCode(...slice);
+          }
+          return btoa(binary);
+        }
+
+        function formatDeviceLabel(device, index) {
+          const label = String(device?.label || "").trim() || `audioinput#${index + 1}`;
+          const id = String(device?.deviceId || "").trim() || "unknown";
+          return `${label} [${id}]`;
+        }
+
+        async function listAudioInputDevices() {
+          try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            return devices.filter((device) => device.kind === "audioinput");
+          } catch (_) {
+            return [];
+          }
+        }
+
+        async function listAudioOutputDevices() {
+          try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            return devices.filter((device) => device.kind === "audiooutput");
+          } catch (_) {
+            return [];
+          }
+        }
+
+        function findDeviceByLabel(devices, requestedLabel) {
+          if (!requestedLabel) {
+            return null;
+          }
+          const needle = requestedLabel.toLowerCase().trim();
+          if (!needle) {
+            return null;
+          }
+          return (
+            devices.find((device) =>
+              String(device.label || "")
+                .toLowerCase()
+                .includes(needle)
+            ) || null
+          );
+        }
+
+        async function applyTtsOutputDevice(audioEl) {
+          if (!audioEl || typeof audioEl.setSinkId !== "function") {
+            if (!state.ttsOutputSupportLogged) {
+              addLog("tts output device routing is unavailable; using default output.");
+              state.ttsOutputSupportLogged = true;
+            }
+            return;
+          }
+
+          let targetDeviceId = state.ttsOutputDeviceId;
+
+          if (!targetDeviceId && state.ttsOutputDeviceLabel) {
+            const outputs = await listAudioOutputDevices();
+            const byLabel = findDeviceByLabel(outputs, state.ttsOutputDeviceLabel);
+            if (byLabel?.deviceId) {
+              targetDeviceId = byLabel.deviceId;
+              state.ttsOutputDeviceId = byLabel.deviceId;
+              addLog(
+                `tts output selected by label: ${byLabel.label || "unknown"} [${byLabel.deviceId}]`
+              );
+            } else if (!state.ttsOutputConfigured) {
+              const visibleOutputs = outputs.length
+                ? outputs
+                    .map(
+                      (device, index) =>
+                        `${String(device?.label || "").trim() || `audiooutput#${index + 1}`} [${String(device?.deviceId || "").trim() || "unknown"}]`
+                    )
+                    .join(" | ")
+                : "none detected";
+              addLog(`tts output devices: ${visibleOutputs}`);
+              addLog(
+                `tts output device label not found: "${state.ttsOutputDeviceLabel}" (using default output)`
+              );
+            }
+          }
+
+          if (!targetDeviceId) {
+            return;
+          }
+
+          try {
+            await audioEl.setSinkId(targetDeviceId);
+            if (!state.ttsOutputConfigured) {
+              addLog(`tts output routed to deviceId=${targetDeviceId}`);
+              state.ttsOutputConfigured = true;
+            }
+          } catch (err) {
+            if (!state.ttsOutputConfigured) {
+              addLog(
+                `tts output routing failed for deviceId=${targetDeviceId}: ${err?.message || err}`
+              );
+              state.ttsOutputConfigured = true;
+            }
+          }
+        }
+
+        function findLoopbackDevice(devices) {
+          return (
+            devices.find((device) =>
+              LOOPBACK_INPUT_REGEX.test(String(device.label || ""))
+            ) || null
+          );
+        }
+
+        async function ensureInputLabelsAvailable() {
+          let inputs = await listAudioInputDevices();
+          const hasLabels = inputs.some((device) => String(device.label || "").trim());
+          if (hasLabels || inputs.length === 0) {
+            return inputs;
+          }
+
+          // On some browsers labels are hidden until at least one media permission grant.
+          try {
+            const probe = await navigator.mediaDevices.getUserMedia({
+              audio: true,
+              video: false
+            });
+            for (const track of probe.getTracks()) {
+              try {
+                track.stop();
+              } catch (_) {
+                // Ignore track stop errors.
+              }
+            }
+          } catch (_) {
+            // Ignore permission probe failures.
+          }
+
+          inputs = await listAudioInputDevices();
+          return inputs;
+        }
+
+        function float32ToInt16Pcm(floatArray) {
+          const pcm = new Int16Array(floatArray.length);
+          for (let index = 0; index < floatArray.length; index += 1) {
+            const sample = Math.max(-1, Math.min(1, floatArray[index]));
+            pcm[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+          }
+          return pcm;
+        }
+
+        function concatInt16Chunks(chunks) {
+          let totalLength = 0;
+          for (const chunk of chunks) {
+            totalLength += chunk.length;
+          }
+
+          const merged = new Int16Array(totalLength);
+          let offset = 0;
+          for (const chunk of chunks) {
+            merged.set(chunk, offset);
+            offset += chunk.length;
+          }
+          return merged;
+        }
+
+        function encodeWavPcm16(samples, sampleRate, channels = 1) {
+          const bytesPerSample = 2;
+          const dataByteLength = samples.length * bytesPerSample;
+          const blockAlign = channels * bytesPerSample;
+          const byteRate = sampleRate * blockAlign;
+          const buffer = new ArrayBuffer(44 + dataByteLength);
+          const view = new DataView(buffer);
+
+          const writeAscii = (offset, value) => {
+            for (let index = 0; index < value.length; index += 1) {
+              view.setUint8(offset + index, value.charCodeAt(index));
+            }
+          };
+
+          writeAscii(0, "RIFF");
+          view.setUint32(4, 36 + dataByteLength, true);
+          writeAscii(8, "WAVE");
+          writeAscii(12, "fmt ");
+          view.setUint32(16, 16, true);
+          view.setUint16(20, 1, true);
+          view.setUint16(22, channels, true);
+          view.setUint32(24, sampleRate, true);
+          view.setUint32(28, byteRate, true);
+          view.setUint16(32, blockAlign, true);
+          view.setUint16(34, 16, true);
+          writeAscii(36, "data");
+          view.setUint32(40, dataByteLength, true);
+
+          let offset = 44;
+          for (let index = 0; index < samples.length; index += 1) {
+            view.setInt16(offset, samples[index], true);
+            offset += 2;
+          }
+
+          return new Uint8Array(buffer);
+        }
+
+        function resetOpenAiSttSegmentState() {
+          state.stt.pcmFrames = [];
+          state.stt.bufferedSamples = 0;
+          state.stt.signalPeak = 0;
+          state.stt.vadState = "idle";
+          state.stt.segmentStartedAtMs = 0;
+          state.stt.lastVoiceAtMs = 0;
+        }
+
+        async function flushOpenAiSttSegment(reason = "segment") {
+          if (!state.stt.active || state.stt.flushInFlight) {
+            return;
+          }
+          if (!Array.isArray(state.stt.pcmFrames) || state.stt.pcmFrames.length === 0) {
+            resetOpenAiSttSegmentState();
+            return;
+          }
+          if (typeof window.notifyBridgeAudioChunk !== "function") {
+            resetOpenAiSttSegmentState();
+            return;
+          }
+
+          const frames = state.stt.pcmFrames;
+          const bufferedSamples = Number(state.stt.bufferedSamples || 0);
+          const peak = Number(state.stt.signalPeak || 0);
+          resetOpenAiSttSegmentState();
+
+          const merged = concatInt16Chunks(frames);
+          if (!merged.length) {
+            return;
+          }
+
+          const durationMs = Math.max(
+            0,
+            Math.round(
+              (bufferedSamples || merged.length) /
+                Math.max(1, Number(state.stt.sampleRate || 48000)) *
+                1000
+            )
+          );
+
+          const minSignalPeak = Math.max(
+            0,
+            Math.min(1, Number(state.stt.minSignalPeak || 0))
+          );
+          if (peak < minSignalPeak) {
+            const now = Date.now();
+            if (now - Number(state.stt.lastSilenceDropLogAtMs || 0) > 2500) {
+              addLog(
+                `openai-stt segment dropped as silence (peak=${peak.toFixed(4)}, threshold=${minSignalPeak.toFixed(4)})`
+              );
+              state.stt.lastSilenceDropLogAtMs = now;
+            }
+            return;
+          }
+
+          const segmentMinMs = Math.max(
+            120,
+            Number(state.stt.segmentMinMs || 900)
+          );
+          if (durationMs < segmentMinMs) {
+            const now = Date.now();
+            if (now - Number(state.stt.lastSegmentDropLogAtMs || 0) > 2500) {
+              addLog(
+                `openai-stt segment dropped as too short (${durationMs}ms < ${segmentMinMs}ms)`
+              );
+              state.stt.lastSegmentDropLogAtMs = now;
+            }
+            return;
+          }
+
+          state.stt.flushInFlight = true;
+          try {
+            const wavBytes = encodeWavPcm16(merged, state.stt.sampleRate, 1);
+            await window.notifyBridgeAudioChunk({
+              audioBase64: bytesToBase64(wavBytes),
+              mimeType: "audio/wav",
+              durationMs,
+              isSegmentFinal: true,
+              ts: Date.now()
+            });
+            addLog(
+              `openai-stt segment sent (${durationMs}ms, peak=${peak.toFixed(4)}, reason=${reason})`
+            );
+          } catch (err) {
+            addLog(`openai-stt segment send failed: ${err?.message || err}`);
+          } finally {
+            state.stt.flushInFlight = false;
+          }
+        }
+
+        async function unlockAudio() {
+          if (state.audioUnlocked) {
+            return true;
+          }
+
+          try {
+            const AudioContextCtor =
+              window.AudioContext || window.webkitAudioContext;
+            if (AudioContextCtor) {
+              if (!unlockAudioContext) {
+                unlockAudioContext = new AudioContextCtor();
+              }
+
+              if (unlockAudioContext.state !== "running") {
+                await unlockAudioContext.resume();
+              }
+
+              const oscillator = unlockAudioContext.createOscillator();
+              const gain = unlockAudioContext.createGain();
+              gain.gain.value = 0.0001;
+              oscillator.connect(gain);
+              gain.connect(unlockAudioContext.destination);
+              const startedAt = unlockAudioContext.currentTime;
+              oscillator.start(startedAt);
+              oscillator.stop(startedAt + 0.02);
+            }
+
+            const probe = new Audio(
+              "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YQAAAAA="
+            );
+            probe.muted = true;
+            probe.volume = 0;
+            try {
+              await probe.play();
+              probe.pause();
+            } catch (_) {
+              // Ignore playback probe errors.
+            }
+
+            state.audioUnlocked = true;
+            addLog("audio unlocked");
+            return true;
+          } catch (err) {
+            addLog(`audio unlock failed: ${err?.message || err}`);
+            return false;
+          }
+        }
+
+        function attachPlaybackStop(controller, stopHandler) {
+          if (!controller || typeof stopHandler !== "function") {
+            return;
+          }
+          controller.stopHandlers.push(stopHandler);
+        }
+
+        function stopSpeaking() {
+          const playback = state.currentPlayback;
+          if (!playback || playback.stopped) {
+            return false;
+          }
+
+          playback.stopped = true;
+          for (const stopHandler of playback.stopHandlers) {
+            try {
+              stopHandler("manual-stop");
+            } catch (_) {
+              // Ignore individual stop handler errors.
+            }
+          }
+          playback.stopHandlers = [];
+          return true;
+        }
+
+        function stopOpenAiStt(options = {}) {
+          const preserveShouldListen = Boolean(options.preserveShouldListen);
+          if (!preserveShouldListen) {
+            state.shouldListen = false;
+          }
+
+          const stream = state.stt.stream;
+          const audioContext = state.stt.audioContext;
+          const sourceNode = state.stt.sourceNode;
+          const processorNode = state.stt.processorNode;
+          const sinkNode = state.stt.sinkNode;
+          const flushTimer = state.stt.flushTimer;
+
+          state.stt.active = false;
+          state.stt.stream = null;
+          state.stt.audioContext = null;
+          state.stt.sourceNode = null;
+          state.stt.processorNode = null;
+          state.stt.sinkNode = null;
+          state.stt.flushTimer = null;
+          state.stt.pcmFrames = [];
+          state.stt.bufferedSamples = 0;
+          state.stt.flushInFlight = false;
+          state.stt.signalPeak = 0;
+          state.stt.gateUntilMs = 0;
+          state.stt.lastSilenceDropLogAtMs = 0;
+          state.stt.lastSegmentDropLogAtMs = 0;
+          state.stt.vadState = "idle";
+          state.stt.lastVoiceAtMs = 0;
+          state.stt.segmentStartedAtMs = 0;
+
+          if (flushTimer) {
+            clearInterval(flushTimer);
+          }
+
+          if (processorNode) {
+            try {
+              processorNode.onaudioprocess = null;
+              processorNode.disconnect();
+            } catch (_) {
+              // Ignore processor disconnect errors.
+            }
+          }
+          if (sourceNode) {
+            try {
+              sourceNode.disconnect();
+            } catch (_) {
+              // Ignore source disconnect errors.
+            }
+          }
+          if (sinkNode) {
+            try {
+              sinkNode.disconnect();
+            } catch (_) {
+              // Ignore sink disconnect errors.
+            }
+          }
+          if (audioContext) {
+            Promise.resolve(audioContext.close()).catch(() => {});
+          }
+
+          if (stream) {
+            for (const track of stream.getTracks()) {
+              try {
+                track.stop();
+              } catch (_) {
+                // Ignore track stop errors.
+              }
+            }
+          }
+
+          setRecognitionState("stopped");
+          return true;
+        }
+
+        async function startOpenAiStt(options = {}) {
+          if (
+            !navigator.mediaDevices?.getUserMedia ||
+            !(window.AudioContext || window.webkitAudioContext)
+          ) {
+            addLog("openai-stt unavailable: WebAudio/getUserMedia is missing.");
+            setRecognitionState("unsupported", true);
+            return false;
+          }
+
+          state.shouldListen = true;
+          if (state.stt.active) {
+            return true;
+          }
+
+          const requestedChunkMs = Number(options.chunkMs);
+          const requestedDeviceId = String(options.deviceId || "").trim();
+          const requestedDeviceLabel = String(options.deviceLabel || "").trim();
+          const preferLoopbackOption = options.preferLoopback;
+          const requestedMinSignalPeak = Number(options.minSignalPeak);
+          const requestedVadThreshold = Number(options.vadThreshold);
+          const requestedHangoverMs = Number(options.hangoverMs);
+          const requestedSegmentMinMs = Number(options.segmentMinMs);
+          const requestedSegmentMaxMs = Number(options.segmentMaxMs);
+
+          state.stt.chunkMs = Number.isFinite(requestedChunkMs)
+            ? Math.max(300, Math.min(10000, Math.trunc(requestedChunkMs)))
+            : state.stt.chunkMs;
+          state.stt.deviceId = requestedDeviceId || state.stt.deviceId;
+          if (typeof preferLoopbackOption === "boolean") {
+            state.stt.preferLoopback = preferLoopbackOption;
+          }
+          if (Number.isFinite(requestedMinSignalPeak)) {
+            state.stt.minSignalPeak = Math.max(
+              0,
+              Math.min(1, requestedMinSignalPeak)
+            );
+          }
+          if (Number.isFinite(requestedVadThreshold)) {
+            state.stt.vadThreshold = Math.max(
+              0,
+              Math.min(1, requestedVadThreshold)
+            );
+          }
+          if (Number.isFinite(requestedHangoverMs)) {
+            state.stt.hangoverMs = Math.max(
+              120,
+              Math.min(8000, Math.trunc(requestedHangoverMs))
+            );
+          }
+          if (Number.isFinite(requestedSegmentMinMs)) {
+            state.stt.segmentMinMs = Math.max(
+              120,
+              Math.min(12000, Math.trunc(requestedSegmentMinMs))
+            );
+          }
+          if (Number.isFinite(requestedSegmentMaxMs)) {
+            state.stt.segmentMaxMs = Math.max(
+              400,
+              Math.min(30000, Math.trunc(requestedSegmentMaxMs))
+            );
+          }
+          if (state.stt.segmentMaxMs <= state.stt.segmentMinMs) {
+            state.stt.segmentMaxMs = Math.min(
+              30000,
+              state.stt.segmentMinMs + 800
+            );
+          }
+
+          try {
+            const audioConstraints = {
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
+              channelCount: 1
+            };
+
+            let selectedDeviceId = state.stt.deviceId;
+            let selectedDeviceLabel = "";
+            if (!selectedDeviceId && requestedDeviceLabel) {
+              const devices = await ensureInputLabelsAvailable();
+              if (devices.length > 0) {
+                addLog(
+                  `openai-stt audio inputs: ${devices
+                    .map((device, index) => formatDeviceLabel(device, index))
+                    .join(" | ")}`
+                );
+              } else {
+                addLog("openai-stt audio inputs: none detected");
+              }
+
+              const byLabel = findDeviceByLabel(devices, requestedDeviceLabel);
+              if (byLabel?.deviceId) {
+                selectedDeviceId = byLabel.deviceId;
+                selectedDeviceLabel = byLabel.label || "";
+              }
+            } else if (!selectedDeviceId) {
+              const devices = await ensureInputLabelsAvailable();
+              if (devices.length > 0) {
+                addLog(
+                  `openai-stt audio inputs: ${devices
+                    .map((device, index) => formatDeviceLabel(device, index))
+                    .join(" | ")}`
+                );
+              } else {
+                addLog("openai-stt audio inputs: none detected");
+              }
+
+              if (state.stt.preferLoopback) {
+                const loopback = findLoopbackDevice(devices);
+                if (loopback?.deviceId) {
+                  selectedDeviceId = loopback.deviceId;
+                  selectedDeviceLabel = loopback.label || "";
+                }
+              }
+            }
+
+            if (selectedDeviceId && selectedDeviceLabel) {
+              addLog(
+                `openai-stt selected input by rule: ${selectedDeviceLabel} [${selectedDeviceId}]`
+              );
+            }
+
+            if (selectedDeviceId) {
+              audioConstraints.deviceId = { exact: selectedDeviceId };
+            }
+
+            const stream = await navigator.mediaDevices.getUserMedia({
+              audio: audioConstraints,
+              video: false
+            });
+
+            // Cache the effective device id for restarts after speech playback.
+            state.stt.deviceId = selectedDeviceId || state.stt.deviceId;
+
+            const AudioContextCtor =
+              window.AudioContext || window.webkitAudioContext;
+            const audioContext = new AudioContextCtor();
+            if (audioContext.state !== "running") {
+              await audioContext.resume();
+            }
+            const sourceNode = audioContext.createMediaStreamSource(stream);
+            const processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+            const sinkNode = audioContext.createGain();
+            sinkNode.gain.value = 0;
+
+            processorNode.onaudioprocess = (event) => {
+              if (!state.stt.active) {
+                return;
+              }
+              const now = Date.now();
+              if (state.speaking || now < Number(state.stt.gateUntilMs || 0)) {
+                if (state.stt.vadState !== "idle") {
+                  resetOpenAiSttSegmentState();
+                }
+                return;
+              }
+              const input = event?.inputBuffer?.getChannelData?.(0);
+              if (!input || input.length === 0) {
+                return;
+              }
+              let peak = 0;
+              for (let index = 0; index < input.length; index += 1) {
+                const abs = Math.abs(input[index]);
+                if (abs > peak) {
+                  peak = abs;
+                }
+              }
+              if (peak > state.stt.signalPeak) {
+                state.stt.signalPeak = peak;
+              }
+              const isVoice = peak >= Number(state.stt.vadThreshold || 0);
+
+              if (isVoice) {
+                if (state.stt.vadState === "idle") {
+                  state.stt.vadState = "speaking";
+                  state.stt.segmentStartedAtMs = now;
+                  state.stt.lastVoiceAtMs = now;
+                } else {
+                  state.stt.lastVoiceAtMs = now;
+                }
+              }
+
+              if (state.stt.vadState === "idle") {
+                return;
+              }
+
+              const pcmFrame = float32ToInt16Pcm(input);
+              state.stt.pcmFrames.push(pcmFrame);
+              state.stt.bufferedSamples += pcmFrame.length;
+
+              const segmentDurationMs =
+                state.stt.bufferedSamples /
+                Math.max(1, Number(state.stt.sampleRate || 48000)) *
+                1000;
+              const hangoverMs = Math.max(
+                120,
+                Number(state.stt.hangoverMs || 700)
+              );
+              const sinceLastVoiceMs = now - Number(state.stt.lastVoiceAtMs || 0);
+              const segmentMaxMs = Math.max(
+                Number(state.stt.segmentMinMs || 900) + 100,
+                Number(state.stt.segmentMaxMs || 7000)
+              );
+
+              if (segmentDurationMs >= segmentMaxMs) {
+                void flushOpenAiSttSegment("max-duration");
+                return;
+              }
+
+              if (!isVoice && sinceLastVoiceMs >= hangoverMs) {
+                void flushOpenAiSttSegment("hangover");
+              }
+            };
+
+            sourceNode.connect(processorNode);
+            processorNode.connect(sinkNode);
+            sinkNode.connect(audioContext.destination);
+
+            state.stt.stream = stream;
+            state.stt.audioContext = audioContext;
+            state.stt.sourceNode = sourceNode;
+            state.stt.processorNode = processorNode;
+            state.stt.sinkNode = sinkNode;
+            state.stt.sampleRate = Math.max(
+              8000,
+              Math.min(96000, Math.trunc(Number(audioContext.sampleRate) || 48000))
+            );
+            state.stt.flushInFlight = false;
+            resetOpenAiSttSegmentState();
+            state.stt.active = true;
+
+            try {
+              const [track] = stream.getAudioTracks();
+              const settings = track?.getSettings?.() || {};
+              addLog(
+                `openai-stt input: ${track?.label || "unknown"} (deviceId=${
+                  settings.deviceId || state.stt.deviceId || "default"
+                }, sampleRate=${settings.sampleRate || state.stt.sampleRate || "?"})`
+              );
+            } catch (_) {
+              // Ignore diagnostics logging failures.
+            }
+
+            setRecognitionState("openai-stt");
+            addLog(
+              `openai-stt started (mode=vad-segments, sampleRate=${state.stt.sampleRate}, vadThreshold=${Number(
+                state.stt.vadThreshold || 0
+              ).toFixed(4)}, minPeak=${Number(
+                state.stt.minSignalPeak || 0
+              ).toFixed(4)}, hangoverMs=${state.stt.hangoverMs}, segmentMinMs=${state.stt.segmentMinMs}, segmentMaxMs=${state.stt.segmentMaxMs})`
+            );
+            return true;
+          } catch (err) {
+            addLog(`openai-stt start failed: ${err?.message || err}`);
+            setRecognitionState("error: openai-stt", true);
+            state.stt.active = false;
+            return false;
+          }
+        }
+
+        async function withSpeechLock(runPlayback) {
+          const playback = {
+            stopped: false,
+            stopHandlers: []
+          };
+
+          state.speaking = true;
+          state.stt.gateUntilMs = Date.now() + Math.max(0, state.silenceMs);
+          setSpeechState("speaking");
+          state.currentPlayback = playback;
+
+          try {
+            await unlockAudio();
+            await runPlayback(playback);
+          } finally {
+            if (state.currentPlayback === playback) {
+              state.currentPlayback = null;
+            }
+            state.stt.gateUntilMs = Date.now() + Math.max(0, state.silenceMs);
+            state.speaking = false;
+            setSpeechState(playback.stopped ? "interrupted" : "idle");
+          }
+        }
+
+        async function playAudio(payload = {}) {
+          const audioBase64 = String(payload.audioBase64 || "").trim();
+          const mimeType = String(payload.mimeType || "audio/mpeg").trim();
+          const spokenText = String(payload.text || "").trim();
+
+          if (!audioBase64) {
+            addLog("openai-audio play skipped: empty payload");
+            return false;
+          }
+
+          let playbackError = null;
+
+          await withSpeechLock(async (playback) => {
+            const source = `data:${mimeType};base64,${audioBase64}`;
+            const audio = new Audio(source);
+            audio.preload = "auto";
+            audio.volume = 1;
+            await applyTtsOutputDevice(audio);
+
+            await new Promise((resolve) => {
+              let resolved = false;
+              const done = () => {
+                if (resolved) {
+                  return;
+                }
+                resolved = true;
+                resolve();
+              };
+
+              attachPlaybackStop(playback, () => {
+                try {
+                  audio.pause();
+                  audio.currentTime = 0;
+                  audio.src = "";
+                  audio.load();
+                } catch (_) {
+                  // Ignore audio teardown errors.
+                }
+                done();
+              });
+
+              audio.onended = done;
+              audio.onerror = () => {
+                playbackError = new Error("audio element error");
+                done();
+              };
+
+              const playPromise = audio.play();
+              if (playPromise && typeof playPromise.catch === "function") {
+                playPromise.catch((err) => {
+                  playbackError = err instanceof Error ? err : new Error(String(err));
+                  done();
+                });
+              }
+            });
+          });
+
+          if (playbackError) {
+            addLog(`openai-audio play failed: ${playbackError.message}`);
+            return false;
+          }
+
+          addLog(`synthesized(openai): ${spokenText || "<audio>"}`);
+          return true;
+        }
+
+        function configure(options = {}) {
+          if (typeof options.language === "string" && options.language) {
+            state.language = options.language;
+          }
+          if (Number.isFinite(options.silenceMs)) {
+            state.silenceMs = options.silenceMs;
+          }
+          if (Number.isFinite(options.turnSilenceMs)) {
+            state.turnSilenceMs = Math.max(120, options.turnSilenceMs);
+          }
+          if (
+            typeof options.ttsOutputDeviceId === "string" &&
+            options.ttsOutputDeviceId.trim()
+          ) {
+            state.ttsOutputDeviceId = options.ttsOutputDeviceId.trim();
+            state.ttsOutputConfigured = false;
+          }
+          if (
+            typeof options.ttsOutputDeviceLabel === "string" &&
+            options.ttsOutputDeviceLabel.trim()
+          ) {
+            state.ttsOutputDeviceLabel = options.ttsOutputDeviceLabel.trim();
+            state.ttsOutputConfigured = false;
+          }
+        }
+
+        parseQuery();
+        configure({
+          language: state.language,
+          silenceMs: state.silenceMs,
+          turnSilenceMs: state.turnSilenceMs,
+          ttsOutputDeviceId: state.ttsOutputDeviceId,
+          ttsOutputDeviceLabel: state.ttsOutputDeviceLabel
+        });
+
+        window.botBridge = {
+          startOpenAiStt,
+          stopOpenAiStt,
+          playAudio,
+          stopSpeaking,
+          unlockAudio,
+          configure
+        };
+
+        addLog("bridge loaded");
+        setRecognitionState("ready");
+      })();
+    </script>
+  </body>
+</html>

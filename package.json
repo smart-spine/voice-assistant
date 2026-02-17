@@ -1,0 +1,24 @@
+{
+  "name": "meet-voice-bot-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Extensible Google Meet voice bot with OpenAI and control API",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:api": "node src/api.js",
+    "start:api:ubuntu": "bash scripts/ubuntu/start-api.sh",
+    "audio:ubuntu": "bash scripts/ubuntu/setup-audio.sh",
+    "start:docker": "xvfb-run -a node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.1.19",
+    "@langchain/langgraph": "^1.1.4",
+    "@langchain/openai": "^1.2.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "openai": "^4.86.1",
+    "puppeteer": "^24.1.1"
+  }
+}
