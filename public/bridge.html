@@ -722,11 +722,57 @@
             if (selectedDeviceId) {
               audioConstraints.deviceId = { exact: selectedDeviceId };
             }
+            const requestStream = async (constraints) => {
+              return navigator.mediaDevices.getUserMedia({
+                audio: constraints,
+                video: false
+              });
+            };
 
-            const stream = await navigator.mediaDevices.getUserMedia({
-              audio: audioConstraints,
-              video: false
-            });
+            let stream;
+            try {
+              stream = await requestStream(audioConstraints);
+            } catch (err) {
+              const errorName = String(err?.name || "");
+              const errorMessage = String(err?.message || err || "");
+              const isOverconstrained =
+                errorName === "OverconstrainedError" ||
+                errorName === "ConstraintNotSatisfiedError";
+
+              if (!isOverconstrained) {
+                throw err;
+              }
+
+              // Fallback #1: keep selected device, relax processing constraints.
+              addLog(
+                `openai-stt getUserMedia overconstrained; retrying with relaxed constraints (device=${selectedDeviceId || "default"}): ${errorMessage}`
+              );
+              const relaxedWithDevice = selectedDeviceId
+                ? { deviceId: { exact: selectedDeviceId } }
+                : true;
+
+              try {
+                stream = await requestStream(relaxedWithDevice);
+              } catch (relaxedErr) {
+                const relaxedErrorName = String(relaxedErr?.name || "");
+                const relaxedMessage = String(relaxedErr?.message || relaxedErr || "");
+                const relaxedOverconstrained =
+                  relaxedErrorName === "OverconstrainedError" ||
+                  relaxedErrorName === "ConstraintNotSatisfiedError";
+
+                if (!selectedDeviceId || !relaxedOverconstrained) {
+                  throw relaxedErr;
+                }
+
+                // Fallback #2: stale/broken device id, fall back to browser default input.
+                addLog(
+                  `openai-stt selected device is unavailable; falling back to default input: ${relaxedMessage}`
+                );
+                stream = await requestStream(true);
+                selectedDeviceId = "";
+                selectedDeviceLabel = "";
+              }
+            }
 
             // Cache the effective device id for restarts after speech playback.
             state.stt.deviceId = selectedDeviceId || state.stt.deviceId;

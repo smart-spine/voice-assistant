@@ -467,7 +467,7 @@ class BotSession {
         this.info(
           `Meet page ready (join attempt executed, state=${String(
             meetJoinState?.status || "unknown"
-          )}).`
+          )}, url=${String(meetJoinState?.url || this.sessionConfig.meetUrl || "")}).`
         );
       }
 
