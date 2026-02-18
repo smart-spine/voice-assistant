@@ -1,8 +1,8 @@
 import {
   startBotSession,
   stopBotSession
-} from "../../../../src/lib/control-api-client";
-import { getOrchestratorStore } from "../../../../src/lib/orchestrator-store";
+} from "../../../../lib/control-api-client";
+import { getOrchestratorStore } from "../../../../lib/orchestrator-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

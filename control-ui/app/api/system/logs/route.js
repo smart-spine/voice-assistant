@@ -1,4 +1,4 @@
-import { getOrchestratorStore } from "../../../../src/lib/orchestrator-store";
+import { getOrchestratorStore } from "../../../../lib/orchestrator-store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

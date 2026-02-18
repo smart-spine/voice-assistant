@@ -1,9 +1,9 @@
 import {
   fetchBotStatus,
   fetchControlHealth
-} from "../../../../src/lib/control-api-client";
-import { getOrchestratorStore } from "../../../../src/lib/orchestrator-store";
-import { getSystemConfig } from "../../../../src/lib/system-config";
+} from "../../../../lib/control-api-client";
+import { getOrchestratorStore } from "../../../../lib/orchestrator-store";
+import { getSystemConfig } from "../../../../lib/system-config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
