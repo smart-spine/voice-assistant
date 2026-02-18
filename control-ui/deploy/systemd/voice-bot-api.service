@@ -1,0 +1,15 @@
+[Unit]
+Description=Voice Bot Control API
+After=network.target
+
+[Service]
+Type=simple
+User=voicebot
+WorkingDirectory=/opt/voice-assistant
+EnvironmentFile=/opt/voice-assistant/.env
+ExecStart=/usr/bin/npm run start:api:ubuntu
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

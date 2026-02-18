@@ -63,6 +63,24 @@ Default: `http://127.0.0.1:3200`
 
 If `CONTROL_API_TOKEN` is set, send `Authorization: Bearer <token>`.
 
+## Control UI (Next.js)
+
+`control-ui` provides a dark-green web dashboard for:
+- starting/stopping the local API process,
+- launching/stopping bot sessions with `meetUrl` + client context,
+- watching unified API/bot logs in one stream.
+
+Quick start:
+
+```bash
+cd control-ui
+cp .env.example .env
+npm install
+npm run dev
+```
+
+Open: `http://127.0.0.1:3300`
+
 ## Ubuntu/Hetzner runbook
 
 For headless Ubuntu servers, run Chrome with `Xvfb` and PulseAudio virtual devices:

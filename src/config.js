@@ -401,7 +401,7 @@ const config = {
   }),
   autoGreetingPrompt: cleanString(
     process.env.AUTO_GREETING_PROMPT,
-    "System event: The Google Meet call has just connected and the user is silent. Start the conversation naturally in English with one short, friendly opening. Do not use rigid scripted wording."
+    "System event: The Google Meet call has just connected and the user is silent. Start with one short friendly opening, briefly introduce yourself as SmartSpine's live assistant, then ask for the user's name and goal. Do not use rigid scripted wording."
   ),
   turnSilenceMs: asBoundedNumber(process.env.TURN_SILENCE_MS, {
     fallback: 420,

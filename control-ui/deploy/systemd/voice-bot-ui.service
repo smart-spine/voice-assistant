@@ -1,0 +1,15 @@
+[Unit]
+Description=Voice Bot Next.js Control UI
+After=network.target voice-bot-api.service
+
+[Service]
+Type=simple
+User=voicebot
+WorkingDirectory=/opt/voice-assistant/control-ui
+EnvironmentFile=/opt/voice-assistant/control-ui/.env
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
