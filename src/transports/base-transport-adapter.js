@@ -43,6 +43,10 @@ class BaseTransportAdapter {
   getJoinState() {
     return null;
   }
+
+  async refreshJoinState() {
+    return this.getJoinState();
+  }
 }
 
 module.exports = {

@@ -148,6 +148,7 @@ async function setupBridgePage({
   await page.goto(bridgeUrl, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => typeof window.botBridge !== "undefined");
   await warmUpBridgePage(page);
+  await bridgePrepareTtsOutput(page);
 
   return page;
 }
@@ -200,6 +201,19 @@ async function bridgeSpeakAudio(page, payload) {
   }, payload);
 }
 
+async function bridgePrepareTtsOutput(page) {
+  return page.evaluate(async () => {
+    if (!window.botBridge?.prepareTtsOutput) {
+      return false;
+    }
+    try {
+      return await window.botBridge.prepareTtsOutput();
+    } catch (_) {
+      return false;
+    }
+  });
+}
+
 async function bridgeStopSpeaking(page) {
   return page.evaluate(() => {
     if (!window.botBridge?.stopSpeaking) {
@@ -230,10 +244,15 @@ async function openMeetPage({ browser, config }) {
   await tryTypeBotName(page, config.botName);
   await ensureCameraOff(page);
   await ensureMicOn(page);
-  await clickJoinButton(page);
+  await clickJoinButton(page, {
+    attempts: Number(config?.meetJoinClickAttempts || 8),
+    retryMs: Number(config?.meetJoinClickRetryMs || 700)
+  });
   void keepMicUnmuted(page, 120000);
 
-  const joinState = await waitForMeetJoinState(page, { timeoutMs: 18000 });
+  const joinState = await waitForMeetJoinState(page, {
+    timeoutMs: Number(config?.meetJoinStateTimeoutMs || 6000)
+  });
   return { page, joinState };
 }
 
@@ -399,7 +418,7 @@ async function ensureCameraOff(page) {
   ]);
 }
 
-async function clickJoinButton(page) {
+async function clickJoinButton(page, { attempts = 8, retryMs = 700 } = {}) {
   const labels = [
     "join now",
     "ask to join",
@@ -407,12 +426,15 @@ async function clickJoinButton(page) {
     "попросить присоединиться"
   ];
 
-  for (let attempt = 0; attempt < 12; attempt += 1) {
+  const maxAttempts = Math.max(1, Math.min(30, Math.trunc(Number(attempts) || 8)));
+  const retryDelayMs = Math.max(120, Math.min(5000, Number(retryMs) || 700));
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const clicked = await clickByLabel(page, labels);
     if (clicked) {
       return true;
     }
-    await sleep(1000);
+    await sleep(retryDelayMs);
   }
 
   return false;
@@ -496,7 +518,9 @@ module.exports = {
   bridgeStartOpenAiStt,
   bridgeStopOpenAiStt,
   bridgeSpeakAudio,
+  bridgePrepareTtsOutput,
   bridgeStopSpeaking,
   openMeetPage,
+  detectMeetJoinState,
   leaveMeetPage
 };

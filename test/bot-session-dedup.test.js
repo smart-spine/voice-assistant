@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { BotSession } = require("../src/runtime/bot-session");
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test("inbound dedup keeps transcript expansions for better recognition", () => {
   const session = new BotSession({ config: {} });
@@ -245,4 +246,52 @@ test("waitForPostTurnResponseDelay caps first user turn delay", async () => {
 
   assert.equal(resolved, "hello there I need some help");
   assert.ok(elapsedMs < 450);
+});
+
+test("waitForPostTurnResponseDelay keeps first short greeting", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.sessionConfig = {
+    postTurnResponseDelayMs: 300,
+    openaiSttChunkMs: 1200
+  };
+
+  session.markSourceActivity("openai-stt");
+  const resolved = await session.waitForPostTurnResponseDelay({
+    source: "openai-stt",
+    commandText: "Hi there",
+    isFirstUserTurn: true
+  });
+
+  assert.equal(resolved, "Hi there");
+});
+
+test("startJoinStateMonitor updates join state and triggers auto greeting", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.sessionConfig = {
+    meetJoinPollMs: 5,
+    autoGreetingEnabled: true,
+    autoGreetingDelayMs: 0,
+    autoGreetingPrompt: "hello"
+  };
+  session.meetPage = { isClosed: () => false };
+  session.transportAdapter = {
+    refreshJoinState: async () => ({ status: "joined", url: "https://meet.google.com/abc-defg-hij" })
+  };
+
+  let greetingCalls = 0;
+  session.runAutoGreeting = async () => {
+    greetingCalls += 1;
+  };
+
+  session.startJoinStateMonitor({ responder: {} });
+  if (session.joinStateMonitorPromise) {
+    await session.joinStateMonitorPromise;
+  } else {
+    await sleep(50);
+  }
+
+  assert.equal(session.meetJoinState?.status, "joined");
+  assert.equal(greetingCalls, 1);
 });

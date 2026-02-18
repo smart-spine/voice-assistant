@@ -455,7 +455,40 @@ const config = {
   allowAnyMeetUrl: asBoolean(process.env.ALLOW_ANY_MEET_URL, false),
   headless: asBoolean(process.env.HEADLESS, false),
   chromePath: cleanString(process.env.CHROME_PATH),
-  chromeUserDataDir: process.env.CHROME_USER_DATA_DIR || ".chrome-profile"
+  chromeUserDataDir: process.env.CHROME_USER_DATA_DIR || ".chrome-profile",
+  meetJoinStateTimeoutMs: asBoundedNumber(
+    process.env.MEET_JOIN_STATE_TIMEOUT_MS,
+    {
+      fallback: 6000,
+      min: 1000,
+      max: 30000,
+      integer: true
+    }
+  ),
+  meetJoinPollMs: asBoundedNumber(process.env.MEET_JOIN_POLL_MS, {
+    fallback: 1200,
+    min: 300,
+    max: 15000,
+    integer: true
+  }),
+  meetJoinClickAttempts: asBoundedNumber(
+    process.env.MEET_JOIN_CLICK_ATTEMPTS,
+    {
+      fallback: 8,
+      min: 1,
+      max: 30,
+      integer: true
+    }
+  ),
+  meetJoinClickRetryMs: asBoundedNumber(
+    process.env.MEET_JOIN_CLICK_RETRY_MS,
+    {
+      fallback: 700,
+      min: 120,
+      max: 5000,
+      integer: true
+    }
+  )
 };
 
 function validateCoreConfig(inputConfig = config) {

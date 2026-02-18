@@ -7,6 +7,7 @@ const {
   extractCommandByWakeWord,
   countWords,
   isLikelyIncompleteFragment,
+  isLikelyGreetingOrPing,
   normalizeText,
   normalizeComparableText,
   normalizeLooseComparableText
@@ -281,6 +282,12 @@ class BotSession {
     this.activeSttSource = "";
     this.lastBridgeRecoveryAtMs = 0;
     this.hasProcessedUserTurn = false;
+    this.joinStateMonitorStopRequested = false;
+    this.joinStateMonitorPromise = null;
+    this.responder = null;
+    this.joinStateMonitorPromise = null;
+    this.joinStateMonitorStopRequested = false;
+    this.responder = null;
   }
 
   getStatus() {
@@ -375,6 +382,7 @@ class BotSession {
       streamChunkMaxChars: this.sessionConfig.replyChunkMaxChars,
       streamChunkMaxLatencyMs: this.sessionConfig.replyChunkMaxLatencyMs
     });
+    this.responder = responder;
     this.processQueueHandler = async () => {
       await this.processQueue(responder);
     };
@@ -525,6 +533,7 @@ class BotSession {
       this.info(
         "Bot is running. If WAKE_WORD is set, only phrases containing it will be processed."
       );
+      this.startJoinStateMonitor({ responder });
       void this.runAutoGreeting({ responder });
       return this.getStatus();
     } catch (err) {
@@ -552,6 +561,7 @@ class BotSession {
       this.info(`Shutting down (${reason})...`);
       try {
         await this.interruptAssistantRun("session-stop");
+        await this.stopJoinStateMonitor();
         if (this.openAiSttStream) {
           try {
             this.openAiSttStream.stop({ flush: false });
@@ -576,6 +586,7 @@ class BotSession {
         this.lastBridgeRecoveryAtMs = 0;
         this.hasProcessedUserTurn = false;
         this.startedAtMs = 0;
+        this.responder = null;
 
         if (this.transportAdapter) {
           try {
@@ -631,11 +642,14 @@ class BotSession {
 
         await this.runCallSummaryWorkflow(summaryTurns);
       } finally {
+        this.joinStateMonitorStopRequested = true;
+        this.joinStateMonitorPromise = null;
         this.transportAdapter = null;
         this.bridgePage = null;
         this.meetPage = null;
         this.meetJoinState = null;
         this.activeSttSource = "";
+        this.responder = null;
         this.status = "stopped";
         this.stoppedAt = new Date().toISOString();
         this.isStopping = false;
@@ -798,7 +812,8 @@ class BotSession {
         isLikelyIncompleteFragment(commandText, {
           minWordsForComplete: 4
         }) &&
-        countWords(commandText) <= 2
+        countWords(commandText) <= 2 &&
+        !(!this.hasProcessedUserTurn && isLikelyGreetingOrPing(commandText))
       ) {
         return;
       }
@@ -815,6 +830,15 @@ class BotSession {
       this.lastAcceptedAtMs = now;
       this.hasProcessedUserTurn = true;
 
+      const sttToHandleMs = Number.isFinite(Number(item.receivedAtMs))
+        ? Math.max(0, now - Number(item.receivedAtMs))
+        : null;
+      if (sttToHandleMs != null) {
+        this.info(
+          `Turn timing (${item.source}): stt-final-to-handle=${sttToHandleMs}ms.`
+        );
+      }
+
       this.user(`[${item.source}] ${commandText}`);
       await this.respondToCommand({
         responder,
@@ -829,6 +853,96 @@ class BotSession {
         void this.processQueue(responder);
       }
     }
+  }
+
+  startJoinStateMonitor({ responder }) {
+    if (this.joinStateMonitorPromise) {
+      return;
+    }
+    if (!this.transportAdapter || typeof this.transportAdapter.refreshJoinState !== "function") {
+      return;
+    }
+
+    const pollMs = Math.max(
+      300,
+      Number(this.sessionConfig?.meetJoinPollMs || 1200)
+    );
+    this.joinStateMonitorStopRequested = false;
+
+    this.joinStateMonitorPromise = (async () => {
+      while (!this.joinStateMonitorStopRequested) {
+        if (
+          this.status !== "running" ||
+          this.isStopping ||
+          !this.transportAdapter ||
+          !this.meetPage ||
+          this.meetPage.isClosed()
+        ) {
+          break;
+        }
+
+        await sleep(pollMs);
+        if (this.joinStateMonitorStopRequested || this.status !== "running") {
+          break;
+        }
+
+        let nextState = null;
+        try {
+          nextState = await this.transportAdapter.refreshJoinState();
+        } catch (_) {
+          continue;
+        }
+        if (!nextState || typeof nextState !== "object") {
+          continue;
+        }
+
+        const previousStatus = String(this.meetJoinState?.status || "");
+        const nextStatus = String(nextState.status || "");
+        this.meetJoinState = nextState;
+
+        if (nextStatus && nextStatus !== previousStatus) {
+          this.info(
+            `Meet join state updated: ${nextStatus}${
+              nextState?.url ? ` (${nextState.url})` : ""
+            }.`
+          );
+        }
+
+        if (nextStatus === "joined") {
+          if (!this.hasProcessedUserTurn) {
+            void this.runAutoGreeting({ responder });
+          }
+          break;
+        }
+
+        if (nextStatus === "auth_required") {
+          this.warn(
+            "Meet session requires authentication; auto-greeting is paused until login is completed."
+          );
+          break;
+        }
+      }
+    })()
+      .catch((err) => {
+        this.warn(`Meet join monitor stopped: ${err?.message || err}`);
+      })
+      .finally(() => {
+        this.joinStateMonitorPromise = null;
+      });
+  }
+
+  async stopJoinStateMonitor() {
+    this.joinStateMonitorStopRequested = true;
+    const monitorPromise = this.joinStateMonitorPromise;
+    if (!monitorPromise) {
+      return;
+    }
+    try {
+      await Promise.race([monitorPromise, sleep(1200)]);
+    } catch (_) {
+      // Ignore monitor shutdown errors.
+    }
+    this.joinStateMonitorPromise = null;
   }
 
   async runAutoGreeting({ responder }) {
@@ -962,11 +1076,14 @@ class BotSession {
   async respondToCommand({ responder, source, commandText }) {
     const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const abortController = new AbortController();
+    const llmStartedAtMs = Date.now();
+    let firstTextChunkAtMs = 0;
     this.activeAssistantRun = {
       id: runId,
       source,
       startedAt: Date.now(),
-      abortController
+      abortController,
+      firstAudioAtMs: 0
     };
 
     let playbackChain = Promise.resolve();
@@ -974,6 +1091,9 @@ class BotSession {
       const text = normalizeText(chunkText);
       if (!text) {
         return;
+      }
+      if (!firstTextChunkAtMs) {
+        firstTextChunkAtMs = Date.now();
       }
 
       playbackChain = playbackChain
@@ -1008,6 +1128,25 @@ class BotSession {
       }
 
       await playbackChain;
+
+      if (!abortController.signal.aborted) {
+        const firstAudioAtMs = Number(this.activeAssistantRun?.firstAudioAtMs || 0);
+        const llmFirstChunkMs = firstTextChunkAtMs
+          ? firstTextChunkAtMs - llmStartedAtMs
+          : null;
+        const ttsFirstAudioMs =
+          firstAudioAtMs && firstTextChunkAtMs
+            ? firstAudioAtMs - firstTextChunkAtMs
+            : null;
+        const totalMs = Date.now() - llmStartedAtMs;
+        this.info(
+          `Turn timing (${source}): llm-first-chunk=${
+            llmFirstChunkMs == null ? "n/a" : `${llmFirstChunkMs}ms`
+          }, tts-first-audio=${
+            ttsFirstAudioMs == null ? "n/a" : `${ttsFirstAudioMs}ms`
+          }, total=${totalMs}ms.`
+        );
+      }
 
       const isAborted =
         Boolean(streamResult?.aborted) || Boolean(abortController.signal.aborted);
@@ -1082,6 +1221,13 @@ class BotSession {
       });
       if (!played) {
         throw new Error("Bridge audio playback failed.");
+      }
+      if (
+        this.activeAssistantRun &&
+        this.activeAssistantRun.id === runId &&
+        !this.activeAssistantRun.firstAudioAtMs
+      ) {
+        this.activeAssistantRun.firstAudioAtMs = Date.now();
       }
     } finally {
       this.isAssistantAudioPlaying = false;
@@ -1366,7 +1512,9 @@ class BotSession {
       includeTurnFinal: true,
       stitchState
     });
-    if (isLikelyIncompleteIntakeStub(resolved)) {
+    const allowShortFirstGreeting =
+      isFirstUserTurn && isLikelyGreetingOrPing(resolved);
+    if (isLikelyIncompleteIntakeStub(resolved) && !allowShortFirstGreeting) {
       return "";
     }
     return normalizeText(resolved);

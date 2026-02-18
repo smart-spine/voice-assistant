@@ -5,6 +5,7 @@ const {
   bridgeSpeakAudio,
   bridgeStopSpeaking,
   openMeetPage,
+  detectMeetJoinState,
   leaveMeetPage
 } = require("../meet-controller");
 const { BaseTransportAdapter } = require("./base-transport-adapter");
@@ -137,6 +138,19 @@ class MeetTransportAdapter extends BaseTransportAdapter {
   }
 
   getJoinState() {
+    return this.joinState;
+  }
+
+  async refreshJoinState() {
+    if (!this.meetPage || this.meetPage.isClosed()) {
+      return this.joinState;
+    }
+
+    try {
+      this.joinState = await detectMeetJoinState(this.meetPage);
+    } catch (_) {
+      // Ignore transient detection errors and keep last known state.
+    }
     return this.joinState;
   }
 }

@@ -49,6 +49,23 @@ function isLikelySentenceComplete(text) {
   return /[.!?…]["')\]]*$/.test(normalized);
 }
 
+function isLikelyGreetingOrPing(text) {
+  const normalized = normalizeLooseComparableText(text);
+  if (!normalized) {
+    return false;
+  }
+
+  if (
+    /^(hi|hey|hello|yo|sup|what s up|good (morning|afternoon|evening))\b/.test(
+      normalized
+    )
+  ) {
+    return true;
+  }
+
+  return /\b(are you (there|here)|can you hear me|you there)\b/.test(normalized);
+}
+
 const TRAILING_JOINER_WORDS = new Set([
   "a",
   "an",
@@ -152,5 +169,6 @@ module.exports = {
   isTextExpansion,
   isLikelySentenceComplete,
   isLikelyIncompleteFragment,
-  extractCommandByWakeWord
+  extractCommandByWakeWord,
+  isLikelyGreetingOrPing
 };

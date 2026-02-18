@@ -260,6 +260,23 @@
           }
         }
 
+        async function prepareTtsOutput() {
+          try {
+            await unlockAudio();
+            const probe = new Audio(
+              "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YQAAAAA="
+            );
+            probe.preload = "auto";
+            probe.muted = true;
+            probe.volume = 0;
+            await applyTtsOutputDevice(probe);
+            return true;
+          } catch (err) {
+            addLog(`tts output prewarm failed: ${err?.message || err}`);
+            return false;
+          }
+        }
+
         function findLoopbackDevice(devices) {
           return (
             devices.find((device) =>
@@ -1034,6 +1051,7 @@
           playAudio,
           stopSpeaking,
           unlockAudio,
+          prepareTtsOutput,
           configure
         };
 
