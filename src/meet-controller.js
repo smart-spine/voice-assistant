@@ -300,12 +300,32 @@ async function detectMeetJoinState(page) {
       normalizedUrl.includes("servicelogin");
 
     const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
-    const labels = controls.map((el) =>
+    const toLabel = (el) =>
       `${el.getAttribute("aria-label") || ""} ${el.textContent || ""}`
         .toLowerCase()
         .replace(/\s+/g, " ")
-        .trim()
-    );
+        .trim();
+    const isVisible = (el) => {
+      if (!el || !(el instanceof Element)) {
+        return false;
+      }
+      if (
+        el.closest("[hidden], [aria-hidden='true'], [inert], [style*='display: none']")
+      ) {
+        return false;
+      }
+      const style = window.getComputedStyle(el);
+      if (!style || style.display === "none" || style.visibility === "hidden") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 1 && rect.height > 1;
+    };
+    const visibleLabels = controls
+      .filter((el) => isVisible(el))
+      .map((el) => toLabel(el))
+      .filter(Boolean);
+    const labels = visibleLabels.length > 0 ? visibleLabels : controls.map((el) => toLabel(el)).filter(Boolean);
 
     const hasAny = (phrases) =>
       phrases.some((phrase) => labels.some((label) => label.includes(phrase)));
@@ -314,17 +334,40 @@ async function detectMeetJoinState(page) {
       "leave call",
       "hang up",
       "end call",
+      "leave",
+      "exit call",
+      "disconnect",
       "покинуть звонок",
       "покинуть встречу",
       "завершить звонок",
-      "отключиться"
+      "отключиться",
+      "выйти"
     ]);
 
     const hasJoinControl = hasAny([
       "join now",
       "ask to join",
+      "join",
+      "rejoin",
       "присоединиться",
-      "попросить присоединиться"
+      "попросить присоединиться",
+      "повторно присоединиться"
+    ]);
+
+    const hasInCallUiControl = hasAny([
+      "chat with everyone",
+      "people",
+      "activities",
+      "raise hand",
+      "present now",
+      "turn on captions",
+      "captions",
+      "чат со всеми",
+      "люди",
+      "действия",
+      "поднять руку",
+      "показать",
+      "субтитры"
     ]);
 
     const bodyText = String(document.body?.innerText || "")
@@ -336,7 +379,7 @@ async function detectMeetJoinState(page) {
       bodyText.includes("войти");
 
     let status = "unknown";
-    if (hasLeaveControl) {
+    if (hasLeaveControl || hasInCallUiControl) {
       status = "joined";
     } else if (authRequiredByUrl || authRequiredByText) {
       status = "auth_required";
@@ -347,7 +390,7 @@ async function detectMeetJoinState(page) {
     return {
       status,
       url,
-      matched: labels.filter(Boolean).slice(0, 30)
+      matched: labels.slice(0, 30)
     };
   });
 }
@@ -482,11 +525,36 @@ async function leaveMeetPage(page, options = {}) {
 async function clickByLabel(page, labels) {
   return page.evaluate((phrases) => {
     const normalizedPhrases = phrases.map((value) => value.toLowerCase());
+    const isVisible = (el) => {
+      if (!el || !(el instanceof Element)) {
+        return false;
+      }
+      if (
+        el.closest("[hidden], [aria-hidden='true'], [inert], [style*='display: none']")
+      ) {
+        return false;
+      }
+      if (
+        el.hasAttribute("disabled") ||
+        el.getAttribute("aria-disabled") === "true"
+      ) {
+        return false;
+      }
+      const style = window.getComputedStyle(el);
+      if (!style || style.display === "none" || style.visibility === "hidden") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 1 && rect.height > 1;
+    };
     const controls = Array.from(
       document.querySelectorAll('button, [role="button"]')
     );
 
     for (const control of controls) {
+      if (!isVisible(control)) {
+        continue;
+      }
       const ariaLabel = (control.getAttribute("aria-label") || "").toLowerCase();
       const text = (control.textContent || "").toLowerCase();
       const target = `${ariaLabel} ${text}`.trim();

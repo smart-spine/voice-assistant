@@ -849,10 +849,13 @@ class BotSession {
       const meetJoinStatus = normalizeText(this.meetJoinState?.status || "")
         .toLowerCase()
         .trim();
+      const shouldIgnorePrejoin =
+        meetJoinStatus === "prejoin" && !this.sessionConfig?.meetAssumeLoggedIn;
+      const shouldIgnoreAuthRequired = meetJoinStatus === "auth_required";
       const shouldIgnoreUntilMeetJoined =
         item.source === "openai-stt" &&
         this.meetPage &&
-        meetJoinStatus !== "joined";
+        (shouldIgnorePrejoin || shouldIgnoreAuthRequired);
       if (shouldIgnoreUntilMeetJoined) {
         this.info(
           `Ignoring STT turn while Meet state=${meetJoinStatus || "unknown"}.`

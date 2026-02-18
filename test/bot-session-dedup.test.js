@@ -389,3 +389,33 @@ test("processQueue ignores openai-stt turns while meet is not joined", async () 
   assert.equal(called, false);
   assert.equal(session.queue.length, 0);
 });
+
+test("processQueue accepts openai-stt turns on prejoin when MEET_ASSUME_LOGGED_IN=true", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.bridgePage = {};
+  session.meetPage = {};
+  session.meetJoinState = { status: "prejoin" };
+  session.sessionConfig = {
+    wakeWord: "",
+    postTurnResponseDelayMs: 0,
+    meetAssumeLoggedIn: true
+  };
+  session.queue = [
+    {
+      text: "Hello are you there?",
+      source: "openai-stt",
+      isTurnFinal: true,
+      receivedAtMs: Date.now()
+    }
+  ];
+
+  let called = false;
+  session.respondToCommand = async () => {
+    called = true;
+  };
+  await session.processQueue({});
+
+  assert.equal(called, true);
+  assert.equal(session.queue.length, 0);
+});
