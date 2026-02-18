@@ -21,6 +21,8 @@ Legacy caption scraping, browser `SpeechSynthesis` fallback, and mixed transcrip
 - `src/openai-stt-service.js` - OpenAI STT turn stream.
 - `src/openai-service.js` - OpenAI chat + TTS runtime.
 - `src/langchain-agent-service.js` - LangChain chat runtime with OpenAI TTS.
+- `src/transports/transport-factory.js` - transport adapter factory (Meet now, extensible for phone/mobile channels).
+- `src/transports/meet-transport-adapter.js` - Meet transport adapter implementation.
 - `src/prompts/prompt-builder.js` - system prompt composition.
 - `src/workflows/call-summary-graph.js` - post-call summary workflow.
 - `src/api/control-server.js` - REST API layer.
@@ -172,6 +174,9 @@ STT:
 - `BRIDGE_TTS_OUTPUT_DEVICE_LABEL` (optional label match for bridge playback sink; useful for forcing TTS to `BlackHole 2ch`)
 - `TURN_SILENCE_MS`
 - `POST_TURN_RESPONSE_DELAY_MS`
+- `FIRST_TURN_RESPONSE_DELAY_CAP_MS` (caps extra delay for the very first user turn to keep initial reply snappy)
+- `TURN_STITCH_ENABLED` (merge adjacent final STT turns when first segment looks incomplete)
+- `TURN_STITCH_WINDOW_MS` (max gap for final-turn stitching, default `1100`)
 
 Conversation/runtime:
 - `WAKE_WORD`

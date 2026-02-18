@@ -42,7 +42,8 @@ test("consumeExpandedQueueText can merge turn.final transcript expansions", () =
     {
       text: "my name is vlad",
       source: "openai-stt",
-      isTurnFinal: true
+      isTurnFinal: true,
+      receivedAtMs: Date.now()
     }
   ];
 
@@ -53,6 +54,42 @@ test("consumeExpandedQueueText can merge turn.final transcript expansions", () =
   });
 
   assert.equal(resolved, "my name is vlad");
+  assert.equal(session.queue.length, 0);
+});
+
+test("consumeExpandedQueueText stitches adjacent final turns for incomplete phrase", () => {
+  const session = new BotSession({ config: {} });
+  const baseTs = Date.now();
+  session.sessionConfig = {
+    turnStitchEnabled: true,
+    turnStitchWindowMs: 1200
+  };
+  session.queue = [
+    {
+      text: "I need help with my project and",
+      source: "openai-stt",
+      isTurnFinal: true,
+      receivedAtMs: baseTs
+    },
+    {
+      text: "I can spend around ten thousand dollars",
+      source: "openai-stt",
+      isTurnFinal: true,
+      receivedAtMs: baseTs + 400
+    }
+  ];
+
+  const resolved = session.consumeExpandedQueueText({
+    source: "openai-stt",
+    currentText: "I need help with my project and",
+    includeTurnFinal: true,
+    stitchState: { lastTurnAtMs: baseTs }
+  });
+
+  assert.equal(
+    resolved,
+    "I need help with my project and I can spend around ten thousand dollars"
+  );
   assert.equal(session.queue.length, 0);
 });
 
@@ -144,6 +181,7 @@ test("waitForPostTurnResponseDelay drops incomplete intake stubs", async () => {
 test("runAutoGreeting uses prompt-driven opening", async () => {
   const session = new BotSession({ config: {} });
   session.status = "running";
+  session.meetJoinState = { status: "joined" };
   session.sessionConfig = {
     autoGreetingEnabled: true,
     autoGreetingDelayMs: 0,
@@ -165,4 +203,46 @@ test("runAutoGreeting uses prompt-driven opening", async () => {
     calls[0].commandText,
     "System event: The call is connected and the user is silent. Start naturally."
   );
+});
+
+test("runAutoGreeting skips when meet is not joined", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.meetJoinState = { status: "unknown" };
+  session.sessionConfig = {
+    autoGreetingEnabled: true,
+    autoGreetingDelayMs: 0,
+    autoGreetingPrompt: "hello"
+  };
+
+  const calls = [];
+  session.respondToCommand = async ({ source, commandText }) => {
+    calls.push({ source, commandText });
+  };
+
+  await session.runAutoGreeting({ responder: {} });
+
+  assert.equal(calls.length, 0);
+});
+
+test("waitForPostTurnResponseDelay caps first user turn delay", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.sessionConfig = {
+    postTurnResponseDelayMs: 1200,
+    firstTurnResponseDelayCapMs: 80,
+    openaiSttChunkMs: 1200
+  };
+
+  session.markSourceActivity("openai-stt");
+  const startedAt = Date.now();
+  const resolved = await session.waitForPostTurnResponseDelay({
+    source: "openai-stt",
+    commandText: "hello there I need some help",
+    isFirstUserTurn: true
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(resolved, "hello there I need some help");
+  assert.ok(elapsedMs < 450);
 });

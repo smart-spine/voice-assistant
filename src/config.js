@@ -409,6 +409,22 @@ const config = {
       integer: true
     }
   ),
+  turnStitchEnabled: asBoolean(process.env.TURN_STITCH_ENABLED, true),
+  turnStitchWindowMs: asBoundedNumber(process.env.TURN_STITCH_WINDOW_MS, {
+    fallback: 1100,
+    min: 200,
+    max: 5000,
+    integer: true
+  }),
+  firstTurnResponseDelayCapMs: asBoundedNumber(
+    process.env.FIRST_TURN_RESPONSE_DELAY_CAP_MS,
+    {
+      fallback: 120,
+      min: 0,
+      max: 2000,
+      integer: true
+    }
+  ),
   silenceAfterSpeakMs: asBoundedNumber(process.env.SILENCE_AFTER_SPEAK_MS, {
     fallback: 1000,
     min: 0,

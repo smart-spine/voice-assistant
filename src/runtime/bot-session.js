@@ -1,15 +1,7 @@
 const { startBridgeServer } = require("../bridge-server");
 const { createResponder } = require("../responder-factory");
-const {
-  launchBrowser,
-  setupBridgePage,
-  bridgeStartOpenAiStt,
-  bridgeSpeakAudio,
-  bridgeStopSpeaking,
-  bridgeStopOpenAiStt,
-  openMeetPage,
-  leaveMeetPage
-} = require("../meet-controller");
+const { launchBrowser } = require("../meet-controller");
+const { createTransportAdapter } = require("../transports/transport-factory");
 const { OpenAiSttTurnStream } = require("../openai-stt-service");
 const {
   extractCommandByWakeWord,
@@ -232,6 +224,16 @@ function isBridgeTransportError(err) {
   );
 }
 
+function isWithinTurnStitchWindow(baseAtMs, nextAtMs, windowMs) {
+  const base = Number(baseAtMs);
+  const next = Number(nextAtMs);
+  const window = Math.max(0, Number(windowMs) || 0);
+  if (!Number.isFinite(base) || !Number.isFinite(next)) {
+    return false;
+  }
+  return Math.abs(next - base) <= window;
+}
+
 class BotSession {
   constructor({ config, sessionId } = {}) {
     this.baseConfig = config;
@@ -247,8 +249,10 @@ class BotSession {
 
     this.server = null;
     this.browser = null;
+    this.transportAdapter = null;
     this.bridgePage = null;
     this.meetPage = null;
+    this.meetJoinState = null;
     this.processQueueHandler = null;
 
     this.queue = [];
@@ -266,6 +270,10 @@ class BotSession {
     this.activeAssistantRun = null;
     this.recentBotOutputs = [];
     this.lastInboundBySource = {};
+    this.transportAdapter = null;
+    this.bridgePage = null;
+    this.meetPage = null;
+    this.meetJoinState = null;
     this.isAssistantAudioPlaying = false;
     this.lastAssistantAudioAtMs = 0;
     this.bridgeBindings = null;
@@ -415,7 +423,10 @@ class BotSession {
         if (!text || this.isLikelyBotEcho(text)) {
           return;
         }
-        const accepted = this.enqueueTranscript(text, source, { isTurnFinal: true });
+        const accepted = this.enqueueTranscript(text, source, {
+          isTurnFinal: true,
+          receivedAtMs: event.ts
+        });
         if (!accepted) {
           return;
         }
@@ -438,24 +449,23 @@ class BotSession {
         onBridgeEvent: handleBridgeEvent
       };
 
-      this.info("Opening bridge page...");
-      this.bridgePage = await setupBridgePage({
+      this.transportAdapter = createTransportAdapter({
+        type: "meet",
         browser: this.browser,
         config: this.sessionConfig,
-        ...this.bridgeBindings
+        bridgeBindings: this.bridgeBindings
       });
 
+      this.info("Opening bridge page...");
       this.info("Opening Google Meet...");
-      const meetResult = await openMeetPage({
-        browser: this.browser,
-        config: this.sessionConfig
-      });
-      const meetPage = meetResult?.page || meetResult;
+      const transportState = await this.transportAdapter.start();
+      this.bridgePage =
+        transportState?.bridgePage || this.transportAdapter.getBridgePage();
+      this.meetPage = transportState?.meetPage || this.transportAdapter.getMeetPage();
       const meetJoinState =
-        meetResult && typeof meetResult === "object"
-          ? meetResult.joinState
-          : undefined;
-      this.meetPage = meetPage;
+        transportState?.joinState || this.transportAdapter.getJoinState();
+      this.meetJoinState = meetJoinState || null;
+
       if (meetJoinState?.status === "joined") {
         this.info("Meet joined successfully.");
       } else if (meetJoinState?.status === "auth_required") {
@@ -490,7 +500,7 @@ class BotSession {
       this.info(
         `OpenAI STT turn settings: turnSilenceMs=${openAiTurnSilenceMs}, vadThreshold=${this.sessionConfig.openaiSttVadThreshold}, hangoverMs=${this.sessionConfig.openaiSttHangoverMs}, segmentMinMs=${this.sessionConfig.openaiSttSegmentMinMs}, segmentMaxMs=${this.sessionConfig.openaiSttSegmentMaxMs}.`
       );
-      const started = await bridgeStartOpenAiStt(this.bridgePage, {
+      const started = await this.transportAdapter.startStt({
         chunkMs: this.sessionConfig.openaiSttChunkMs,
         mimeType: this.sessionConfig.openaiSttMimeType,
         deviceId: this.sessionConfig.openaiSttDeviceId,
@@ -567,59 +577,32 @@ class BotSession {
         this.hasProcessedUserTurn = false;
         this.startedAtMs = 0;
 
-        if (this.meetPage) {
+        if (this.transportAdapter) {
           try {
-            const hasLeftCall = await withTimeout(
-              leaveMeetPage(this.meetPage),
-              8000,
-              "Leave Meet"
+            const stopResult = await withTimeout(
+              this.transportAdapter.stop({ leaveMeet: true }),
+              12000,
+              "Transport stop"
             );
-            if (hasLeftCall) {
+            if (stopResult?.hasLeftCall) {
               this.info("Left Meet call before shutdown.");
             } else {
               this.warn(
                 "Could not confirm Meet leave action before shutdown; continuing."
               );
             }
-          } catch (leaveErr) {
+          } catch (transportStopErr) {
             this.warn(
-              `Meet leave action failed; continuing shutdown: ${
-                leaveErr?.message || leaveErr
+              `Transport stop failed; continuing shutdown: ${
+                transportStopErr?.message || transportStopErr
               }`
             );
           }
+          this.transportAdapter = null;
         }
-
-        if (this.bridgePage) {
-          try {
-            await bridgeStopOpenAiStt(this.bridgePage);
-          } catch (_) {
-            // Ignore openai-stt bridge stop errors.
-          }
-          try {
-            await withTimeout(
-              this.bridgePage.close({ runBeforeUnload: true }),
-              5000,
-              "Bridge page close"
-            );
-          } catch (_) {
-            // Ignore bridge close errors.
-          }
-          this.bridgePage = null;
-        }
-
-        if (this.meetPage) {
-          try {
-            await withTimeout(
-              this.meetPage.close({ runBeforeUnload: true }),
-              5000,
-              "Meet page close"
-            );
-          } catch (_) {
-            // Ignore meet page close errors.
-          }
-          this.meetPage = null;
-        }
+        this.bridgePage = null;
+        this.meetPage = null;
+        this.meetJoinState = null;
 
         if (this.browser) {
           try {
@@ -648,8 +631,10 @@ class BotSession {
 
         await this.runCallSummaryWorkflow(summaryTurns);
       } finally {
+        this.transportAdapter = null;
         this.bridgePage = null;
         this.meetPage = null;
+        this.meetJoinState = null;
         this.activeSttSource = "";
         this.status = "stopped";
         this.stoppedAt = new Date().toISOString();
@@ -664,7 +649,11 @@ class BotSession {
     return this.stopPromise;
   }
 
-  enqueueTranscript(text, source, { isTurnFinal = false } = {}) {
+  enqueueTranscript(
+    text,
+    source,
+    { isTurnFinal = false, receivedAtMs } = {}
+  ) {
     const normalizedText = normalizeText(text);
     const normalizedSource = normalizeText(source || "unknown") || "unknown";
     if (!normalizedText) {
@@ -684,7 +673,10 @@ class BotSession {
     this.queue.push({
       text: normalizedText,
       source: normalizedSource,
-      isTurnFinal: Boolean(isTurnFinal)
+      isTurnFinal: Boolean(isTurnFinal),
+      receivedAtMs: Number.isFinite(Number(receivedAtMs))
+        ? Number(receivedAtMs)
+        : Date.now()
     });
     if (this.queue.length > this.maxQueueSize) {
       this.queue.shift();
@@ -795,7 +787,9 @@ class BotSession {
 
       commandText = await this.waitForPostTurnResponseDelay({
         source: item.source,
-        commandText
+        commandText,
+        isFirstUserTurn: !this.hasProcessedUserTurn,
+        initialTurnAtMs: item.receivedAtMs
       });
       if (!commandText || commandText.length < 2) {
         return;
@@ -853,6 +847,9 @@ class BotSession {
     if (this.status !== "running" || this.isStopping) {
       return;
     }
+    if (this.meetJoinState?.status !== "joined") {
+      return;
+    }
     if (this.hasProcessedUserTurn) {
       return;
     }
@@ -883,7 +880,7 @@ class BotSession {
     if (
       !this.browser ||
       !this.sessionConfig ||
-      !this.bridgeBindings ||
+      !this.transportAdapter ||
       this.isStopping
     ) {
       return false;
@@ -898,27 +895,8 @@ class BotSession {
     this.warn(`Bridge page unavailable (${reason}); attempting recovery.`);
 
     try {
-      if (this.bridgePage && !this.bridgePage.isClosed()) {
-        await withTimeout(
-          this.bridgePage.close({ runBeforeUnload: true }),
-          3000,
-          "Bridge page close"
-        );
-      }
-    } catch (_) {
-      // Ignore stale bridge page close errors.
-    } finally {
-      this.bridgePage = null;
-    }
-
-    try {
-      this.bridgePage = await setupBridgePage({
-        browser: this.browser,
-        config: this.sessionConfig,
-        ...this.bridgeBindings
-      });
-
-      await bridgeStartOpenAiStt(this.bridgePage, {
+      this.bridgePage = await this.transportAdapter.reopenBridge();
+      await this.transportAdapter.startStt({
         chunkMs: this.sessionConfig.openaiSttChunkMs,
         mimeType: this.sessionConfig.openaiSttMimeType,
         deviceId: this.sessionConfig.openaiSttDeviceId,
@@ -948,7 +926,11 @@ class BotSession {
       return false;
     }
 
-    if (!this.bridgePage || this.bridgePage.isClosed()) {
+    if (
+      !this.transportAdapter ||
+      !this.bridgePage ||
+      this.bridgePage.isClosed()
+    ) {
       const recovered = await this.recoverBridgePage("bridge page closed");
       if (!recovered) {
         return false;
@@ -956,7 +938,7 @@ class BotSession {
     }
 
     try {
-      return Boolean(await bridgeSpeakAudio(this.bridgePage, payload));
+      return Boolean(await this.transportAdapter.playAudio(payload));
     } catch (err) {
       if (!isBridgeTransportError(err)) {
         throw err;
@@ -965,10 +947,15 @@ class BotSession {
       const recovered = await this.recoverBridgePage(
         "audio playback bridge transport error"
       );
-      if (!recovered || !this.bridgePage || this.bridgePage.isClosed()) {
+      if (
+        !recovered ||
+        !this.transportAdapter ||
+        !this.bridgePage ||
+        this.bridgePage.isClosed()
+      ) {
         return false;
       }
-      return Boolean(await bridgeSpeakAudio(this.bridgePage, payload));
+      return Boolean(await this.transportAdapter.playAudio(payload));
     }
   }
 
@@ -1263,8 +1250,8 @@ class BotSession {
 
     run.abortController.abort();
     try {
-      if (this.bridgePage) {
-        await bridgeStopSpeaking(this.bridgePage);
+      if (this.transportAdapter && this.bridgePage) {
+        await this.transportAdapter.stopSpeaking();
       }
     } catch (_) {
       // Ignore playback interruption transport errors.
@@ -1288,7 +1275,12 @@ class BotSession {
     return Date.now() - lastAt;
   }
 
-  async waitForPostTurnResponseDelay({ source, commandText }) {
+  async waitForPostTurnResponseDelay({
+    source,
+    commandText,
+    isFirstUserTurn = false,
+    initialTurnAtMs
+  }) {
     let resolved = normalizeText(commandText);
     if (!resolved) {
       return "";
@@ -1308,13 +1300,21 @@ class BotSession {
       (hasBudgetSignal(resolved) && hasExplicitBudgetValue(resolved));
     const realtimeDelayCapMs = 350;
     const highSignalDelayCapMs = 320;
-    const delayMs = isIncompleteIntakeStub
+    let delayMs = isIncompleteIntakeStub
       ? Math.max(configuredDelayMs, 2800)
       : hasHighSignalComplete
         ? Math.min(configuredDelayMs, highSignalDelayCapMs)
         : isOpenAiSttSource
           ? Math.min(configuredDelayMs, realtimeDelayCapMs)
           : configuredDelayMs;
+
+    if (isFirstUserTurn && !isIncompleteIntakeStub) {
+      const firstTurnCapMs = Math.max(
+        0,
+        Number(this.sessionConfig?.firstTurnResponseDelayCapMs ?? 120)
+      );
+      delayMs = Math.min(delayMs, firstTurnCapMs);
+    }
 
     const openAiChunkMs = Number(this.sessionConfig?.openaiSttChunkMs || 1200);
     const chunkAllowanceMs = isOpenAiSttSource
@@ -1329,12 +1329,19 @@ class BotSession {
       )
     );
 
+    const stitchState = {
+      lastTurnAtMs: Number.isFinite(Number(initialTurnAtMs))
+        ? Number(initialTurnAtMs)
+        : Date.now()
+    };
+
     const startedAt = Date.now();
     while (Date.now() - startedAt < hardMaxWaitMs) {
       resolved = this.consumeExpandedQueueText({
         source,
         currentText: resolved,
-        includeTurnFinal: true
+        includeTurnFinal: true,
+        stitchState
       });
 
       if (this.isStopping || this.status !== "running") {
@@ -1356,7 +1363,8 @@ class BotSession {
     resolved = this.consumeExpandedQueueText({
       source,
       currentText: resolved,
-      includeTurnFinal: true
+      includeTurnFinal: true,
+      stitchState
     });
     if (isLikelyIncompleteIntakeStub(resolved)) {
       return "";
@@ -1367,7 +1375,8 @@ class BotSession {
   consumeExpandedQueueText({
     source,
     currentText,
-    includeTurnFinal = false
+    includeTurnFinal = false,
+    stitchState = null
   }) {
     if (!Array.isArray(this.queue) || this.queue.length === 0) {
       return currentText;
@@ -1376,6 +1385,12 @@ class BotSession {
     let resolvedText = currentText;
     const consumedIndexes = [];
     let resolvedComparable = normalizeComparableText(resolvedText);
+    const turnStitchEnabled =
+      includeTurnFinal && this.sessionConfig?.turnStitchEnabled !== false;
+    const turnStitchWindowMs = Math.max(
+      200,
+      Number(this.sessionConfig?.turnStitchWindowMs || 1100)
+    );
 
     for (let index = 0; index < this.queue.length; index += 1) {
       const item = this.queue[index];
@@ -1398,11 +1413,17 @@ class BotSession {
         consumedIndexes.push(index);
         continue;
       }
+      const queuedAtMs = Number.isFinite(Number(item.receivedAtMs))
+        ? Number(item.receivedAtMs)
+        : Date.now();
 
       if (resolvedComparable === queuedComparable) {
         resolvedText = queuedText;
         resolvedComparable = queuedComparable;
         consumedIndexes.push(index);
+        if (stitchState && Number.isFinite(queuedAtMs)) {
+          stitchState.lastTurnAtMs = queuedAtMs;
+        }
         continue;
       }
 
@@ -1415,6 +1436,36 @@ class BotSession {
           resolvedComparable = queuedComparable;
         }
         consumedIndexes.push(index);
+        if (stitchState && Number.isFinite(queuedAtMs)) {
+          stitchState.lastTurnAtMs = queuedAtMs;
+        }
+        continue;
+      }
+
+      const shouldStitchAdjacentFinals =
+        turnStitchEnabled &&
+        item.isTurnFinal &&
+        countWords(queuedText) >= 2 &&
+        countWords(resolvedText) >= 2 &&
+        isLikelyIncompleteFragment(resolvedText, {
+          minWordsForComplete: 4
+        }) &&
+        isWithinTurnStitchWindow(
+          stitchState?.lastTurnAtMs,
+          queuedAtMs,
+          turnStitchWindowMs
+        );
+
+      if (shouldStitchAdjacentFinals) {
+        const stitched = normalizeText(`${resolvedText} ${queuedText}`);
+        if (stitched && stitched !== resolvedText) {
+          resolvedText = stitched;
+          resolvedComparable = normalizeComparableText(stitched);
+        }
+        consumedIndexes.push(index);
+        if (stitchState && Number.isFinite(queuedAtMs)) {
+          stitchState.lastTurnAtMs = queuedAtMs;
+        }
       }
     }
 
