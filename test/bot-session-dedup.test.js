@@ -231,6 +231,31 @@ test("runAutoGreeting skips when meet is not joined", async () => {
   assert.equal(calls.length, 0);
 });
 
+test("runAutoGreeting is deduplicated across concurrent triggers", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.meetJoinState = { status: "joined" };
+  session.sessionConfig = {
+    autoGreetingEnabled: true,
+    autoGreetingDelayMs: 0,
+    autoGreetingPrompt: "hello"
+  };
+
+  let calls = 0;
+  session.respondToCommand = async () => {
+    calls += 1;
+    await sleep(40);
+  };
+
+  await Promise.all([
+    session.runAutoGreeting({ responder: {} }),
+    session.runAutoGreeting({ responder: {} })
+  ]);
+
+  assert.equal(calls, 1);
+  assert.equal(session.autoGreetingCompleted, true);
+});
+
 test("consumePendingUserContinuation merges previous user turn after barge-in", () => {
   const session = new BotSession({ config: {} });
   session.sessionConfig = {

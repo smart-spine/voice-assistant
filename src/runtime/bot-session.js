@@ -307,6 +307,8 @@ class BotSession {
     this.activeSttSource = "";
     this.lastBridgeRecoveryAtMs = 0;
     this.hasProcessedUserTurn = false;
+    this.autoGreetingInFlight = false;
+    this.autoGreetingCompleted = false;
     this.joinStateMonitorStopRequested = false;
     this.joinStateMonitorPromise = null;
     this.responder = null;
@@ -362,6 +364,8 @@ class BotSession {
     this.activeSttSource = "";
     this.lastBridgeRecoveryAtMs = 0;
     this.hasProcessedUserTurn = false;
+    this.autoGreetingInFlight = false;
+    this.autoGreetingCompleted = false;
 
     const sessionSystemPrompt = buildSystemPrompt({
       basePrompt: this.sessionConfig.systemPrompt,
@@ -1024,6 +1028,9 @@ class BotSession {
     if (!this.sessionConfig?.autoGreetingEnabled) {
       return;
     }
+    if (this.autoGreetingCompleted || this.autoGreetingInFlight) {
+      return;
+    }
 
     const delayMs = Math.max(
       0,
@@ -1054,14 +1061,18 @@ class BotSession {
       return;
     }
 
+    this.autoGreetingInFlight = true;
     try {
       await this.respondToCommand({
         responder,
         source: "system",
         commandText: prompt
       });
+      this.autoGreetingCompleted = true;
     } catch (err) {
       this.warn(`Auto greeting failed: ${err?.message || err}`);
+    } finally {
+      this.autoGreetingInFlight = false;
     }
   }
 
