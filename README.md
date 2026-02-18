@@ -217,6 +217,7 @@ Browser:
 - `HEADLESS`
 - `CHROME_PATH`
 - `CHROME_USER_DATA_DIR`
+- `MEET_ASSUME_LOGGED_IN` (default `false`; when `true`, do not fail startup on temporary `auth_required` join-state detection)
 - `MEET_JOIN_STATE_TIMEOUT_MS` (initial join-state wait during startup; lower means faster startup when Meet is slow to report joined)
 - `MEET_JOIN_POLL_MS` (background join-state polling interval used after startup)
 - `MEET_JOIN_CLICK_ATTEMPTS` (max join-button retries on prejoin screen)

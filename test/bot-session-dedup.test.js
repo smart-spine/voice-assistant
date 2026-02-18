@@ -319,3 +319,73 @@ test("startJoinStateMonitor updates join state and triggers auto greeting", asyn
   assert.equal(session.meetJoinState?.status, "joined");
   assert.equal(greetingCalls, 1);
 });
+
+test("startJoinStateMonitor keeps polling on auth_required when MEET_ASSUME_LOGGED_IN=true", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.sessionConfig = {
+    meetJoinPollMs: 5,
+    meetAssumeLoggedIn: true,
+    autoGreetingEnabled: true,
+    autoGreetingDelayMs: 0,
+    autoGreetingPrompt: "hello"
+  };
+  session.meetPage = { isClosed: () => false };
+  let refreshCalls = 0;
+  session.transportAdapter = {
+    refreshJoinState: async () => {
+      refreshCalls += 1;
+      if (refreshCalls === 1) {
+        return { status: "auth_required", url: "https://accounts.google.com/" };
+      }
+      return { status: "joined", url: "https://meet.google.com/abc-defg-hij" };
+    }
+  };
+
+  let greetingCalls = 0;
+  session.runAutoGreeting = async () => {
+    greetingCalls += 1;
+  };
+
+  session.startJoinStateMonitor({ responder: {} });
+  if (session.joinStateMonitorPromise) {
+    await session.joinStateMonitorPromise;
+  } else {
+    await sleep(80);
+  }
+
+  assert.ok(refreshCalls >= 2);
+  assert.equal(session.meetJoinState?.status, "joined");
+  assert.equal(greetingCalls, 1);
+});
+
+test("processQueue ignores openai-stt turns while meet is not joined", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.bridgePage = {};
+  session.meetPage = {};
+  session.meetJoinState = { status: "prejoin" };
+  session.sessionConfig = {
+    wakeWord: "",
+    postTurnResponseDelayMs: 0
+  };
+  session.queue = [
+    {
+      text: "Hello are you there?",
+      source: "openai-stt",
+      isTurnFinal: true,
+      receivedAtMs: Date.now()
+    }
+  ];
+
+  let called = false;
+  await session.processQueue({
+    respond: async () => {
+      called = true;
+      return { text: "x", aborted: false };
+    }
+  });
+
+  assert.equal(called, false);
+  assert.equal(session.queue.length, 0);
+});

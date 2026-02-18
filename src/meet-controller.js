@@ -251,12 +251,17 @@ async function openMeetPage({ browser, config }) {
   void keepMicUnmuted(page, 120000);
 
   const joinState = await waitForMeetJoinState(page, {
-    timeoutMs: Number(config?.meetJoinStateTimeoutMs || 6000)
+    timeoutMs: Number(config?.meetJoinStateTimeoutMs || 6000),
+    pollMs: Number(config?.meetJoinPollMs || 900),
+    stopOnAuthRequired: !config?.meetAssumeLoggedIn
   });
   return { page, joinState };
 }
 
-async function waitForMeetJoinState(page, { timeoutMs = 18000, pollMs = 900 } = {}) {
+async function waitForMeetJoinState(
+  page,
+  { timeoutMs = 18000, pollMs = 900, stopOnAuthRequired = true } = {}
+) {
   const startedAt = Date.now();
   let lastState = {
     status: "unknown",
@@ -271,7 +276,10 @@ async function waitForMeetJoinState(page, { timeoutMs = 18000, pollMs = 900 } = 
       // Ignore transient navigation/evaluation failures.
     }
 
-    if (lastState.status === "joined" || lastState.status === "auth_required") {
+    if (lastState.status === "joined") {
+      return lastState;
+    }
+    if (stopOnAuthRequired && lastState.status === "auth_required") {
       return lastState;
     }
 

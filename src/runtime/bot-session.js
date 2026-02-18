@@ -506,9 +506,15 @@ class BotSession {
         this.info("Meet joined successfully.");
       } else if (meetJoinState?.status === "auth_required") {
         const joinUrl = String(meetJoinState?.url || this.sessionConfig.meetUrl || "");
-        throw new Error(
-          `Meet authentication is required before joining (${joinUrl}). Log in with the same CHROME_USER_DATA_DIR and retry.`
-        );
+        if (this.sessionConfig?.meetAssumeLoggedIn) {
+          this.warn(
+            `Meet reported auth_required (${joinUrl}), but MEET_ASSUME_LOGGED_IN=true so startup will continue.`
+          );
+        } else {
+          throw new Error(
+            `Meet authentication is required before joining (${joinUrl}). Log in with the same CHROME_USER_DATA_DIR and retry.`
+          );
+        }
       } else {
         this.info(
           `Meet page ready (join attempt executed, state=${String(
@@ -840,6 +846,20 @@ class BotSession {
         return;
       }
 
+      const meetJoinStatus = normalizeText(this.meetJoinState?.status || "")
+        .toLowerCase()
+        .trim();
+      const shouldIgnoreUntilMeetJoined =
+        item.source === "openai-stt" &&
+        this.meetPage &&
+        meetJoinStatus !== "joined";
+      if (shouldIgnoreUntilMeetJoined) {
+        this.info(
+          `Ignoring STT turn while Meet state=${meetJoinStatus || "unknown"}.`
+        );
+        return;
+      }
+
       commandText = await this.waitForPostTurnResponseDelay({
         source: item.source,
         commandText,
@@ -965,10 +985,13 @@ class BotSession {
         }
 
         if (nextStatus === "auth_required") {
-          this.warn(
-            "Meet session requires authentication; auto-greeting is paused until login is completed."
-          );
-          break;
+          if (!this.sessionConfig?.meetAssumeLoggedIn) {
+            this.warn(
+              "Meet session requires authentication; auto-greeting is paused until login is completed."
+            );
+            break;
+          }
+          continue;
         }
       }
     })()

@@ -465,6 +465,7 @@ const config = {
   headless: asBoolean(process.env.HEADLESS, false),
   chromePath: cleanString(process.env.CHROME_PATH),
   chromeUserDataDir: process.env.CHROME_USER_DATA_DIR || ".chrome-profile",
+  meetAssumeLoggedIn: asBoolean(process.env.MEET_ASSUME_LOGGED_IN, false),
   meetJoinStateTimeoutMs: asBoundedNumber(
     process.env.MEET_JOIN_STATE_TIMEOUT_MS,
     {
