@@ -99,6 +99,7 @@ test("waitForPostTurnResponseDelay keeps latest final transcript expansion", asy
   session.status = "running";
   session.sessionConfig = {
     postTurnResponseDelayMs: 60,
+    turnContinuationSilenceMs: 60,
     openaiSttChunkMs: 120
   };
   session.markSourceActivity("openai-stt");
@@ -116,11 +117,12 @@ test("waitForPostTurnResponseDelay keeps latest final transcript expansion", asy
   assert.equal(resolved, "tell me a joke");
 });
 
-test("waitForPostTurnResponseDelay is shortened for high-signal turns", async () => {
+test("waitForPostTurnResponseDelay respects continuation silence for openai-stt", async () => {
   const session = new BotSession({ config: {} });
   session.status = "running";
   session.sessionConfig = {
-    postTurnResponseDelayMs: 2000,
+    postTurnResponseDelayMs: 10,
+    turnContinuationSilenceMs: 140,
     openaiSttChunkMs: 1200
   };
 
@@ -128,32 +130,34 @@ test("waitForPostTurnResponseDelay is shortened for high-signal turns", async ()
   const startedAt = Date.now();
   const resolved = await session.waitForPostTurnResponseDelay({
     source: "openai-stt",
-    commandText: "my name is vlad"
+    commandText: "I need help with a proposal"
   });
   const elapsedMs = Date.now() - startedAt;
 
-  assert.equal(resolved, "my name is vlad");
-  assert.ok(elapsedMs < 1200);
+  assert.equal(resolved, "I need help with a proposal");
+  assert.ok(elapsedMs >= 100);
 });
 
-test("waitForPostTurnResponseDelay treats i'm-name as high-signal name turn", async () => {
+test("waitForPostTurnResponseDelay extends wait for max-duration STT segment", async () => {
   const session = new BotSession({ config: {} });
   session.status = "running";
   session.sessionConfig = {
-    postTurnResponseDelayMs: 2000,
-    openaiSttChunkMs: 1200
+    turnContinuationSilenceMs: 80,
+    openaiSttSegmentMaxMs: 400,
+    openaiSttChunkMs: 100
   };
 
   session.markSourceActivity("openai-stt");
   const startedAt = Date.now();
   const resolved = await session.waitForPostTurnResponseDelay({
     source: "openai-stt",
-    commandText: "I'm Vlad"
+    commandText: "long sentence fragment",
+    initialSegmentDurationMs: 390
   });
   const elapsedMs = Date.now() - startedAt;
 
-  assert.equal(resolved, "I'm Vlad");
-  assert.ok(elapsedMs < 1200);
+  assert.equal(resolved, "long sentence fragment");
+  assert.ok(elapsedMs >= 350);
 });
 
 test("waitForPostTurnResponseDelay drops incomplete intake stubs", async () => {
@@ -161,6 +165,7 @@ test("waitForPostTurnResponseDelay drops incomplete intake stubs", async () => {
   session.status = "running";
   session.sessionConfig = {
     postTurnResponseDelayMs: 300,
+    turnContinuationSilenceMs: 80,
     openaiSttChunkMs: 1200
   };
 
@@ -226,26 +231,44 @@ test("runAutoGreeting skips when meet is not joined", async () => {
   assert.equal(calls.length, 0);
 });
 
-test("waitForPostTurnResponseDelay caps first user turn delay", async () => {
+test("consumePendingUserContinuation merges previous user turn after barge-in", () => {
   const session = new BotSession({ config: {} });
-  session.status = "running";
   session.sessionConfig = {
-    postTurnResponseDelayMs: 1200,
-    firstTurnResponseDelayCapMs: 80,
-    openaiSttChunkMs: 1200
+    bargeInContinuationWindowMs: 20000
   };
-
-  session.markSourceActivity("openai-stt");
-  const startedAt = Date.now();
-  const resolved = await session.waitForPostTurnResponseDelay({
+  session.lastUserTurnText = "I need help with the real estate bot";
+  session.markPendingUserContinuation({
     source: "openai-stt",
-    commandText: "hello there I need some help",
-    isFirstUserTurn: true
+    text: "and the budget is twenty thousand"
   });
-  const elapsedMs = Date.now() - startedAt;
 
-  assert.equal(resolved, "hello there I need some help");
-  assert.ok(elapsedMs < 450);
+  const merged = session.consumePendingUserContinuation({
+    source: "openai-stt",
+    currentText: "and the budget is twenty thousand"
+  });
+
+  assert.equal(
+    merged,
+    "I need help with the real estate bot and the budget is twenty thousand"
+  );
+});
+
+test("consumePendingUserContinuation skips stale pending continuation", () => {
+  const session = new BotSession({ config: {} });
+  session.sessionConfig = {
+    bargeInContinuationWindowMs: 1000
+  };
+  session.pendingContinuationBaseText = "my previous sentence";
+  session.pendingContinuationSetAtMs = Date.now() - 5000;
+
+  const merged = session.consumePendingUserContinuation({
+    source: "openai-stt",
+    currentText: "new sentence"
+  });
+
+  assert.equal(merged, "new sentence");
+  assert.equal(session.pendingContinuationBaseText, "");
+  assert.equal(session.pendingContinuationSetAtMs, 0);
 });
 
 test("waitForPostTurnResponseDelay keeps first short greeting", async () => {
@@ -253,6 +276,7 @@ test("waitForPostTurnResponseDelay keeps first short greeting", async () => {
   session.status = "running";
   session.sessionConfig = {
     postTurnResponseDelayMs: 300,
+    turnContinuationSilenceMs: 80,
     openaiSttChunkMs: 1200
   };
 

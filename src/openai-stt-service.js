@@ -240,7 +240,9 @@ class OpenAiSttTurnStream {
     }
 
     if (isSegmentFinal) {
-      this.pushSegmentFinalTranscript(normalizedTranscribed, ts);
+      this.pushSegmentFinalTranscript(normalizedTranscribed, ts, {
+        durationMs
+      });
       return;
     }
 
@@ -366,7 +368,7 @@ class OpenAiSttTurnStream {
     return buffer;
   }
 
-  pushSegmentFinalTranscript(text, ts) {
+  pushSegmentFinalTranscript(text, ts, { durationMs } = {}) {
     const normalizedText = normalizeText(text);
     const comparable = normalizeComparableText(normalizedText);
     if (!normalizedText || !comparable) {
@@ -388,6 +390,9 @@ class OpenAiSttTurnStream {
     }
 
     const turnId = createTurnId();
+    const segmentDurationMs = Number.isFinite(Number(durationMs))
+      ? Math.max(0, Math.trunc(Number(durationMs)))
+      : undefined;
     this.emit({
       type: "speech.start",
       turnId,
@@ -412,6 +417,7 @@ class OpenAiSttTurnStream {
       text: normalizedText,
       turnId,
       isFinal: true,
+      segmentDurationMs,
       ts: now
     });
     this.emit({

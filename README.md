@@ -169,12 +169,12 @@ STT:
 - `OPENAI_STT_VAD_THRESHOLD` (default `0.015`; voice activity threshold for segment start/continue)
 - `OPENAI_STT_HANGOVER_MS` (default `700`; silence window before segment flush)
 - `OPENAI_STT_SEGMENT_MIN_MS` (default `900`; drop too-short segments)
-- `OPENAI_STT_SEGMENT_MAX_MS` (default `7000`; force flush long utterances)
+- `OPENAI_STT_SEGMENT_MAX_MS` (default `15000`; force flush very long utterances)
 - `BRIDGE_TTS_OUTPUT_DEVICE_ID` (optional explicit audio output device id for bridge playback)
 - `BRIDGE_TTS_OUTPUT_DEVICE_LABEL` (optional label match for bridge playback sink; useful for forcing TTS to `BlackHole 2ch`)
 - `TURN_SILENCE_MS`
 - `POST_TURN_RESPONSE_DELAY_MS`
-- `FIRST_TURN_RESPONSE_DELAY_CAP_MS` (caps extra delay for the very first user turn to keep initial reply snappy)
+- `TURN_CONTINUATION_SILENCE_MS` (default `3000`; wait this long for user continuation before responding)
 - `TURN_STITCH_ENABLED` (merge adjacent final STT turns when first segment looks incomplete)
 - `TURN_STITCH_WINDOW_MS` (max gap for final-turn stitching, default `1100`)
 
@@ -188,11 +188,11 @@ Conversation/runtime:
 - `BARGE_IN_ON_PARTIALS` (default `false`; keep disabled to avoid canceling replies on unstable interim STT text)
 - `BARGE_IN_MIN_MS`
 - `BARGE_IN_MIN_WORDS_OPENAI_STT` (default `2`; avoids barge-in on one-word STT noise)
+- `BARGE_IN_CONTINUATION_WINDOW_MS` (default `20000`; max age of previous user turn used for continuation merge after barge-in)
 - `SILENCE_AFTER_SPEAK_MS`
 - `INBOUND_DEDUP_MS`
 - `AUTO_GREETING_ENABLED`
 - `AUTO_GREETING_DELAY_MS`
-- `AUTO_GREETING_TEXT`
 - `AUTO_GREETING_PROMPT`
 
 Prompt/context:

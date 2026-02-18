@@ -235,6 +235,32 @@ function isWithinTurnStitchWindow(baseAtMs, nextAtMs, windowMs) {
   return Math.abs(next - base) <= window;
 }
 
+function mergeUserContinuationText(baseText, continuationText) {
+  const base = normalizeText(baseText);
+  const continuation = normalizeText(continuationText);
+  if (!base) {
+    return continuation;
+  }
+  if (!continuation) {
+    return base;
+  }
+
+  const baseComparable = normalizeComparableText(base);
+  const continuationComparable = normalizeComparableText(continuation);
+  if (!baseComparable || !continuationComparable) {
+    return normalizeText(`${base} ${continuation}`);
+  }
+
+  if (continuationComparable.startsWith(baseComparable)) {
+    return continuation;
+  }
+  if (baseComparable.startsWith(continuationComparable)) {
+    return base;
+  }
+
+  return normalizeText(`${base} ${continuation}`);
+}
+
 class BotSession {
   constructor({ config, sessionId } = {}) {
     this.baseConfig = config;
@@ -268,13 +294,12 @@ class BotSession {
 
     this.lastAcceptedText = "";
     this.lastAcceptedAtMs = 0;
+    this.lastUserTurnText = "";
+    this.pendingContinuationBaseText = "";
+    this.pendingContinuationSetAtMs = 0;
     this.activeAssistantRun = null;
     this.recentBotOutputs = [];
     this.lastInboundBySource = {};
-    this.transportAdapter = null;
-    this.bridgePage = null;
-    this.meetPage = null;
-    this.meetJoinState = null;
     this.isAssistantAudioPlaying = false;
     this.lastAssistantAudioAtMs = 0;
     this.bridgeBindings = null;
@@ -284,9 +309,6 @@ class BotSession {
     this.hasProcessedUserTurn = false;
     this.joinStateMonitorStopRequested = false;
     this.joinStateMonitorPromise = null;
-    this.responder = null;
-    this.joinStateMonitorPromise = null;
-    this.joinStateMonitorStopRequested = false;
     this.responder = null;
   }
 
@@ -325,6 +347,11 @@ class BotSession {
       Number(this.sessionConfig.callSummaryMaxTurns || 40) * 3
     );
     this.lastSourceActivityAtMs = {};
+    this.lastAcceptedText = "";
+    this.lastAcceptedAtMs = 0;
+    this.lastUserTurnText = "";
+    this.pendingContinuationBaseText = "";
+    this.pendingContinuationSetAtMs = 0;
     this.activeAssistantRun = null;
     this.recentBotOutputs = [];
     this.lastInboundBySource = {};
@@ -433,7 +460,8 @@ class BotSession {
         }
         const accepted = this.enqueueTranscript(text, source, {
           isTurnFinal: true,
-          receivedAtMs: event.ts
+          receivedAtMs: event.ts,
+          segmentDurationMs: event.segmentDurationMs
         });
         if (!accepted) {
           return;
@@ -587,6 +615,11 @@ class BotSession {
         this.hasProcessedUserTurn = false;
         this.startedAtMs = 0;
         this.responder = null;
+        this.lastAcceptedText = "";
+        this.lastAcceptedAtMs = 0;
+        this.lastUserTurnText = "";
+        this.pendingContinuationBaseText = "";
+        this.pendingContinuationSetAtMs = 0;
 
         if (this.transportAdapter) {
           try {
@@ -650,6 +683,11 @@ class BotSession {
         this.meetJoinState = null;
         this.activeSttSource = "";
         this.responder = null;
+        this.lastAcceptedText = "";
+        this.lastAcceptedAtMs = 0;
+        this.lastUserTurnText = "";
+        this.pendingContinuationBaseText = "";
+        this.pendingContinuationSetAtMs = 0;
         this.status = "stopped";
         this.stoppedAt = new Date().toISOString();
         this.isStopping = false;
@@ -666,7 +704,7 @@ class BotSession {
   enqueueTranscript(
     text,
     source,
-    { isTurnFinal = false, receivedAtMs } = {}
+    { isTurnFinal = false, receivedAtMs, segmentDurationMs } = {}
   ) {
     const normalizedText = normalizeText(text);
     const normalizedSource = normalizeText(source || "unknown") || "unknown";
@@ -690,7 +728,10 @@ class BotSession {
       isTurnFinal: Boolean(isTurnFinal),
       receivedAtMs: Number.isFinite(Number(receivedAtMs))
         ? Number(receivedAtMs)
-        : Date.now()
+        : Date.now(),
+      segmentDurationMs: Number.isFinite(Number(segmentDurationMs))
+        ? Number(segmentDurationMs)
+        : undefined
     });
     if (this.queue.length > this.maxQueueSize) {
       this.queue.shift();
@@ -803,7 +844,12 @@ class BotSession {
         source: item.source,
         commandText,
         isFirstUserTurn: !this.hasProcessedUserTurn,
-        initialTurnAtMs: item.receivedAtMs
+        initialTurnAtMs: item.receivedAtMs,
+        initialSegmentDurationMs: item.segmentDurationMs
+      });
+      commandText = this.consumePendingUserContinuation({
+        source: item.source,
+        currentText: commandText
       });
       if (!commandText || commandText.length < 2) {
         return;
@@ -829,6 +875,9 @@ class BotSession {
       this.lastAcceptedText = commandText;
       this.lastAcceptedAtMs = now;
       this.hasProcessedUserTurn = true;
+      if (item.source !== "system") {
+        this.lastUserTurnText = commandText;
+      }
 
       const sttToHandleMs = Number.isFinite(Number(item.receivedAtMs))
         ? Math.max(0, now - Number(item.receivedAtMs))
@@ -1385,7 +1434,59 @@ class BotSession {
       return;
     }
 
+    this.markPendingUserContinuation({
+      source: normalizedSource,
+      text
+    });
     void this.interruptAssistantRun(`barge-in:${source}:${reason}`);
+  }
+
+  markPendingUserContinuation({ source, text }) {
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    if (normalizedSource === "system") {
+      return;
+    }
+
+    const latestUserText = normalizeText(this.lastUserTurnText);
+    const incomingText = normalizeText(text);
+    if (!latestUserText || !incomingText) {
+      return;
+    }
+
+    this.pendingContinuationBaseText = latestUserText;
+    this.pendingContinuationSetAtMs = Date.now();
+  }
+
+  consumePendingUserContinuation({ source, currentText }) {
+    const normalizedCurrent = normalizeText(currentText);
+    if (!normalizedCurrent) {
+      return "";
+    }
+
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    if (normalizedSource === "system") {
+      return normalizedCurrent;
+    }
+
+    const base = normalizeText(this.pendingContinuationBaseText);
+    const setAtMs = Number(this.pendingContinuationSetAtMs || 0);
+    if (!base || !Number.isFinite(setAtMs) || setAtMs <= 0) {
+      return normalizedCurrent;
+    }
+
+    const continuationWindowMs = Math.max(
+      1000,
+      Number(this.sessionConfig?.bargeInContinuationWindowMs || 20000)
+    );
+    if (Date.now() - setAtMs > continuationWindowMs) {
+      this.pendingContinuationBaseText = "";
+      this.pendingContinuationSetAtMs = 0;
+      return normalizedCurrent;
+    }
+
+    this.pendingContinuationBaseText = "";
+    this.pendingContinuationSetAtMs = 0;
+    return mergeUserContinuationText(base, normalizedCurrent);
   }
 
   async interruptAssistantRun(reason = "interrupted") {
@@ -1425,7 +1526,8 @@ class BotSession {
     source,
     commandText,
     isFirstUserTurn = false,
-    initialTurnAtMs
+    initialTurnAtMs,
+    initialSegmentDurationMs
   }) {
     let resolved = normalizeText(commandText);
     if (!resolved) {
@@ -1434,32 +1536,47 @@ class BotSession {
     const normalizedSource = normalizeText(source || "unknown") || "unknown";
     const isOpenAiSttSource = normalizedSource === "openai-stt";
 
-    const configuredDelayMs = Number(
-      this.sessionConfig?.postTurnResponseDelayMs || 0
+    const configuredDelayMsRaw = Number(
+      this.sessionConfig?.postTurnResponseDelayMs
     );
-    if (!Number.isFinite(configuredDelayMs) || configuredDelayMs <= 0) {
+    const continuationSilenceMsRaw = Number(
+      this.sessionConfig?.turnContinuationSilenceMs
+    );
+    const configuredDelayMs = Number.isFinite(configuredDelayMsRaw)
+      ? Math.max(0, configuredDelayMsRaw)
+      : 0;
+    const continuationSilenceMs = Number.isFinite(continuationSilenceMsRaw)
+      ? Math.max(500, continuationSilenceMsRaw)
+      : 3000;
+
+    let delayMs = isOpenAiSttSource
+      ? continuationSilenceMs
+      : configuredDelayMs;
+    if (delayMs <= 0) {
       return resolved;
     }
-    const isIncompleteIntakeStub = isLikelyIncompleteIntakeStub(resolved);
-    const hasHighSignalComplete =
-      (hasNameSignal(resolved) && hasExplicitNameValue(resolved)) ||
-      (hasBudgetSignal(resolved) && hasExplicitBudgetValue(resolved));
-    const realtimeDelayCapMs = 350;
-    const highSignalDelayCapMs = 320;
-    let delayMs = isIncompleteIntakeStub
-      ? Math.max(configuredDelayMs, 2800)
-      : hasHighSignalComplete
-        ? Math.min(configuredDelayMs, highSignalDelayCapMs)
-        : isOpenAiSttSource
-          ? Math.min(configuredDelayMs, realtimeDelayCapMs)
-          : configuredDelayMs;
 
-    if (isFirstUserTurn && !isIncompleteIntakeStub) {
-      const firstTurnCapMs = Math.max(
-        0,
-        Number(this.sessionConfig?.firstTurnResponseDelayCapMs ?? 120)
+    const isIncompleteIntakeStub = isLikelyIncompleteIntakeStub(resolved);
+    if (isOpenAiSttSource && isIncompleteIntakeStub) {
+      delayMs = Math.max(delayMs, 2800);
+    }
+    if (isOpenAiSttSource) {
+      const segmentMaxMs = Math.max(
+        400,
+        Number(this.sessionConfig?.openaiSttSegmentMaxMs || 15000)
       );
-      delayMs = Math.min(delayMs, firstTurnCapMs);
+      const currentSegmentDurationMs = Number(initialSegmentDurationMs || 0);
+      const likelyForcedByMaxDuration =
+        Number.isFinite(currentSegmentDurationMs) &&
+        currentSegmentDurationMs >= Math.max(1000, segmentMaxMs - 250);
+      if (likelyForcedByMaxDuration) {
+        // When a segment is force-flushed by max duration, wait for the next
+        // segment so long monologues are merged before generating a reply.
+        delayMs = Math.max(
+          delayMs,
+          Math.min(30000, segmentMaxMs + continuationSilenceMs)
+        );
+      }
     }
 
     const openAiChunkMs = Number(this.sessionConfig?.openaiSttChunkMs || 1200);

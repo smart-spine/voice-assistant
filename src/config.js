@@ -148,9 +148,9 @@ const config = {
     fallbackPrompt: defaultSystemPrompt
   }),
   maxUserMessageChars: asBoundedNumber(process.env.MAX_USER_MESSAGE_CHARS, {
-    fallback: 600,
-    min: 80,
-    max: 4000,
+    fallback: 12000,
+    min: 200,
+    max: 50000,
     integer: true
   }),
   maxAssistantReplyChars: asBoundedNumber(process.env.MAX_ASSISTANT_REPLY_CHARS, {
@@ -245,6 +245,15 @@ const config = {
       fallback: 2,
       min: 1,
       max: 10,
+      integer: true
+    }
+  ),
+  bargeInContinuationWindowMs: asBoundedNumber(
+    process.env.BARGE_IN_CONTINUATION_WINDOW_MS,
+    {
+      fallback: 20000,
+      min: 2000,
+      max: 120000,
       integer: true
     }
   ),
@@ -369,7 +378,7 @@ const config = {
   openaiSttSegmentMaxMs: asBoundedNumber(
     process.env.OPENAI_STT_SEGMENT_MAX_MS,
     {
-      fallback: 7000,
+      fallback: 15000,
       min: 400,
       max: 30000,
       integer: true
@@ -409,6 +418,15 @@ const config = {
       integer: true
     }
   ),
+  turnContinuationSilenceMs: asBoundedNumber(
+    process.env.TURN_CONTINUATION_SILENCE_MS,
+    {
+      fallback: 3000,
+      min: 500,
+      max: 10000,
+      integer: true
+    }
+  ),
   turnStitchEnabled: asBoolean(process.env.TURN_STITCH_ENABLED, true),
   turnStitchWindowMs: asBoundedNumber(process.env.TURN_STITCH_WINDOW_MS, {
     fallback: 1100,
@@ -416,15 +434,6 @@ const config = {
     max: 5000,
     integer: true
   }),
-  firstTurnResponseDelayCapMs: asBoundedNumber(
-    process.env.FIRST_TURN_RESPONSE_DELAY_CAP_MS,
-    {
-      fallback: 120,
-      min: 0,
-      max: 2000,
-      integer: true
-    }
-  ),
   silenceAfterSpeakMs: asBoundedNumber(process.env.SILENCE_AFTER_SPEAK_MS, {
     fallback: 1000,
     min: 0,
