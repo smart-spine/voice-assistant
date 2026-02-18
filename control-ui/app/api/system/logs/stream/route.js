@@ -11,53 +11,75 @@ function formatSse(event, data) {
 
 export async function GET(request) {
   const store = getOrchestratorStore();
-  const stream = new TransformStream();
-  const writer = stream.writable.getWriter();
-
+  let controllerRef = null;
   let closed = false;
+  let keepAliveTimer = null;
+  let unsubscribe = null;
 
-  const safeWrite = async (chunk) => {
+  const closeStream = () => {
     if (closed) {
       return;
     }
-
-    try {
-      await writer.write(chunk);
-    } catch (_) {
-      closed = true;
-    }
-  };
-
-  await safeWrite(
-    formatSse("snapshot", {
-      logs: store.getLogs(400)
-    })
-  );
-
-  const unsubscribe = store.subscribe((entry) => {
-    void safeWrite(formatSse("log", entry));
-  });
-
-  const keepAlive = setInterval(() => {
-    void safeWrite(encoder.encode(": keep-alive\n\n"));
-  }, 15000);
-
-  request.signal.addEventListener("abort", async () => {
-    unsubscribe();
-    clearInterval(keepAlive);
     closed = true;
+    if (keepAliveTimer) {
+      clearInterval(keepAliveTimer);
+      keepAliveTimer = null;
+    }
+    if (unsubscribe) {
+      unsubscribe();
+      unsubscribe = null;
+    }
     try {
-      await writer.close();
+      controllerRef?.close();
     } catch (_) {
       // Ignore close races.
     }
+  };
+
+  const stream = new ReadableStream({
+    start(controller) {
+      controllerRef = controller;
+
+      const enqueue = (chunk) => {
+        if (closed) {
+          return;
+        }
+        try {
+          controller.enqueue(chunk);
+        } catch (_) {
+          closeStream();
+        }
+      };
+
+      enqueue(
+        formatSse("snapshot", {
+          logs: store.getLogs(400)
+        })
+      );
+
+      unsubscribe = store.subscribe((entry) => {
+        enqueue(formatSse("log", entry));
+      });
+
+      keepAliveTimer = setInterval(() => {
+        enqueue(encoder.encode(": keep-alive\n\n"));
+      }, 15000);
+    },
+    cancel() {
+      closeStream();
+    }
   });
 
-  return new Response(stream.readable, {
+  request.signal.addEventListener("abort", () => {
+    closeStream();
+  });
+
+  return new Response(stream, {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive"
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no"
     }
   });
 }

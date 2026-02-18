@@ -111,10 +111,10 @@ export default function HomePage() {
       const payload = await fetchJson("/api/system/state");
       setSystemState(payload.data);
       if (!silent) {
-        pushNotice("success", "Состояние синхронизировано.");
+        pushNotice("success", "State synchronized.");
       }
     } catch (err) {
-      pushNotice("error", err.message || "Не удалось получить состояние.");
+      pushNotice("error", err.message || "Failed to fetch system state.");
     } finally {
       if (!silent) {
         setBusy((prev) => ({ ...prev, refreshing: false }));
@@ -145,6 +145,16 @@ export default function HomePage() {
       clearInterval(timer);
     };
   }, [loadState]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      void loadLogsSnapshot();
+    }, 3000);
+
+    return () => {
+      clearInterval(timer);
+    };
+  }, [loadLogsSnapshot]);
 
   useEffect(() => {
     const source = new EventSource("/api/system/logs/stream");
@@ -197,7 +207,7 @@ export default function HomePage() {
       try {
         await run();
       } catch (err) {
-        pushNotice("error", err.message || "Операция завершилась с ошибкой.");
+        pushNotice("error", err.message || "Operation failed.");
       } finally {
         setBusy((prev) => ({ ...prev, [key]: false }));
       }
@@ -215,8 +225,8 @@ export default function HomePage() {
         pushNotice(
           "success",
           action === "start"
-            ? "Запрос на запуск API отправлен."
-            : "Запрос на остановку API отправлен."
+            ? "API start request sent."
+            : "API stop request sent."
         );
         await loadState({ silent: true });
       });
@@ -238,7 +248,7 @@ export default function HomePage() {
         })
       });
 
-      pushNotice("success", "Бот успешно запущен.");
+      pushNotice("success", "Bot session started.");
       await loadState({ silent: true });
     });
   }, [form, loadState, performAction, pushNotice]);
@@ -253,7 +263,7 @@ export default function HomePage() {
         })
       });
 
-      pushNotice("success", "Бот остановлен.");
+      pushNotice("success", "Bot session stopped.");
       await loadState({ silent: true });
     });
   }, [loadState, performAction, pushNotice]);
@@ -292,7 +302,7 @@ export default function HomePage() {
           <p className="eyebrow">Voice Assistant Ops</p>
           <h1>Control UI</h1>
           <p className="subtitle">
-            Единая панель запуска API, старта бота и мониторинга логов.
+            Unified dashboard for API process control, bot launches, and live logs.
           </p>
         </div>
         <div className="header-meta">
@@ -367,8 +377,8 @@ export default function HomePage() {
 
           {!managedApi?.enabled ? (
             <p className="help warning">
-              Managed API mode disabled (`MANAGED_API_ENABLED=false`). UI будет только
-              управлять ботом через готовый Control API.
+              Managed API mode is disabled (`MANAGED_API_ENABLED=false`). The UI can
+              control bot sessions, but cannot start/stop the API process.
             </p>
           ) : null}
         </article>
@@ -422,7 +432,7 @@ export default function HomePage() {
       </section>
 
       <section className="card panel reveal reveal-delay-2">
-        <h2>Запуск бота в Meet</h2>
+        <h2>Launch Bot in Meet</h2>
         <div className="form-grid">
           <label>
             <span>Meet URL</span>
@@ -436,7 +446,7 @@ export default function HomePage() {
           </label>
 
           <label>
-            <span>Имя клиента</span>
+            <span>Client Name</span>
             <input
               value={form.clientName}
               onChange={(event) => {
@@ -447,7 +457,7 @@ export default function HomePage() {
           </label>
 
           <label>
-            <span>Компания</span>
+            <span>Company</span>
             <input
               value={form.clientCompany}
               onChange={(event) => {
@@ -458,13 +468,13 @@ export default function HomePage() {
           </label>
 
           <label className="notes">
-            <span>Контекст по клиенту / заметки</span>
+            <span>Client Context / Notes</span>
             <textarea
               value={form.clientNotes}
               onChange={(event) => {
                 setForm((prev) => ({ ...prev, clientNotes: event.target.value }));
               }}
-              placeholder="Бюджет, цель звонка, ограничения, важные детали..."
+              placeholder="Budget, goals, constraints, and key notes..."
             />
           </label>
         </div>
@@ -477,7 +487,7 @@ export default function HomePage() {
               setForm((prev) => ({ ...prev, forceRestart: event.target.checked }));
             }}
           />
-          <span>forceRestart (перезапустить, если сессия уже идет)</span>
+          <span>Force restart if a session is already active</span>
         </label>
       </section>
 
@@ -498,7 +508,7 @@ export default function HomePage() {
 
         <div className="logs" ref={logsViewportRef}>
           {renderedLogs.length === 0 ? (
-            <p className="logs-empty">Логи пока пусты.</p>
+            <p className="logs-empty">No logs yet.</p>
           ) : (
             renderedLogs.map((entry) => (
               <div key={entry.id} className={`log-line level-${entry.level || "info"}`}>
@@ -512,7 +522,7 @@ export default function HomePage() {
       </section>
 
       <footer className={`notice notice-${notice.type}`}>
-        <span>{notice.text || "Готово к работе."}</span>
+        <span>{notice.text || "Ready."}</span>
       </footer>
     </main>
   );

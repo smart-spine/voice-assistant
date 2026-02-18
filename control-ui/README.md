@@ -32,6 +32,7 @@ Key values:
 
 - `CONTROL_API_BASE_URL` - where existing bot control API is reachable.
 - `CONTROL_API_TOKEN` - optional Bearer token for protected API.
+- `CONTROL_API_START_TIMEOUT_MS` - timeout for `/api/v1/bot/start` (default `120000` ms).
 - `MANAGED_API_ENABLED` - if `true`, UI can start/stop local API process.
 - `MANAGED_API_COMMAND` - command to launch API process.
 - `MANAGED_API_CWD` - working dir for command (default `..`, repo root from `control-ui`).
