@@ -261,6 +261,18 @@ function mergeUserContinuationText(baseText, continuationText) {
   return normalizeText(`${base} ${continuation}`);
 }
 
+function truncateForLog(text, maxChars = 180) {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return "";
+  }
+  const limit = Math.max(24, Number(maxChars) || 180);
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, limit)}...`;
+}
+
 class BotSession {
   constructor({ config, sessionId } = {}) {
     this.baseConfig = config;
@@ -309,6 +321,10 @@ class BotSession {
     this.hasProcessedUserTurn = false;
     this.autoGreetingInFlight = false;
     this.autoGreetingCompleted = false;
+    this.softInterruptActive = false;
+    this.softInterruptRunId = "";
+    this.softInterruptSource = "";
+    this.softInterruptTimer = null;
     this.joinStateMonitorStopRequested = false;
     this.joinStateMonitorPromise = null;
     this.responder = null;
@@ -366,6 +382,10 @@ class BotSession {
     this.hasProcessedUserTurn = false;
     this.autoGreetingInFlight = false;
     this.autoGreetingCompleted = false;
+    this.softInterruptActive = false;
+    this.softInterruptRunId = "";
+    this.softInterruptSource = "";
+    this.softInterruptTimer = null;
 
     const sessionSystemPrompt = buildSystemPrompt({
       basePrompt: this.sessionConfig.systemPrompt,
@@ -387,6 +407,9 @@ class BotSession {
     this.startedAtMs = Date.now();
     this.stoppedAt = null;
     this.lastError = null;
+    this.trace(
+      `Session config: source=${this.sessionConfig.openaiSttSource}, sttModel=${this.sessionConfig.openaiSttModel}, turnSilenceMs=${this.sessionConfig.turnSilenceMs}, continuationSilenceMs=${this.sessionConfig.turnContinuationSilenceMs}, postTurnDelayMs=${this.sessionConfig.postTurnResponseDelayMs}, bargeInEnabled=${this.sessionConfig.bargeInEnabled}, softInterruptEnabled=${this.sessionConfig.softInterruptEnabled}.`
+    );
 
     this.info("Starting bridge server...");
     const { server } = await startBridgeServer(
@@ -435,6 +458,36 @@ class BotSession {
         this.markSourceActivity(source);
       }
 
+      if (type === "vad.start") {
+        this.markSourceActivity(source);
+        const peak = Number.isFinite(Number(event.peak))
+          ? Number(event.peak).toFixed(4)
+          : "n/a";
+        this.trace(
+          `Bridge event (${source}): vad.start (reason=${normalizeText(
+            event.reason || "n/a"
+          ) || "n/a"}, peak=${peak}).`
+        );
+        this.maybeStartSoftInterrupt({
+          source,
+          reason: normalizeText(event.reason || "vad-start") || "vad-start"
+        });
+        return;
+      }
+
+      if (type === "vad.stop") {
+        this.trace(
+          `Bridge event (${source}): vad.stop (reason=${normalizeText(
+            event.reason || "n/a"
+          ) || "n/a"}).`
+        );
+        this.handleSoftInterruptStop({
+          source,
+          reason: normalizeText(event.reason || "vad-stop") || "vad-stop"
+        });
+        return;
+      }
+
       if (type === "transcript.partial" && text) {
         if (this.sessionConfig?.openaiSttLogPartials) {
           this.stt(`[${source}] partial: ${text}`);
@@ -459,7 +512,17 @@ class BotSession {
         if (this.sessionConfig?.openaiSttLogFinals) {
           this.stt(`[${source}] final: ${text}`);
         }
-        if (!text || this.isLikelyBotEcho(text)) {
+        if (!text) {
+          this.trace(`Ignored final transcript from ${source}: empty text.`);
+          return;
+        }
+        if (this.isLikelyBotEcho(text)) {
+          this.trace(
+            `Ignored final transcript from ${source}: detected as bot echo ("${truncateForLog(
+              text,
+              120
+            )}").`
+          );
           return;
         }
         const accepted = this.enqueueTranscript(text, source, {
@@ -598,6 +661,7 @@ class BotSession {
     this.stopPromise = (async () => {
       this.info(`Shutting down (${reason})...`);
       try {
+        this.clearSoftInterrupt({ resumeAudio: true });
         await this.interruptAssistantRun("session-stop");
         await this.stopJoinStateMonitor();
         if (this.openAiSttStream) {
@@ -630,6 +694,10 @@ class BotSession {
         this.lastUserTurnText = "";
         this.pendingContinuationBaseText = "";
         this.pendingContinuationSetAtMs = 0;
+        this.softInterruptActive = false;
+        this.softInterruptRunId = "";
+        this.softInterruptSource = "";
+        this.softInterruptTimer = null;
 
         if (this.transportAdapter) {
           try {
@@ -743,6 +811,11 @@ class BotSession {
         ? Number(segmentDurationMs)
         : undefined
     });
+    this.trace(
+      `Enqueued transcript (${normalizedSource}, final=${Boolean(
+        isTurnFinal
+      )}, chars=${normalizedText.length}, queueSize=${this.queue.length}).`
+    );
     if (this.queue.length > this.maxQueueSize) {
       this.queue.shift();
       const now = Date.now();
@@ -759,6 +832,11 @@ class BotSession {
 
   shouldDropInboundTranscript({ source, text }) {
     if (!text) {
+      this.traceInboundDrop({
+        source,
+        reason: "empty text",
+        text
+      });
       return true;
     }
 
@@ -766,6 +844,11 @@ class BotSession {
     const now = Date.now();
     const loose = normalizeLooseComparableText(text);
     if (!loose) {
+      this.traceInboundDrop({
+        source: key,
+        reason: "no comparable tokens",
+        text
+      });
       return true;
     }
     const tokens = tokenizeComparableWords(loose);
@@ -783,6 +866,11 @@ class BotSession {
 
     for (const previous of activeHistory) {
       if (previous.loose === loose) {
+        this.traceInboundDrop({
+          source: key,
+          reason: "exact duplicate",
+          text
+        });
         return true;
       }
 
@@ -797,6 +885,12 @@ class BotSession {
         previous.loose.startsWith(loose) &&
         previous.loose.length - loose.length <= 14;
       if (isCurrentTruncatedRepeat) {
+        this.traceInboundDrop({
+          source: key,
+          reason: "truncated repeat",
+          text,
+          extra: `(delta=${previous.loose.length - loose.length})`
+        });
         return true;
       }
 
@@ -810,6 +904,12 @@ class BotSession {
         tokens.length >= 4 &&
         previous.tokens.length >= 4
       ) {
+        this.traceInboundDrop({
+          source: key,
+          reason: "near-duplicate by similarity",
+          text,
+          extra: `(similarity=${similarity.toFixed(2)}, lengthDelta=${lengthDelta})`
+        });
         return true;
       }
     }
@@ -831,6 +931,16 @@ class BotSession {
 
     this.isProcessing = true;
     const item = this.queue.shift();
+    if (item) {
+      this.trace(
+        `Processing queue item (${item.source}, final=${Boolean(
+          item.isTurnFinal
+        )}, remaining=${this.queue.length}): "${truncateForLog(
+          item.text,
+          120
+        )}".`
+      );
+    }
 
     try {
       const normalized = normalizeText(item.text);
@@ -843,10 +953,22 @@ class BotSession {
         this.sessionConfig.wakeWord
       );
       if (!commandText || commandText.length < 2) {
+        this.trace(
+          `Queue item ignored (${item.source}): wake word filter produced empty/short text ("${truncateForLog(
+            normalized,
+            120
+          )}").`
+        );
         return;
       }
 
       if (!item.isTurnFinal) {
+        this.trace(
+          `Queue item ignored (${item.source}): waiting for final turn transcript ("${truncateForLog(
+            commandText,
+            120
+          )}").`
+        );
         return;
       }
 
@@ -879,6 +1001,9 @@ class BotSession {
         currentText: commandText
       });
       if (!commandText || commandText.length < 2) {
+        this.trace(
+          `Turn ignored (${item.source}): text became empty after continuation merge/wait.`
+        );
         return;
       }
       if (
@@ -888,6 +1013,12 @@ class BotSession {
         countWords(commandText) <= 2 &&
         !(!this.hasProcessedUserTurn && isLikelyGreetingOrPing(commandText))
       ) {
+        this.trace(
+          `Turn ignored (${item.source}): too short/incomplete fragment after stabilization ("${truncateForLog(
+            commandText,
+            120
+          )}").`
+        );
         return;
       }
 
@@ -896,6 +1027,12 @@ class BotSession {
         commandText.toLowerCase() === this.lastAcceptedText.toLowerCase() &&
         now - this.lastAcceptedAtMs < 4000
       ) {
+        this.trace(
+          `Turn ignored (${item.source}): duplicate of recently accepted text within 4s ("${truncateForLog(
+            commandText,
+            120
+          )}").`
+        );
         return;
       }
 
@@ -916,6 +1053,9 @@ class BotSession {
       }
 
       this.user(`[${item.source}] ${commandText}`);
+      this.trace(
+        `Dispatching turn to responder (${item.source}, chars=${commandText.length}).`
+      );
       await this.respondToCommand({
         responder,
         source: item.source,
@@ -944,6 +1084,7 @@ class BotSession {
       Number(this.sessionConfig?.meetJoinPollMs || 1200)
     );
     this.joinStateMonitorStopRequested = false;
+    this.trace(`Meet join-state monitor started (pollMs=${pollMs}).`);
 
     this.joinStateMonitorPromise = (async () => {
       while (!this.joinStateMonitorStopRequested) {
@@ -954,11 +1095,13 @@ class BotSession {
           !this.meetPage ||
           this.meetPage.isClosed()
         ) {
+          this.trace("Meet join-state monitor stopping: session/page is no longer active.");
           break;
         }
 
         await sleep(pollMs);
         if (this.joinStateMonitorStopRequested || this.status !== "running") {
+          this.trace("Meet join-state monitor stopping: stop requested.");
           break;
         }
 
@@ -985,6 +1128,7 @@ class BotSession {
         }
 
         if (nextStatus === "joined") {
+          this.trace("Meet join-state monitor detected joined status.");
           if (!this.hasProcessedUserTurn) {
             void this.runAutoGreeting({ responder });
           }
@@ -1006,6 +1150,7 @@ class BotSession {
         this.warn(`Meet join monitor stopped: ${err?.message || err}`);
       })
       .finally(() => {
+        this.trace("Meet join-state monitor stopped.");
         this.joinStateMonitorPromise = null;
       });
   }
@@ -1016,6 +1161,7 @@ class BotSession {
     if (!monitorPromise) {
       return;
     }
+    this.trace("Waiting for meet join-state monitor to stop...");
     try {
       await Promise.race([monitorPromise, sleep(1200)]);
     } catch (_) {
@@ -1026,9 +1172,13 @@ class BotSession {
 
   async runAutoGreeting({ responder }) {
     if (!this.sessionConfig?.autoGreetingEnabled) {
+      this.trace("Auto greeting skipped: disabled.");
       return;
     }
     if (this.autoGreetingCompleted || this.autoGreetingInFlight) {
+      this.trace(
+        `Auto greeting skipped: completed=${this.autoGreetingCompleted}, inFlight=${this.autoGreetingInFlight}.`
+      );
       return;
     }
 
@@ -1037,31 +1187,44 @@ class BotSession {
       Number(this.sessionConfig.autoGreetingDelayMs || 0)
     );
     if (delayMs > 0) {
+      this.trace(`Auto greeting waiting for configured delay (${delayMs}ms).`);
       await sleep(delayMs);
     }
 
     if (this.status !== "running" || this.isStopping) {
+      this.trace("Auto greeting skipped: session is not running.");
       return;
     }
     if (this.meetJoinState?.status !== "joined") {
+      this.trace(
+        `Auto greeting skipped: Meet state is ${String(
+          this.meetJoinState?.status || "unknown"
+        )}.`
+      );
       return;
     }
     if (this.hasProcessedUserTurn) {
+      this.trace("Auto greeting skipped: user turn already captured.");
       return;
     }
     const hasPendingUserInput = this.queue.some((item) =>
       Boolean(normalizeText(item?.text || ""))
     );
     if (hasPendingUserInput) {
+      this.trace("Auto greeting skipped: pending user transcript in queue.");
       return;
     }
 
     const prompt = normalizeText(this.sessionConfig.autoGreetingPrompt);
     if (!prompt) {
+      this.trace("Auto greeting skipped: prompt is empty.");
       return;
     }
 
     this.autoGreetingInFlight = true;
+    this.trace(
+      `Auto greeting started (chars=${prompt.length}, source=system).`
+    );
     try {
       await this.respondToCommand({
         responder,
@@ -1069,6 +1232,7 @@ class BotSession {
         commandText: prompt
       });
       this.autoGreetingCompleted = true;
+      this.trace("Auto greeting completed.");
     } catch (err) {
       this.warn(`Auto greeting failed: ${err?.message || err}`);
     } finally {
@@ -1109,6 +1273,7 @@ class BotSession {
         segmentMinMs: this.sessionConfig.openaiSttSegmentMinMs,
         segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs
       });
+      this.setBridgeTtsDucking(this.softInterruptActive);
 
       this.info("Bridge page recovered.");
       if (this.queue.length > 0) {
@@ -1164,6 +1329,9 @@ class BotSession {
     const abortController = new AbortController();
     const llmStartedAtMs = Date.now();
     let firstTextChunkAtMs = 0;
+    this.trace(
+      `Assistant run started (${runId}, source=${source}, userChars=${commandText.length}).`
+    );
     this.activeAssistantRun = {
       id: runId,
       source,
@@ -1171,6 +1339,7 @@ class BotSession {
       abortController,
       firstAudioAtMs: 0
     };
+    this.setBridgeTtsDucking(false);
 
     let playbackChain = Promise.resolve();
     const queueChunkPlayback = (chunkText) => {
@@ -1181,6 +1350,9 @@ class BotSession {
       if (!firstTextChunkAtMs) {
         firstTextChunkAtMs = Date.now();
       }
+      this.trace(
+        `Assistant text chunk queued (${runId}, chars=${text.length}).`
+      );
 
       playbackChain = playbackChain
         .then(() =>
@@ -1211,6 +1383,9 @@ class BotSession {
         if (!isAbortErrorLike(streamErr)) {
           throw streamErr;
         }
+        this.trace(
+          `Assistant stream aborted (${runId}) while waiting for chunks.`
+        );
       }
 
       await playbackChain;
@@ -1258,8 +1433,14 @@ class BotSession {
         if (completionDetected) {
           await this.handleIntakeCompletion();
         }
+      } else {
+        this.trace(
+          `Assistant run produced no committed reply (${runId}, aborted=${isAborted}).`
+        );
       }
     } finally {
+      this.clearSoftInterrupt({ resumeAudio: true });
+      this.trace(`Assistant run finished (${runId}).`);
       if (this.activeAssistantRun?.id === runId) {
         this.activeAssistantRun = null;
       }
@@ -1284,6 +1465,10 @@ class BotSession {
     this.rememberBotOutput(chunkText);
     this.isAssistantAudioPlaying = true;
     this.lastAssistantAudioAtMs = Date.now();
+    const ttsStartedAtMs = Date.now();
+    this.trace(
+      `TTS chunk start (${runId || "n/a"}, chars=${chunkText.length}).`
+    );
 
     try {
       const timedAudio = await withTimeout(
@@ -1299,6 +1484,7 @@ class BotSession {
       if (!timedAudio?.audioBase64) {
         throw new Error("OpenAI TTS returned empty chunk audio.");
       }
+      const ttsLatencyMs = Date.now() - ttsStartedAtMs;
 
       const played = await this.playAudioOnBridge({
         audioBase64: timedAudio.audioBase64,
@@ -1315,6 +1501,9 @@ class BotSession {
       ) {
         this.activeAssistantRun.firstAudioAtMs = Date.now();
       }
+      this.trace(
+        `TTS chunk played (${runId || "n/a"}, ttsLatencyMs=${ttsLatencyMs}, chars=${chunkText.length}).`
+      );
     } finally {
       this.isAssistantAudioPlaying = false;
       this.lastAssistantAudioAtMs = Date.now();
@@ -1440,12 +1629,167 @@ class BotSession {
     await this.stop({ reason: "intake complete" });
   }
 
+  setBridgeTtsDucking(active) {
+    if (
+      !this.transportAdapter ||
+      !this.bridgePage ||
+      this.bridgePage.isClosed()
+    ) {
+      return;
+    }
+
+    const duckLevel = Math.max(
+      0,
+      Math.min(1, Number(this.sessionConfig?.softInterruptDuckLevel ?? 0.22))
+    );
+    this.trace(
+      `Bridge ducking ${Boolean(active) ? "enabled" : "disabled"} (level=${duckLevel.toFixed(
+        2
+      )}).`
+    );
+
+    void Promise.resolve(
+      this.transportAdapter.setTtsDucking({
+        active: Boolean(active),
+        level: duckLevel
+      })
+    ).catch(() => {});
+  }
+
+  clearSoftInterrupt({ resumeAudio = true, reason = "" } = {}) {
+    if (this.softInterruptTimer) {
+      clearTimeout(this.softInterruptTimer);
+      this.softInterruptTimer = null;
+    }
+    const wasActive = this.softInterruptActive;
+    this.softInterruptActive = false;
+    this.softInterruptRunId = "";
+    this.softInterruptSource = "";
+    if (resumeAudio && wasActive) {
+      this.setBridgeTtsDucking(false);
+    }
+    if (wasActive) {
+      this.trace(
+        `Soft interrupt cleared${reason ? ` (${reason})` : ""}; resumeAudio=${resumeAudio}.`
+      );
+    }
+  }
+
+  maybeStartSoftInterrupt({ source, reason }) {
+    if (!this.sessionConfig?.softInterruptEnabled) {
+      return;
+    }
+    if (!this.sessionConfig?.bargeInEnabled) {
+      return;
+    }
+
+    const run = this.activeAssistantRun;
+    if (!run || this.isStopping) {
+      return;
+    }
+
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    if (normalizedSource !== "openai-stt") {
+      return;
+    }
+
+    if (run.abortController?.signal?.aborted) {
+      return;
+    }
+
+    const elapsedMs = Date.now() - Number(run.startedAt || 0);
+    const minBargeInMs = Number(this.sessionConfig?.bargeInMinMs || 0);
+    if (elapsedMs < minBargeInMs) {
+      this.trace(
+        `Soft interrupt ignored (${normalizedSource}:${reason}): elapsed ${elapsedMs}ms < bargeInMinMs ${minBargeInMs}.`
+      );
+      return;
+    }
+
+    if (this.softInterruptActive && this.softInterruptRunId === run.id) {
+      if (this.softInterruptTimer) {
+        clearTimeout(this.softInterruptTimer);
+        this.softInterruptTimer = null;
+      }
+      this.trace(
+        `Soft interrupt re-armed (${normalizedSource}:${reason}) for active run ${run.id}.`
+      );
+      return;
+    }
+
+    this.clearSoftInterrupt({ resumeAudio: false, reason: "re-arm" });
+    this.softInterruptActive = true;
+    this.softInterruptRunId = run.id;
+    this.softInterruptSource = normalizedSource;
+    this.setBridgeTtsDucking(true);
+    this.info(`Soft interrupt armed (${normalizedSource}:${reason}).`);
+  }
+
+  handleSoftInterruptStop({ source, reason }) {
+    if (!this.softInterruptActive) {
+      return;
+    }
+
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    if (this.softInterruptSource && normalizedSource !== this.softInterruptSource) {
+      return;
+    }
+
+    const run = this.activeAssistantRun;
+    if (!run || run.id !== this.softInterruptRunId || run.abortController?.signal?.aborted) {
+      this.clearSoftInterrupt({
+        resumeAudio: true,
+        reason: "run changed before vad.stop confirm"
+      });
+      return;
+    }
+
+    const confirmMs = Math.max(
+      200,
+      Number(this.sessionConfig?.softInterruptConfirmMs || 700)
+    );
+
+    if (this.softInterruptTimer) {
+      clearTimeout(this.softInterruptTimer);
+      this.softInterruptTimer = null;
+    }
+    this.trace(
+      `Soft interrupt confirmation timer started (${confirmMs}ms, ${normalizedSource}:${reason}).`
+    );
+    this.softInterruptTimer = setTimeout(() => {
+      if (!this.softInterruptActive) {
+        return;
+      }
+      const activeRun = this.activeAssistantRun;
+      if (
+        !activeRun ||
+        activeRun.id !== this.softInterruptRunId ||
+        activeRun.abortController?.signal?.aborted
+      ) {
+        this.clearSoftInterrupt({
+          resumeAudio: true,
+          reason: "run changed during confirm timeout"
+        });
+        return;
+      }
+      this.info(
+        `Soft interrupt expired without confirmed speech (${normalizedSource}:${reason}).`
+      );
+      this.clearSoftInterrupt({ resumeAudio: true, reason: "confirm-timeout" });
+    }, confirmMs);
+  }
+
   maybeInterruptAssistantOutput({ source, text, reason }) {
     if (!this.sessionConfig?.bargeInEnabled) {
       return;
     }
 
     if (!text || !this.activeAssistantRun || this.isStopping) {
+      if (text && this.isStopping) {
+        this.trace(
+          `Barge-in skipped (${source}:${reason}): session is stopping.`
+        );
+      }
       return;
     }
     const normalizedSource = normalizeText(source || "unknown") || "unknown";
@@ -1455,22 +1799,46 @@ class BotSession {
         Number(this.sessionConfig?.bargeInMinWordsOpenAiStt || 2)
       );
       if (countWords(text) < minWords) {
+        this.trace(
+          `Barge-in skipped (${source}:${reason}): ${countWords(
+            text
+          )} word(s) < min ${minWords}.`
+        );
         return;
       }
     }
     if (this.isLikelyBotEcho(text)) {
+      this.trace(
+        `Barge-in skipped (${source}:${reason}): transcript looks like bot echo ("${truncateForLog(
+          text,
+          120
+        )}").`
+      );
       return;
     }
     if (this.activeAssistantRun.abortController?.signal?.aborted) {
+      this.trace(`Barge-in skipped (${source}:${reason}): run already aborted.`);
       return;
     }
 
     const elapsedMs = Date.now() - Number(this.activeAssistantRun.startedAt || 0);
     const minBargeInMs = Number(this.sessionConfig.bargeInMinMs || 0);
     if (elapsedMs < minBargeInMs) {
+      this.trace(
+        `Barge-in skipped (${source}:${reason}): elapsed ${elapsedMs}ms < bargeInMinMs ${minBargeInMs}.`
+      );
       return;
     }
 
+    if (this.softInterruptActive) {
+      this.clearSoftInterrupt({
+        resumeAudio: false,
+        reason: "hard-interrupt confirmed"
+      });
+    }
+    this.trace(
+      `Barge-in accepted (${source}:${reason}) -> interrupting assistant.`
+    );
     this.markPendingUserContinuation({
       source: normalizedSource,
       text
@@ -1492,6 +1860,9 @@ class BotSession {
 
     this.pendingContinuationBaseText = latestUserText;
     this.pendingContinuationSetAtMs = Date.now();
+    this.trace(
+      `Pending continuation armed from last user turn (${normalizedSource}, baseChars=${latestUserText.length}, newChars=${incomingText.length}).`
+    );
   }
 
   consumePendingUserContinuation({ source, currentText }) {
@@ -1518,12 +1889,19 @@ class BotSession {
     if (Date.now() - setAtMs > continuationWindowMs) {
       this.pendingContinuationBaseText = "";
       this.pendingContinuationSetAtMs = 0;
+      this.trace(
+        `Pending continuation expired after ${continuationWindowMs}ms window.`
+      );
       return normalizedCurrent;
     }
 
     this.pendingContinuationBaseText = "";
     this.pendingContinuationSetAtMs = 0;
-    return mergeUserContinuationText(base, normalizedCurrent);
+    const merged = mergeUserContinuationText(base, normalizedCurrent);
+    this.trace(
+      `Pending continuation merged (baseChars=${base.length}, currentChars=${normalizedCurrent.length}, mergedChars=${merged.length}).`
+    );
+    return merged;
   }
 
   async interruptAssistantRun(reason = "interrupted") {
@@ -1532,6 +1910,7 @@ class BotSession {
       return false;
     }
 
+    this.clearSoftInterrupt({ resumeAudio: false, reason: "hard interrupt" });
     run.abortController.abort();
     try {
       if (this.transportAdapter && this.bridgePage) {
@@ -1540,6 +1919,7 @@ class BotSession {
     } catch (_) {
       // Ignore playback interruption transport errors.
     }
+    this.setBridgeTtsDucking(false);
 
     this.info(`Assistant output interrupted (${reason}).`);
     return true;
@@ -1590,12 +1970,22 @@ class BotSession {
       ? continuationSilenceMs
       : configuredDelayMs;
     if (delayMs <= 0) {
+      this.trace(
+        `Turn delay skipped (${normalizedSource}): configured delay is ${delayMs}ms.`
+      );
       return resolved;
     }
+    const initialResolved = resolved;
+    this.trace(
+      `Turn delay start (${normalizedSource}): targetSilenceMs=${delayMs}, continuationSilenceMs=${continuationSilenceMs}, postTurnDelayMs=${configuredDelayMs}.`
+    );
 
     const isIncompleteIntakeStub = isLikelyIncompleteIntakeStub(resolved);
     if (isOpenAiSttSource && isIncompleteIntakeStub) {
       delayMs = Math.max(delayMs, 2800);
+      this.trace(
+        `Turn delay extended for incomplete intake stub (${normalizedSource}) to ${delayMs}ms.`
+      );
     }
     if (isOpenAiSttSource) {
       const segmentMaxMs = Math.max(
@@ -1612,6 +2002,9 @@ class BotSession {
         delayMs = Math.max(
           delayMs,
           Math.min(30000, segmentMaxMs + continuationSilenceMs)
+        );
+        this.trace(
+          `Turn delay extended for max-duration flush (${normalizedSource}): segmentDurationMs=${currentSegmentDurationMs}, delayMs=${delayMs}.`
         );
       }
     }
@@ -1645,6 +2038,9 @@ class BotSession {
       });
 
       if (this.isStopping || this.status !== "running") {
+        this.trace(
+          `Turn delay stopped early (${normalizedSource}): session status=${this.status}, isStopping=${this.isStopping}.`
+        );
         break;
       }
 
@@ -1669,8 +2065,20 @@ class BotSession {
     const allowShortFirstGreeting =
       isFirstUserTurn && isLikelyGreetingOrPing(resolved);
     if (isLikelyIncompleteIntakeStub(resolved) && !allowShortFirstGreeting) {
+      this.trace(
+        `Turn delay result dropped (${normalizedSource}): still incomplete stub ("${truncateForLog(
+          resolved,
+          140
+        )}").`
+      );
       return "";
     }
+    this.trace(
+      `Turn delay done (${normalizedSource}): waited=${Date.now() - startedAt}ms, initial="${truncateForLog(
+        initialResolved,
+        120
+      )}", final="${truncateForLog(resolved, 140)}".`
+    );
     return normalizeText(resolved);
   }
 
@@ -1733,10 +2141,19 @@ class BotSession {
         queuedComparable.startsWith(resolvedComparable) ||
         resolvedComparable.startsWith(queuedComparable);
       if (isExpansion) {
+        const previousResolvedText = resolvedText;
         if (queuedComparable.length >= resolvedComparable.length) {
           resolvedText = queuedText;
           resolvedComparable = queuedComparable;
         }
+        this.trace(
+          `Turn text expanded from queue (${source}, final=${Boolean(
+            item.isTurnFinal
+          )}): "${truncateForLog(previousResolvedText, 100)}" -> "${truncateForLog(
+            resolvedText,
+            100
+          )}".`
+        );
         consumedIndexes.push(index);
         if (stitchState && Number.isFinite(queuedAtMs)) {
           stitchState.lastTurnAtMs = queuedAtMs;
@@ -1759,11 +2176,21 @@ class BotSession {
         );
 
       if (shouldStitchAdjacentFinals) {
+        const previousResolvedText = resolvedText;
         const stitched = normalizeText(`${resolvedText} ${queuedText}`);
         if (stitched && stitched !== resolvedText) {
           resolvedText = stitched;
           resolvedComparable = normalizeComparableText(stitched);
         }
+        this.trace(
+          `Turn stitch applied (${source}): "${truncateForLog(
+            previousResolvedText,
+            100
+          )}" + "${truncateForLog(queuedText, 100)}" -> "${truncateForLog(
+            resolvedText,
+            120
+          )}".`
+        );
         consumedIndexes.push(index);
         if (stitchState && Number.isFinite(queuedAtMs)) {
           stitchState.lastTurnAtMs = queuedAtMs;
@@ -1820,6 +2247,27 @@ class BotSession {
     } catch (err) {
       this.warn(`Call summary workflow failed: ${err?.message || err}`);
     }
+  }
+
+  trace(message) {
+    if (this.sessionConfig?.verboseSessionLogs === false) {
+      return;
+    }
+    this.info(message);
+  }
+
+  traceInboundDrop({ source, reason, text, extra = "" }) {
+    if (this.sessionConfig?.verboseSessionLogs === false) {
+      return;
+    }
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    const details = extra ? ` ${extra}` : "";
+    const preview = truncateForLog(text, 140);
+    this.info(
+      `Inbound transcript dropped (${normalizedSource}): ${reason}${details}${
+        preview ? ` | "${preview}"` : ""
+      }`
+    );
   }
 
   info(message) {

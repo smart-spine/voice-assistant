@@ -100,6 +100,18 @@ function extractTranscribedText(response) {
   return "";
 }
 
+function previewForLog(text, maxChars = 120) {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    return "";
+  }
+  const limit = Math.max(24, Number(maxChars) || 120);
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, limit)}...`;
+}
+
 class OpenAiSttTurnStream {
   constructor({
     apiKey,
@@ -253,15 +265,22 @@ class OpenAiSttTurnStream {
     const normalized = normalizeText(text);
     const comparable = normalizeComparableText(normalized);
     if (!normalized || !comparable) {
+      this.log("openai-stt drop transcription: empty comparable text");
       return true;
     }
 
     const words = countWords(normalized);
     if (words <= 0) {
+      this.log("openai-stt drop transcription: zero words");
       return true;
     }
 
     if (words === 1 && comparable.length <= 1) {
+      this.log(
+        `openai-stt drop transcription: too short token ("${previewForLog(
+          normalized
+        )}")`
+      );
       return true;
     }
 
@@ -272,6 +291,11 @@ class OpenAiSttTurnStream {
       Number.isFinite(Number(durationMs)) &&
       Number(durationMs) < 700
     ) {
+      this.log(
+        `openai-stt drop transcription: short single-word final (${Number(
+          durationMs
+        )}ms, "${previewForLog(normalized)}")`
+      );
       return true;
     }
 
@@ -380,6 +404,11 @@ class OpenAiSttTurnStream {
       comparable === this.lastFinalComparable &&
       now - this.lastFinalAtMs <= 2500
     ) {
+      this.log(
+        `openai-stt drop segment final duplicate ("${previewForLog(
+          normalizedText
+        )}")`
+      );
       return;
     }
     this.lastFinalComparable = comparable;
@@ -426,6 +455,11 @@ class OpenAiSttTurnStream {
       turnId,
       ts: now
     });
+    this.log(
+      `openai-stt emitted segment final turn (${turnId}, durationMs=${
+        segmentDurationMs ?? "n/a"
+      }, text="${previewForLog(normalizedText)}")`
+    );
   }
 
   pushTranscript(text, ts) {
@@ -445,6 +479,9 @@ class OpenAiSttTurnStream {
 
     if (comparable === this.activeComparable) {
       this.activeUpdatedAtMs = now;
+      this.log(
+        `openai-stt transcript unchanged for active turn (${this.activeTurnId}).`
+      );
       this.scheduleFinalize();
       return;
     }
@@ -456,6 +493,7 @@ class OpenAiSttTurnStream {
     if (isExpansion) {
       const shouldReplace = comparable.length >= this.activeComparable.length;
       if (shouldReplace && normalizedText !== this.activeText) {
+        const previous = this.activeText;
         this.activeText = normalizedText;
         this.activeComparable = comparable;
         this.activeUpdatedAtMs = now;
@@ -466,6 +504,11 @@ class OpenAiSttTurnStream {
           isFinal: false,
           ts: now
         });
+        this.log(
+          `openai-stt turn expansion (${this.activeTurnId}): "${previewForLog(
+            previous
+          )}" -> "${previewForLog(normalizedText)}"`
+        );
       }
       this.scheduleFinalize();
       return;
@@ -477,10 +520,20 @@ class OpenAiSttTurnStream {
       countWords(this.activeText) >= 3
     ) {
       this.activeUpdatedAtMs = now;
+      this.log(
+        `openai-stt ignored short competing fragment for active turn (${this.activeTurnId}): "${previewForLog(
+          normalizedText
+        )}"`
+      );
       this.scheduleFinalize();
       return;
     }
 
+    this.log(
+      `openai-stt switching active turn from "${previewForLog(
+        this.activeText
+      )}" to "${previewForLog(normalizedText)}"`
+    );
     this.flushTurn({ reason: "switch", ts: now });
     this.startTurn({ text: normalizedText, comparable, ts: now });
   }
@@ -490,6 +543,9 @@ class OpenAiSttTurnStream {
     this.activeText = text;
     this.activeComparable = comparable;
     this.activeUpdatedAtMs = Number.isFinite(Number(ts)) ? Number(ts) : Date.now();
+    this.log(
+      `openai-stt turn start (${this.activeTurnId}): "${previewForLog(text)}"`
+    );
 
     this.emit({
       type: "speech.start",
@@ -548,6 +604,11 @@ class OpenAiSttTurnStream {
         turnId,
         ts: eventTs
       });
+      this.log(
+        `openai-stt turn final (${turnId}, reason=${reason}): "${previewForLog(
+          text
+        )}"`
+      );
     }
 
     this.activeTurnId = "";

@@ -64,6 +64,13 @@ async function setupBridgePage({
         ? Number(payload.ts)
         : Date.now(),
       isFinal: Boolean(payload.isFinal),
+      reason:
+        typeof payload.reason === "string" && payload.reason
+          ? payload.reason
+          : undefined,
+      peak: Number.isFinite(Number(payload.peak))
+        ? Number(payload.peak)
+        : undefined,
       turnId:
         typeof payload.turnId === "string" && payload.turnId
           ? payload.turnId
@@ -221,6 +228,15 @@ async function bridgeStopSpeaking(page) {
     }
     return window.botBridge.stopSpeaking();
   });
+}
+
+async function bridgeSetTtsDucking(page, options = {}) {
+  return page.evaluate((duckOptions) => {
+    if (!window.botBridge?.setTtsDucking) {
+      return false;
+    }
+    return window.botBridge.setTtsDucking(duckOptions || {});
+  }, options);
 }
 
 async function openMeetPage({ browser, config }) {
@@ -596,6 +612,7 @@ module.exports = {
   bridgeSpeakAudio,
   bridgePrepareTtsOutput,
   bridgeStopSpeaking,
+  bridgeSetTtsDucking,
   openMeetPage,
   detectMeetJoinState,
   leaveMeetPage

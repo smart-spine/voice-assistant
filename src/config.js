@@ -258,6 +258,24 @@ const config = {
     }
   ),
   bargeInOnPartials: asBoolean(process.env.BARGE_IN_ON_PARTIALS, false),
+  softInterruptEnabled: asBoolean(process.env.SOFT_INTERRUPT_ENABLED, true),
+  softInterruptConfirmMs: asBoundedNumber(
+    process.env.SOFT_INTERRUPT_CONFIRM_MS,
+    {
+      fallback: 700,
+      min: 150,
+      max: 6000,
+      integer: true
+    }
+  ),
+  softInterruptDuckLevel: asBoundedNumber(
+    process.env.SOFT_INTERRUPT_DUCK_LEVEL,
+    {
+      fallback: 0.22,
+      min: 0,
+      max: 1
+    }
+  ),
   intakeCompleteToken: cleanString(
     process.env.INTAKE_COMPLETE_TOKEN,
     "[[INTAKE_COMPLETE]]"
@@ -298,6 +316,7 @@ const config = {
   }),
   openaiSttLogFinals: asBoolean(process.env.OPENAI_STT_LOG_FINALS, true),
   openaiSttLogPartials: asBoolean(process.env.OPENAI_STT_LOG_PARTIALS, false),
+  verboseSessionLogs: asBoolean(process.env.VERBOSE_SESSION_LOGS, true),
   openaiSttMaxRetries: asBoundedNumber(process.env.OPENAI_STT_MAX_RETRIES, {
     fallback: 1,
     min: 0,

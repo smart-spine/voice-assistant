@@ -176,6 +176,7 @@ STT:
 - `OPENAI_STT_TIMEOUT_MS`
 - `OPENAI_STT_LOG_FINALS`
 - `OPENAI_STT_LOG_PARTIALS`
+- `VERBOSE_SESSION_LOGS` (default `true`; adds detailed runtime logs for queueing, turn delay, barge-in/soft-interrupt decisions, and auto-greeting flow)
 - `OPENAI_STT_MAX_RETRIES`
 - `OPENAI_STT_MIN_CHUNK_BYTES`
 - `OPENAI_STT_MIME_TYPE`
@@ -207,6 +208,9 @@ Conversation/runtime:
 - `BARGE_IN_MIN_MS`
 - `BARGE_IN_MIN_WORDS_OPENAI_STT` (default `2`; avoids barge-in on one-word STT noise)
 - `BARGE_IN_CONTINUATION_WINDOW_MS` (default `20000`; max age of previous user turn used for continuation merge after barge-in)
+- `SOFT_INTERRUPT_ENABLED` (default `true`; enable VAD-driven soft barge-in with temporary TTS ducking)
+- `SOFT_INTERRUPT_CONFIRM_MS` (default `700`; how long to wait after `vad.stop` for confirmed STT text before restoring TTS)
+- `SOFT_INTERRUPT_DUCK_LEVEL` (default `0.22`; temporary TTS volume multiplier during soft interrupt)
 - `SILENCE_AFTER_SPEAK_MS`
 - `INBOUND_DEDUP_MS`
 - `AUTO_GREETING_ENABLED`

@@ -32,6 +32,10 @@ class BaseTransportAdapter {
     throw new Error("stopSpeaking() is not implemented for this transport adapter.");
   }
 
+  async setTtsDucking() {
+    return false;
+  }
+
   getBridgePage() {
     return null;
   }

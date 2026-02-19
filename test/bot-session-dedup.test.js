@@ -296,6 +296,85 @@ test("consumePendingUserContinuation skips stale pending continuation", () => {
   assert.equal(session.pendingContinuationSetAtMs, 0);
 });
 
+test("soft interrupt ducks assistant audio and restores it if speech is not confirmed", async () => {
+  const session = new BotSession({ config: {} });
+  const duckingCalls = [];
+  session.sessionConfig = {
+    bargeInEnabled: true,
+    softInterruptEnabled: true,
+    softInterruptConfirmMs: 220,
+    softInterruptDuckLevel: 0.2,
+    bargeInMinMs: 0
+  };
+  session.bridgePage = { isClosed: () => false };
+  session.transportAdapter = {
+    setTtsDucking: async (payload) => {
+      duckingCalls.push(payload);
+      return true;
+    }
+  };
+  session.activeAssistantRun = {
+    id: "run_soft_1",
+    startedAt: Date.now() - 2000,
+    abortController: { signal: { aborted: false } }
+  };
+
+  session.maybeStartSoftInterrupt({
+    source: "openai-stt",
+    reason: "vad-start"
+  });
+  assert.equal(session.softInterruptActive, true);
+
+  session.handleSoftInterruptStop({
+    source: "openai-stt",
+    reason: "vad-stop"
+  });
+  await sleep(280);
+
+  assert.equal(session.softInterruptActive, false);
+  assert.equal(
+    duckingCalls.some((item) => item?.active === true),
+    true
+  );
+  assert.equal(
+    duckingCalls.some((item) => item?.active === false),
+    true
+  );
+});
+
+test("final user turn after soft interrupt triggers hard interruption", async () => {
+  const session = new BotSession({ config: {} });
+  session.sessionConfig = {
+    bargeInEnabled: true,
+    bargeInMinMs: 0,
+    bargeInMinWordsOpenAiStt: 2
+  };
+  session.activeAssistantRun = {
+    id: "run_soft_2",
+    startedAt: Date.now() - 1500,
+    abortController: { signal: { aborted: false } }
+  };
+  session.softInterruptActive = true;
+  session.softInterruptRunId = "run_soft_2";
+  session.softInterruptSource = "openai-stt";
+
+  let interrupted = false;
+  session.interruptAssistantRun = async () => {
+    interrupted = true;
+    return true;
+  };
+
+  session.maybeInterruptAssistantOutput({
+    source: "openai-stt",
+    text: "hello i need help",
+    reason: "final-turn"
+  });
+  await sleep(10);
+
+  assert.equal(interrupted, true);
+  assert.equal(session.softInterruptActive, false);
+});
+
 test("waitForPostTurnResponseDelay keeps first short greeting", async () => {
   const session = new BotSession({ config: {} });
   session.status = "running";

@@ -4,6 +4,7 @@ const {
   bridgeStopOpenAiStt,
   bridgeSpeakAudio,
   bridgeStopSpeaking,
+  bridgeSetTtsDucking,
   openMeetPage,
   detectMeetJoinState,
   leaveMeetPage
@@ -77,6 +78,13 @@ class MeetTransportAdapter extends BaseTransportAdapter {
       return false;
     }
     return bridgeStopSpeaking(this.bridgePage);
+  }
+
+  async setTtsDucking(options = {}) {
+    if (!this.bridgePage || this.bridgePage.isClosed()) {
+      return false;
+    }
+    return bridgeSetTtsDucking(this.bridgePage, options);
   }
 
   async stop({ leaveMeet = true } = {}) {

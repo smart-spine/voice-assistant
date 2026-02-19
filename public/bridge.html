@@ -75,10 +75,13 @@
           language: "en-US",
           silenceMs: 1000,
           turnSilenceMs: 700,
+          ttsDuckLevel: 0.22,
+          ttsDuckActive: false,
           ttsOutputDeviceId: "",
           ttsOutputDeviceLabel: "",
           ttsOutputConfigured: false,
           ttsOutputSupportLogged: false,
+          currentAudioElement: null,
           stt: {
             active: false,
             stream: null,
@@ -105,7 +108,8 @@
             hangoverMs: 700,
             segmentMinMs: 900,
             segmentMaxMs: 7000,
-            lastSegmentDropLogAtMs: 0
+            lastSegmentDropLogAtMs: 0,
+            vadEventActive: false
           },
           currentPlayback: null
         };
@@ -137,12 +141,55 @@
           }
         }
 
+        function emitBridgeEvent(payload = {}) {
+          if (!payload || typeof payload !== "object") {
+            return;
+          }
+          if (typeof window.notifyBridgeEvent !== "function") {
+            return;
+          }
+          Promise.resolve(
+            window.notifyBridgeEvent({
+              ts: Date.now(),
+              source: "openai-stt",
+              ...payload
+            })
+          ).catch(() => {});
+        }
+
+        function effectiveTtsVolume() {
+          if (!state.ttsDuckActive) {
+            return 1;
+          }
+          const duck = Number(state.ttsDuckLevel);
+          if (!Number.isFinite(duck)) {
+            return 0.22;
+          }
+          return Math.max(0, Math.min(1, duck));
+        }
+
+        function applyCurrentAudioVolume() {
+          const audio = state.currentAudioElement;
+          if (!audio) {
+            return;
+          }
+          try {
+            audio.volume = effectiveTtsVolume();
+          } catch (_) {
+            // Ignore runtime audio volume update failures.
+          }
+        }
+
         function parseQuery() {
           const params = new URLSearchParams(window.location.search);
           state.language = params.get("lang") || state.language;
           state.silenceMs = Number(params.get("silenceMs")) || state.silenceMs;
           state.turnSilenceMs =
             Number(params.get("turnSilenceMs")) || state.turnSilenceMs;
+          const duckLevel = Number(params.get("ttsDuckLevel"));
+          if (Number.isFinite(duckLevel)) {
+            state.ttsDuckLevel = Math.max(0, Math.min(1, duckLevel));
+          }
           state.ttsOutputDeviceId =
             (params.get("ttsOutputDeviceId") || state.ttsOutputDeviceId || "").trim();
           state.ttsOutputDeviceLabel =
@@ -383,6 +430,18 @@
           state.stt.lastVoiceAtMs = 0;
         }
 
+        function emitVadStop(reason = "silence") {
+          if (!state.stt.vadEventActive) {
+            return;
+          }
+          state.stt.vadEventActive = false;
+          addLog(`openai-stt vad.stop (reason=${reason})`);
+          emitBridgeEvent({
+            type: "vad.stop",
+            reason
+          });
+        }
+
         async function flushOpenAiSttSegment(reason = "segment") {
           if (!state.stt.active || state.stt.flushInFlight) {
             return;
@@ -399,6 +458,7 @@
           const frames = state.stt.pcmFrames;
           const bufferedSamples = Number(state.stt.bufferedSamples || 0);
           const peak = Number(state.stt.signalPeak || 0);
+          emitVadStop(reason);
           resetOpenAiSttSegmentState();
 
           const merged = concatInt16Chunks(frames);
@@ -523,6 +583,7 @@
         function stopSpeaking() {
           const playback = state.currentPlayback;
           if (!playback || playback.stopped) {
+            addLog("stopSpeaking ignored: no active playback");
             return false;
           }
 
@@ -535,6 +596,23 @@
             }
           }
           playback.stopHandlers = [];
+          addLog("stopSpeaking applied: active playback interrupted");
+          return true;
+        }
+
+        function setTtsDucking(options = {}) {
+          const active =
+            typeof options.active === "boolean"
+              ? options.active
+              : Boolean(options);
+          if (Number.isFinite(options.level)) {
+            state.ttsDuckLevel = Math.max(0, Math.min(1, Number(options.level)));
+          }
+          state.ttsDuckActive = active;
+          applyCurrentAudioVolume();
+          addLog(
+            `tts ducking ${active ? "enabled" : "disabled"} (level=${effectiveTtsVolume().toFixed(2)})`
+          );
           return true;
         }
 
@@ -551,6 +629,7 @@
           const sinkNode = state.stt.sinkNode;
           const flushTimer = state.stt.flushTimer;
 
+          emitVadStop("stt-stop");
           state.stt.active = false;
           state.stt.stream = null;
           state.stt.audioContext = null;
@@ -568,6 +647,7 @@
           state.stt.vadState = "idle";
           state.stt.lastVoiceAtMs = 0;
           state.stt.segmentStartedAtMs = 0;
+          state.stt.vadEventActive = false;
 
           if (flushTimer) {
             clearInterval(flushTimer);
@@ -810,8 +890,9 @@
                 return;
               }
               const now = Date.now();
-              if (state.speaking || now < Number(state.stt.gateUntilMs || 0)) {
+              if (now < Number(state.stt.gateUntilMs || 0)) {
                 if (state.stt.vadState !== "idle") {
+                  emitVadStop("gate");
                   resetOpenAiSttSegmentState();
                 }
                 return;
@@ -837,6 +918,18 @@
                   state.stt.vadState = "speaking";
                   state.stt.segmentStartedAtMs = now;
                   state.stt.lastVoiceAtMs = now;
+                  if (!state.stt.vadEventActive) {
+                    state.stt.vadEventActive = true;
+                    addLog(
+                      `openai-stt vad.start (peak=${peak.toFixed(4)}, threshold=${Number(
+                        state.stt.vadThreshold || 0
+                      ).toFixed(4)})`
+                    );
+                    emitBridgeEvent({
+                      type: "vad.start",
+                      peak
+                    });
+                  }
                 } else {
                   state.stt.lastVoiceAtMs = now;
                 }
@@ -930,6 +1023,9 @@
           state.stt.gateUntilMs = Date.now() + Math.max(0, state.silenceMs);
           setSpeechState("speaking");
           state.currentPlayback = playback;
+          addLog(
+            `tts playback start (gateMs=${Math.max(0, Number(state.silenceMs || 0))})`
+          );
 
           try {
             await unlockAudio();
@@ -941,6 +1037,9 @@
             state.stt.gateUntilMs = Date.now() + Math.max(0, state.silenceMs);
             state.speaking = false;
             setSpeechState(playback.stopped ? "interrupted" : "idle");
+            addLog(
+              `tts playback end (state=${playback.stopped ? "interrupted" : "completed"})`
+            );
           }
         }
 
@@ -960,8 +1059,9 @@
             const source = `data:${mimeType};base64,${audioBase64}`;
             const audio = new Audio(source);
             audio.preload = "auto";
-            audio.volume = 1;
+            audio.volume = effectiveTtsVolume();
             await applyTtsOutputDevice(audio);
+            state.currentAudioElement = audio;
 
             await new Promise((resolve) => {
               let resolved = false;
@@ -981,6 +1081,9 @@
                   audio.load();
                 } catch (_) {
                   // Ignore audio teardown errors.
+                }
+                if (state.currentAudioElement === audio) {
+                  state.currentAudioElement = null;
                 }
                 done();
               });
@@ -1020,6 +1123,10 @@
           if (Number.isFinite(options.turnSilenceMs)) {
             state.turnSilenceMs = Math.max(120, options.turnSilenceMs);
           }
+          if (Number.isFinite(options.ttsDuckLevel)) {
+            state.ttsDuckLevel = Math.max(0, Math.min(1, options.ttsDuckLevel));
+            applyCurrentAudioVolume();
+          }
           if (
             typeof options.ttsOutputDeviceId === "string" &&
             options.ttsOutputDeviceId.trim()
@@ -1041,6 +1148,7 @@
           language: state.language,
           silenceMs: state.silenceMs,
           turnSilenceMs: state.turnSilenceMs,
+          ttsDuckLevel: state.ttsDuckLevel,
           ttsOutputDeviceId: state.ttsOutputDeviceId,
           ttsOutputDeviceLabel: state.ttsOutputDeviceLabel
         });
@@ -1050,6 +1158,7 @@
           stopOpenAiStt,
           playAudio,
           stopSpeaking,
+          setTtsDucking,
           unlockAudio,
           prepareTtsOutput,
           configure
