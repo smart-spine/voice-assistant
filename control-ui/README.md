@@ -2,6 +2,8 @@
 
 Dark-green Next.js dashboard for operating the existing voice-bot stack.
 
+Supports the current backend runtime (OpenAI Realtime pipeline with hybrid fallback).
+
 ## What it does
 
 - Starts/stops the local bot Control API process (`npm run start:api` or custom command).

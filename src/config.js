@@ -33,12 +33,24 @@ function pickAudioFormat(rawValue) {
   return "mp3";
 }
 
-function pickAgentRuntime(rawValue) {
-  const value = String(rawValue || "openai").toLowerCase();
-  if (["langchain", "openai"].includes(value)) {
+function pickVoicePipelineMode(rawValue) {
+  const value = String(rawValue || "hybrid")
+    .trim()
+    .toLowerCase();
+  if (["hybrid", "realtime"].includes(value)) {
     return value;
   }
-  return "openai";
+  return "hybrid";
+}
+
+function pickRealtimeTurnDetection(rawValue) {
+  const value = String(rawValue || "manual")
+    .trim()
+    .toLowerCase();
+  if (["manual", "server_vad", "semantic_vad"].includes(value)) {
+    return value;
+  }
+  return "manual";
 }
 
 function pickOpenAiSttSource(rawValue) {
@@ -47,10 +59,6 @@ function pickOpenAiSttSource(rawValue) {
     .toLowerCase();
   if (value === "bridge-input") {
     return value;
-  }
-  if (value === "meet-tab") {
-    // Legacy alias kept for backward compatibility after meet-tab mode removal.
-    return "bridge-input";
   }
   return "bridge-input";
 }
@@ -129,7 +137,104 @@ const config = {
   openaiTtsModel: process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
   openaiTtsVoice: process.env.OPENAI_TTS_VOICE || "alloy",
   openaiTtsFormat: pickAudioFormat(process.env.OPENAI_TTS_FORMAT),
-  agentRuntime: pickAgentRuntime(process.env.AGENT_RUNTIME),
+  voicePipelineMode: pickVoicePipelineMode(process.env.VOICE_PIPELINE_MODE),
+  voicePipelineFallbackToHybrid: asBoolean(
+    process.env.VOICE_PIPELINE_FALLBACK_TO_HYBRID,
+    true
+  ),
+  openaiRealtimeModel: cleanString(
+    process.env.OPENAI_REALTIME_MODEL,
+    "gpt-4o-mini-realtime-preview-2024-12-17"
+  ),
+  openaiRealtimeConnectTimeoutMs: asBoundedNumber(
+    process.env.OPENAI_REALTIME_CONNECT_TIMEOUT_MS,
+    {
+      fallback: 8000,
+      min: 1000,
+      max: 30000,
+      integer: true
+    }
+  ),
+  openaiRealtimeInputSampleRateHz: asBoundedNumber(
+    process.env.OPENAI_REALTIME_INPUT_SAMPLE_RATE_HZ,
+    {
+      fallback: 24000,
+      min: 8000,
+      max: 48000,
+      integer: true
+    }
+  ),
+  openaiRealtimeOutputSampleRateHz: asBoundedNumber(
+    process.env.OPENAI_REALTIME_OUTPUT_SAMPLE_RATE_HZ,
+    {
+      fallback: 24000,
+      min: 8000,
+      max: 48000,
+      integer: true
+    }
+  ),
+  openaiRealtimeOutputChunkMs: asBoundedNumber(
+    process.env.OPENAI_REALTIME_OUTPUT_CHUNK_MS,
+    {
+      fallback: 120,
+      min: 40,
+      max: 500,
+      integer: true
+    }
+  ),
+  openaiRealtimeInputTranscriptionModel: cleanString(
+    process.env.OPENAI_REALTIME_INPUT_TRANSCRIPTION_MODEL,
+    "gpt-4o-mini-transcribe"
+  ),
+  openaiRealtimeTurnDetection: pickRealtimeTurnDetection(
+    process.env.OPENAI_REALTIME_TURN_DETECTION
+  ),
+  openaiRealtimeTurnEagerness: cleanString(
+    process.env.OPENAI_REALTIME_TURN_EAGERNESS,
+    "auto"
+  ),
+  openaiRealtimeVadThreshold: asBoundedNumber(
+    process.env.OPENAI_REALTIME_VAD_THRESHOLD,
+    {
+      fallback: 0.45,
+      min: 0,
+      max: 1
+    }
+  ),
+  openaiRealtimeVadSilenceMs: asBoundedNumber(
+    process.env.OPENAI_REALTIME_VAD_SILENCE_MS,
+    {
+      fallback: 280,
+      min: 120,
+      max: 2000,
+      integer: true
+    }
+  ),
+  openaiRealtimeVadPrefixPaddingMs: asBoundedNumber(
+    process.env.OPENAI_REALTIME_VAD_PREFIX_PADDING_MS,
+    {
+      fallback: 180,
+      min: 0,
+      max: 1000,
+      integer: true
+    }
+  ),
+  openaiRealtimeInterruptResponseOnTurn: asBoolean(
+    process.env.OPENAI_REALTIME_INTERRUPT_RESPONSE_ON_TURN,
+    true
+  ),
+  openaiRealtimeMaxResponseOutputTokens:
+    cleanString(
+      process.env.OPENAI_REALTIME_MAX_RESPONSE_OUTPUT_TOKENS,
+      "inf"
+    ).toLowerCase() === "inf"
+      ? "inf"
+      : asBoundedNumber(process.env.OPENAI_REALTIME_MAX_RESPONSE_OUTPUT_TOKENS, {
+          fallback: 512,
+          min: 16,
+          max: 4096,
+          integer: true
+        }),
   openaiTtsTimeoutMs: asBoundedNumber(process.env.OPENAI_TTS_TIMEOUT_MS, {
     fallback: 8000,
     min: 1000,

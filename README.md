@@ -1,42 +1,46 @@
 # Google Meet Voice Bot
 
-OpenAI-native Google Meet bot for short intake calls.
+Ultra-low-latency voice bot for Google Meet with OpenAI Realtime pipeline and hybrid fallback.
 
-The runtime is intentionally strict and minimal:
-1. Join Google Meet with Puppeteer.
-2. Capture audio in the bridge page via `MediaRecorder`.
-3. Transcribe turns with OpenAI STT.
-4. Generate streaming assistant output (OpenAI or LangChain runtime).
-5. Synthesize speech with OpenAI TTS and play it back through the bridge page.
+## Runtime architecture
 
-Legacy caption scraping, browser `SpeechSynthesis` fallback, and mixed transcription modes were removed.
+The bot now has two execution paths:
+
+1. `realtime` (recommended)
+- Audio from bridge is streamed to OpenAI Realtime WS.
+- User speech transcription and assistant audio come back as realtime events.
+- Assistant audio is played in short chunks for faster first-byte speech.
+- Barge-in cancels active response immediately (`response.cancel` + playback flush).
+
+2. `hybrid` (fallback)
+- Bridge VAD segments -> OpenAI STT (`gpt-4o-*-transcribe`) -> OpenAI chat stream -> OpenAI TTS.
+
+`VOICE_PIPELINE_MODE` controls the primary path.
+`VOICE_PIPELINE_FALLBACK_TO_HYBRID=true` allows automatic fallback if realtime init fails.
 
 ## Project structure
 
-- `src/index.js` - CLI entrypoint (`npm start`).
-- `src/api.js` - control API entrypoint (`npm run start:api`).
-- `src/runtime/bot-session.js` - core session lifecycle and turn pipeline.
-- `src/runtime/session-manager.js` - single active session orchestrator.
-- `src/meet-controller.js` - browser automation + Meet interactions.
-- `src/openai-stt-service.js` - OpenAI STT turn stream.
-- `src/openai-service.js` - OpenAI chat + TTS runtime.
-- `src/langchain-agent-service.js` - LangChain chat runtime with OpenAI TTS.
-- `src/transports/transport-factory.js` - transport adapter factory (Meet now, extensible for phone/mobile channels).
-- `src/transports/meet-transport-adapter.js` - Meet transport adapter implementation.
-- `src/prompts/prompt-builder.js` - system prompt composition.
-- `src/workflows/call-summary-graph.js` - post-call summary workflow.
-- `src/api/control-server.js` - REST API layer.
-- `public/bridge.html` - audio bridge for STT capture + playback.
-- `prompts/system-prompt.txt` - default system prompt.
+- `/Users/uladzislaupraskou/voice-assistant/src/index.js` - CLI entrypoint (`npm start`).
+- `/Users/uladzislaupraskou/voice-assistant/src/api.js` - Control API entrypoint (`npm run start:api`).
+- `/Users/uladzislaupraskou/voice-assistant/src/runtime/bot-session.js` - session lifecycle, turn logic, barge-in.
+- `/Users/uladzislaupraskou/voice-assistant/src/runtime/session-manager.js` - single active session manager.
+- `/Users/uladzislaupraskou/voice-assistant/src/transports/realtime-transport-adapter.js` - OpenAI Realtime WS adapter.
+- `/Users/uladzislaupraskou/voice-assistant/src/openai-stt-service.js` - hybrid STT turn stream.
+- `/Users/uladzislaupraskou/voice-assistant/src/openai-service.js` - OpenAI chat + TTS responder.
+- `/Users/uladzislaupraskou/voice-assistant/src/meet-controller.js` - Puppeteer + bridge wiring.
+- `/Users/uladzislaupraskou/voice-assistant/src/transports/meet-transport-adapter.js` - Meet transport implementation.
+- `/Users/uladzislaupraskou/voice-assistant/src/workflows/call-summary-graph.js` - post-call summary workflow.
+- `/Users/uladzislaupraskou/voice-assistant/public/bridge.html` - browser audio bridge (capture/playback/VAD events).
+- `/Users/uladzislaupraskou/voice-assistant/prompts/system-prompt.txt` - base system prompt.
 
 ## Requirements
 
 - Node.js 18+
-- Google Chrome installed (or `CHROME_PATH` configured)
-- Valid OpenAI API key
-- Bot Google account already signed in inside `CHROME_USER_DATA_DIR`
+- Google Chrome (or `CHROME_PATH`)
+- OpenAI API key
+- Signed-in Google account in `CHROME_USER_DATA_DIR`
 
-## Quick start (CLI)
+## Quick start
 
 ```bash
 npm install
@@ -44,33 +48,24 @@ cp .env.example .env
 npm start
 ```
 
-Required env vars for CLI mode:
+Required env:
 - `OPENAI_API_KEY`
 - `MEET_URL`
 
-Recommended local values:
-- `HEADLESS=false`
-- `CHROME_USER_DATA_DIR=.chrome-profile`
-- `OPENAI_STT_MODEL=gpt-4o-mini-transcribe`
-
-## API mode
+## Control API
 
 ```bash
 npm run start:api
 ```
 
-Default: `http://127.0.0.1:3200`
+Default address: `http://127.0.0.1:3200`
 
-If `CONTROL_API_TOKEN` is set, send `Authorization: Bearer <token>`.
+If `CONTROL_API_TOKEN` is set, send:
+`Authorization: Bearer <token>`
 
-## Control UI (Next.js)
+## Control UI
 
-`control-ui` provides a dark-green web dashboard for:
-- starting/stopping the local API process,
-- launching/stopping bot sessions with `meetUrl` + client context,
-- watching unified API/bot logs in one stream.
-
-Quick start:
+`/Users/uladzislaupraskou/voice-assistant/control-ui`
 
 ```bash
 cd control-ui
@@ -79,62 +74,142 @@ npm install
 npm run dev
 ```
 
-Open: `http://127.0.0.1:3300`
+UI: `http://127.0.0.1:3300`
 
-## Ubuntu/Hetzner runbook
+## Ubuntu / Hetzner runbook
 
-For headless Ubuntu servers, run Chrome with `Xvfb` and PulseAudio virtual devices:
-
-1. Install runtime deps:
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
   xvfb pulseaudio pulseaudio-utils \
   chromium-browser fonts-liberation fonts-noto-color-emoji
-```
 
-2. Install project deps and configure env:
-```bash
 npm install
 cp .env.example .env
-```
-
-3. Start API with Linux audio bootstrap:
-```bash
 npm run start:api:ubuntu
 ```
 
-What this script does:
-- starts `Xvfb` on `:99` (if needed),
-- starts PulseAudio (if needed),
-- creates virtual devices:
-  - sink `meet_rx` (`Meet-RX`) for incoming call audio,
-  - sink `meet_tx` (`Meet-TX`) for bot TTS out,
-  - source `meet_tx_mic` (`Meet-TX-Mic`) for Meet microphone,
-  - source `meet_rx_in` (`Meet-RX-In`) for STT capture from remote participants,
-- exports defaults:
-  - `OPENAI_STT_DEVICE_LABEL=Meet-RX-In`
-  - `BRIDGE_TTS_OUTPUT_DEVICE_LABEL=Meet-TX`
+The ubuntu startup script prepares virtual PulseAudio devices and exports device labels for bridge STT/TTS routing.
 
-Recommended first-run check:
-- Open Meet settings in the bot browser profile once and ensure:
-  - `Microphone = Meet-TX-Mic` (or monitor of `Meet-TX`),
-  - `Speakers = Meet-RX`.
-- Keep `HEADLESS=false` on server unless you fully verify media capture in your environment.
+## Environment variables
 
-### Endpoints
+### Core
+- `OPENAI_API_KEY`
+- `MEET_URL`
+- `OPENAI_MODEL`
+- `OPENAI_TEMPERATURE`
+- `SYSTEM_PROMPT_FILE`
+- `SYSTEM_PROMPT`
 
-Health:
+### Voice pipeline
+- `VOICE_PIPELINE_MODE` (`realtime` or `hybrid`)
+- `VOICE_PIPELINE_FALLBACK_TO_HYBRID`
+
+### Realtime mode
+- `OPENAI_REALTIME_MODEL`
+- `OPENAI_REALTIME_CONNECT_TIMEOUT_MS`
+- `OPENAI_REALTIME_INPUT_SAMPLE_RATE_HZ`
+- `OPENAI_REALTIME_OUTPUT_SAMPLE_RATE_HZ`
+- `OPENAI_REALTIME_OUTPUT_CHUNK_MS`
+- `OPENAI_REALTIME_INPUT_TRANSCRIPTION_MODEL`
+- `OPENAI_REALTIME_TURN_DETECTION` (`manual`, `server_vad`, `semantic_vad`)
+- `OPENAI_REALTIME_TURN_EAGERNESS`
+- `OPENAI_REALTIME_VAD_THRESHOLD`
+- `OPENAI_REALTIME_VAD_SILENCE_MS`
+- `OPENAI_REALTIME_VAD_PREFIX_PADDING_MS`
+- `OPENAI_REALTIME_INTERRUPT_RESPONSE_ON_TURN`
+- `OPENAI_REALTIME_MAX_RESPONSE_OUTPUT_TOKENS`
+
+### Hybrid STT/TTS fallback
+- `OPENAI_STT_MODEL`
+- `OPENAI_STT_LANGUAGE`
+- `OPENAI_STT_CHUNK_MS`
+- `OPENAI_STT_TIMEOUT_MS`
+- `OPENAI_STT_LOG_FINALS`
+- `OPENAI_STT_LOG_PARTIALS`
+- `OPENAI_STT_PARTIALS_ENABLED`
+- `OPENAI_STT_PARTIAL_EMIT_MS`
+- `OPENAI_STT_MAX_RETRIES`
+- `OPENAI_STT_MIN_CHUNK_BYTES`
+- `OPENAI_STT_MAX_QUEUE_CHUNKS`
+- `OPENAI_STT_MIME_TYPE`
+- `OPENAI_STT_DEVICE_ID`
+- `OPENAI_STT_DEVICE_LABEL`
+- `OPENAI_STT_PREFER_LOOPBACK`
+- `OPENAI_STT_AUDIO_BITS_PER_SECOND`
+- `OPENAI_STT_MIN_SIGNAL_PEAK`
+- `OPENAI_STT_VAD_THRESHOLD`
+- `OPENAI_STT_HANGOVER_MS`
+- `OPENAI_STT_SEGMENT_MIN_MS`
+- `OPENAI_STT_SEGMENT_MAX_MS`
+- `OPENAI_TTS_MODEL`
+- `OPENAI_TTS_VOICE`
+- `OPENAI_TTS_FORMAT`
+- `OPENAI_TTS_TIMEOUT_MS`
+- `BRIDGE_TTS_OUTPUT_DEVICE_ID`
+- `BRIDGE_TTS_OUTPUT_DEVICE_LABEL`
+
+### Turn-taking / interruption
+- `TURN_SILENCE_MS`
+- `TURN_CONTINUATION_SILENCE_MS`
+- `POST_TURN_RESPONSE_DELAY_MS`
+- `TURN_STITCH_ENABLED`
+- `TURN_STITCH_WINDOW_MS`
+- `SEMANTIC_EOT_ENABLED`
+- `SEMANTIC_EOT_USE_LLM`
+- `SEMANTIC_EOT_MODEL`
+- `SEMANTIC_EOT_TIMEOUT_MS`
+- `SEMANTIC_EOT_MIN_DELAY_MS`
+- `SEMANTIC_EOT_MAX_DELAY_MS`
+- `BARGE_IN_ENABLED`
+- `BARGE_IN_ON_PARTIALS`
+- `BARGE_IN_ON_VAD_CONFIRMED`
+- `BARGE_IN_VAD_MIN_PEAK`
+- `BARGE_IN_MIN_MS`
+- `BARGE_IN_MIN_WORDS_OPENAI_STT`
+- `BARGE_IN_CONTINUATION_WINDOW_MS`
+- `SOFT_INTERRUPT_ENABLED`
+- `SOFT_INTERRUPT_CONFIRM_MS`
+- `SOFT_INTERRUPT_DUCK_LEVEL`
+- `SILENCE_AFTER_SPEAK_MS`
+- `INBOUND_DEDUP_MS`
+
+### Browser / Meet
+- `HEADLESS`
+- `CHROME_PATH`
+- `CHROME_USER_DATA_DIR`
+- `MEET_ASSUME_LOGGED_IN`
+- `MEET_JOIN_STATE_TIMEOUT_MS`
+- `MEET_JOIN_POLL_MS`
+- `MEET_JOIN_CLICK_ATTEMPTS`
+- `MEET_JOIN_CLICK_RETRY_MS`
+- `BRIDGE_HOST`
+- `BRIDGE_PORT`
+
+### API
+- `CONTROL_API_HOST`
+- `CONTROL_API_PORT`
+- `CONTROL_API_TOKEN`
+- `ALLOW_ANY_MEET_URL`
+
+### Call summary
+- `CALL_SUMMARY_ENABLED`
+- `CALL_SUMMARY_MODEL`
+- `CALL_SUMMARY_TEMPERATURE`
+- `CALL_SUMMARY_MAX_TURNS`
+- `CALL_SUMMARY_MAX_TRANSCRIPT_CHARS`
+- `CALL_SUMMARY_MAX_OUTPUT_CHARS`
+- `CALL_SUMMARY_TIMEOUT_MS`
+
+## Health / control endpoints
+
 ```bash
 curl http://127.0.0.1:3200/health
-```
-
-Status:
-```bash
 curl http://127.0.0.1:3200/api/v1/bot/status
 ```
 
-Start:
+Start session:
+
 ```bash
 curl -X POST http://127.0.0.1:3200/api/v1/bot/start \
   -H "Content-Type: application/json" \
@@ -147,127 +222,16 @@ curl -X POST http://127.0.0.1:3200/api/v1/bot/start \
   }'
 ```
 
-Stop:
+Stop session:
+
 ```bash
 curl -X POST http://127.0.0.1:3200/api/v1/bot/stop \
   -H "Content-Type: application/json" \
   -d '{"reason":"manual stop"}'
 ```
 
-## Active environment variables
-
-Core:
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
-- `OPENAI_TEMPERATURE`
-- `AGENT_RUNTIME` (`langchain` or `openai`)
-
-TTS:
-- `OPENAI_TTS_MODEL`
-- `OPENAI_TTS_VOICE`
-- `OPENAI_TTS_FORMAT`
-- `OPENAI_TTS_TIMEOUT_MS`
-
-STT:
-- `OPENAI_STT_MODEL`
-- `OPENAI_STT_SOURCE` (`bridge-input` only)
-- `OPENAI_STT_LANGUAGE`
-- `OPENAI_STT_CHUNK_MS`
-- `OPENAI_STT_TIMEOUT_MS`
-- `OPENAI_STT_LOG_FINALS`
-- `OPENAI_STT_LOG_PARTIALS`
-- `VERBOSE_SESSION_LOGS` (default `true`; adds detailed runtime logs for queueing, turn delay, barge-in/soft-interrupt decisions, and auto-greeting flow)
-- `OPENAI_STT_MAX_RETRIES`
-- `OPENAI_STT_MIN_CHUNK_BYTES`
-- `OPENAI_STT_MIME_TYPE`
-- `OPENAI_STT_DEVICE_ID`
-- `OPENAI_STT_DEVICE_LABEL` (optional substring match for input device label, useful on macOS when device id changes)
-- `OPENAI_STT_PREFER_LOOPBACK` (default `true`: if no device is explicitly set, bridge prefers loopback-style inputs such as BlackHole/Loopback/Soundflower)
-- `OPENAI_STT_AUDIO_BITS_PER_SECOND`
-- `OPENAI_STT_MIN_SIGNAL_PEAK` (default `0.004`; drop near-silent chunks before sending to STT)
-- `OPENAI_STT_VAD_THRESHOLD` (default `0.015`; voice activity threshold for segment start/continue)
-- `OPENAI_STT_HANGOVER_MS` (default `700`; silence window before segment flush)
-- `OPENAI_STT_SEGMENT_MIN_MS` (default `900`; drop too-short segments)
-- `OPENAI_STT_SEGMENT_MAX_MS` (default `15000`; force flush very long utterances)
-- `BRIDGE_TTS_OUTPUT_DEVICE_ID` (optional explicit audio output device id for bridge playback)
-- `BRIDGE_TTS_OUTPUT_DEVICE_LABEL` (optional label match for bridge playback sink; useful for forcing TTS to `BlackHole 2ch`)
-- `TURN_SILENCE_MS`
-- `POST_TURN_RESPONSE_DELAY_MS`
-- `TURN_CONTINUATION_SILENCE_MS` (default `3000`; wait this long for user continuation before responding)
-- `TURN_STITCH_ENABLED` (merge adjacent final STT turns when first segment looks incomplete)
-- `TURN_STITCH_WINDOW_MS` (max gap for final-turn stitching, default `1100`)
-
-Conversation/runtime:
-- `WAKE_WORD`
-- `REPLY_CHUNK_MIN_CHARS`
-- `REPLY_CHUNK_TARGET_CHARS`
-- `REPLY_CHUNK_MAX_CHARS`
-- `REPLY_CHUNK_MAX_LATENCY_MS`
-- `BARGE_IN_ENABLED`
-- `BARGE_IN_ON_PARTIALS` (default `false`; keep disabled to avoid canceling replies on unstable interim STT text)
-- `BARGE_IN_MIN_MS`
-- `BARGE_IN_MIN_WORDS_OPENAI_STT` (default `2`; avoids barge-in on one-word STT noise)
-- `BARGE_IN_CONTINUATION_WINDOW_MS` (default `20000`; max age of previous user turn used for continuation merge after barge-in)
-- `SOFT_INTERRUPT_ENABLED` (default `true`; enable VAD-driven soft barge-in with temporary TTS ducking)
-- `SOFT_INTERRUPT_CONFIRM_MS` (default `700`; how long to wait after `vad.stop` for confirmed STT text before restoring TTS)
-- `SOFT_INTERRUPT_DUCK_LEVEL` (default `0.22`; temporary TTS volume multiplier during soft interrupt)
-- `SILENCE_AFTER_SPEAK_MS`
-- `INBOUND_DEDUP_MS`
-- `AUTO_GREETING_ENABLED`
-- `AUTO_GREETING_DELAY_MS`
-- `AUTO_GREETING_PROMPT`
-
-Prompt/context:
-- `SYSTEM_PROMPT_FILE`
-- `SYSTEM_PROMPT`
-- `PROJECT_CONTEXT`
-
-Call completion/summary:
-- `INTAKE_COMPLETE_TOKEN`
-- `AUTO_LEAVE_ON_INTAKE_COMPLETE`
-- `INTAKE_COMPLETE_LEAVE_DELAY_MS`
-- `CALL_SUMMARY_ENABLED`
-- `CALL_SUMMARY_MODEL`
-- `CALL_SUMMARY_TEMPERATURE`
-- `CALL_SUMMARY_MAX_TURNS`
-- `CALL_SUMMARY_MAX_TRANSCRIPT_CHARS`
-- `CALL_SUMMARY_MAX_OUTPUT_CHARS`
-- `CALL_SUMMARY_TIMEOUT_MS`
-
-Browser:
-- `MEET_URL`
-- `HEADLESS`
-- `CHROME_PATH`
-- `CHROME_USER_DATA_DIR`
-- `MEET_ASSUME_LOGGED_IN` (default `false`; when `true`, do not fail startup on temporary `auth_required` join-state detection)
-- `MEET_JOIN_STATE_TIMEOUT_MS` (initial join-state wait during startup; lower means faster startup when Meet is slow to report joined)
-- `MEET_JOIN_POLL_MS` (background join-state polling interval used after startup)
-- `MEET_JOIN_CLICK_ATTEMPTS` (max join-button retries on prejoin screen)
-- `MEET_JOIN_CLICK_RETRY_MS` (delay between join-button retries)
-- `BRIDGE_HOST`
-- `BRIDGE_PORT`
-
-Control API:
-- `CONTROL_API_HOST`
-- `CONTROL_API_PORT`
-- `CONTROL_API_TOKEN`
-- `ALLOW_ANY_MEET_URL`
-
-## Audio routing note
-
-Recommended macOS setup for stable single-machine tests:
-1. Keep separate TX/RX buses: `BlackHole 2ch` for Meet microphone (bot voice out) and `BlackHole 16ch` for Meet speakers (remote voice in).
-2. In Meet, set `Microphone = BlackHole 2ch` and `Speakers = BlackHole 16ch`.
-3. Set `OPENAI_STT_SOURCE=bridge-input` and `OPENAI_STT_DEVICE_LABEL=BlackHole 16ch`.
-4. Set `BRIDGE_TTS_OUTPUT_DEVICE_LABEL=BlackHole 2ch` so bridge playback is routed directly to Meet mic path (independent from macOS default output).
-
-The bridge uses VAD-driven segment capture plus a software gate while TTS is playing:
-- STT only flushes full speech segments (not fixed 650ms slices).
-- STT ignores bot playback and resumes after a silence window (`SILENCE_AFTER_SPEAK_MS`).
-- Segment boundaries are controlled by `OPENAI_STT_VAD_THRESHOLD`, `OPENAI_STT_HANGOVER_MS`, `OPENAI_STT_SEGMENT_MIN_MS`, and `OPENAI_STT_SEGMENT_MAX_MS`.
-
 ## Security
 
-- Keep API bound to localhost unless behind a trusted proxy.
-- Set `CONTROL_API_TOKEN` outside local-only development.
+- Keep API on localhost unless protected by trusted proxy.
+- Set `CONTROL_API_TOKEN` outside local dev.
 - Do not commit real `.env` secrets.

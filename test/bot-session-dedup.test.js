@@ -523,3 +523,66 @@ test("processQueue accepts openai-stt turns on prejoin when MEET_ASSUME_LOGGED_I
   assert.equal(called, true);
   assert.equal(session.queue.length, 0);
 });
+
+test("handleConfirmedVadBargeIn interrupts realtime response in realtime mode", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.sessionConfig = {
+    bargeInOnVadConfirmed: true,
+    bargeInEnabled: true,
+    bargeInMinMs: 220,
+    bargeInVadMinPeak: 0.01
+  };
+  session.activeVoicePipelineMode = "realtime";
+  session.realtimeAdapter = {};
+  session.realtimeResponseInProgress = true;
+  session.latestPartialsBySource = {
+    "openai-stt": {
+      text: "sorry wait one sec",
+      at: Date.now()
+    }
+  };
+
+  let interrupted = false;
+  session.interruptRealtimeOutput = async () => {
+    interrupted = true;
+    return true;
+  };
+
+  session.handleConfirmedVadBargeIn({
+    source: "openai-stt",
+    reason: "vad-confirmed",
+    speechMs: 260,
+    peak: 0.03
+  });
+  await sleep(20);
+
+  assert.equal(interrupted, true);
+});
+
+test("runAutoGreeting uses realtime adapter when realtime mode is active", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.meetJoinState = { status: "joined" };
+  session.sessionConfig = {
+    autoGreetingEnabled: true,
+    autoGreetingDelayMs: 0,
+    autoGreetingPrompt: "System: greet the user with one short sentence."
+  };
+  session.activeVoicePipelineMode = "realtime";
+  let called = 0;
+  session.realtimeAdapter = {
+    createTextTurn: async ({ role, text, createResponse }) => {
+      called += 1;
+      assert.equal(role, "system");
+      assert.equal(createResponse, true);
+      assert.equal(text, "System: greet the user with one short sentence.");
+      return true;
+    }
+  };
+
+  await session.runAutoGreeting({ responder: {} });
+
+  assert.equal(called, 1);
+  assert.equal(session.autoGreetingCompleted, true);
+});

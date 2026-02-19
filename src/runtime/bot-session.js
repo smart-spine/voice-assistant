@@ -1,7 +1,8 @@
 const { startBridgeServer } = require("../bridge-server");
-const { createResponder } = require("../responder-factory");
+const { OpenAIResponder } = require("../openai-service");
 const { launchBrowser } = require("../meet-controller");
 const { createTransportAdapter } = require("../transports/transport-factory");
+const { RealtimeTransportAdapter } = require("../transports/realtime-transport-adapter");
 const { OpenAiSttTurnStream } = require("../openai-stt-service");
 const { SemanticTurnDetector } = require("../semantic-turn-detector");
 const {
@@ -329,6 +330,16 @@ class BotSession {
     this.lastAssistantAudioAtMs = 0;
     this.bridgeBindings = null;
     this.openAiSttStream = null;
+    this.realtimeAdapter = null;
+    this.requestedVoicePipelineMode = "hybrid";
+    this.activeVoicePipelineMode = "";
+    this.realtimeResponseInProgress = false;
+    this.realtimeCurrentResponseId = "";
+    this.realtimePendingUserTurnText = "";
+    this.realtimeUserTurnByResponseId = {};
+    this.realtimeAssistantTextByResponseId = {};
+    this.realtimeAudioPlaybackChain = Promise.resolve();
+    this.realtimeAudioPlaybackGeneration = 0;
     this.activeSttSource = "";
     this.lastBridgeRecoveryAtMs = 0;
     this.hasProcessedUserTurn = false;
@@ -338,9 +349,6 @@ class BotSession {
     this.softInterruptRunId = "";
     this.softInterruptSource = "";
     this.softInterruptTimer = null;
-    this.semanticTurnDetector = null;
-    this.speculativePrefetch = null;
-    this.latestPartialsBySource = {};
     this.semanticTurnDetector = null;
     this.speculativePrefetch = null;
     this.latestPartialsBySource = {};
@@ -356,6 +364,11 @@ class BotSession {
       startedAt: this.startedAt,
       stoppedAt: this.stoppedAt,
       meetUrl: this.sessionConfig?.meetUrl || null,
+      voicePipelineMode:
+        this.activeVoicePipelineMode ||
+        this.requestedVoicePipelineMode ||
+        this.sessionConfig?.voicePipelineMode ||
+        "hybrid",
       sttSource: this.activeSttSource || this.sessionConfig?.openaiSttSource || null,
       hasProjectContext: Boolean(this.sessionConfig?.projectContext),
       queueSize: this.queue.length,
@@ -396,6 +409,17 @@ class BotSession {
     this.lastAssistantAudioAtMs = 0;
     this.bridgeBindings = null;
     this.openAiSttStream = null;
+    this.realtimeAdapter = null;
+    this.requestedVoicePipelineMode =
+      this.sessionConfig?.voicePipelineMode || "hybrid";
+    this.activeVoicePipelineMode = "";
+    this.realtimeResponseInProgress = false;
+    this.realtimeCurrentResponseId = "";
+    this.realtimePendingUserTurnText = "";
+    this.realtimeUserTurnByResponseId = {};
+    this.realtimeAssistantTextByResponseId = {};
+    this.realtimeAudioPlaybackChain = Promise.resolve();
+    this.realtimeAudioPlaybackGeneration = 0;
     this.activeSttSource = "";
     this.lastBridgeRecoveryAtMs = 0;
     this.hasProcessedUserTurn = false;
@@ -427,7 +451,7 @@ class BotSession {
     this.stoppedAt = null;
     this.lastError = null;
     this.trace(
-      `Session config: source=${this.sessionConfig.openaiSttSource}, sttModel=${this.sessionConfig.openaiSttModel}, turnSilenceMs=${this.sessionConfig.turnSilenceMs}, continuationSilenceMs=${this.sessionConfig.turnContinuationSilenceMs}, postTurnDelayMs=${this.sessionConfig.postTurnResponseDelayMs}, bargeInEnabled=${this.sessionConfig.bargeInEnabled}, softInterruptEnabled=${this.sessionConfig.softInterruptEnabled}.`
+      `Session config: source=${this.sessionConfig.openaiSttSource}, sttModel=${this.sessionConfig.openaiSttModel}, voicePipelineMode=${this.requestedVoicePipelineMode}, turnSilenceMs=${this.sessionConfig.turnSilenceMs}, continuationSilenceMs=${this.sessionConfig.turnContinuationSilenceMs}, postTurnDelayMs=${this.sessionConfig.postTurnResponseDelayMs}, bargeInEnabled=${this.sessionConfig.bargeInEnabled}, softInterruptEnabled=${this.sessionConfig.softInterruptEnabled}.`
     );
 
     this.info("Starting bridge server...");
@@ -438,8 +462,7 @@ class BotSession {
     this.server = server;
 
     this.info("Starting AI responder...");
-    const responder = createResponder({
-      runtime: this.sessionConfig.agentRuntime,
+    const responder = new OpenAIResponder({
       apiKey: this.sessionConfig.openaiApiKey,
       model: this.sessionConfig.openaiModel,
       ttsModel: this.sessionConfig.openaiTtsModel,
@@ -479,7 +502,6 @@ class BotSession {
     this.info(
       `TTS mode: OpenAI (${this.sessionConfig.openaiTtsModel}, voice=${this.sessionConfig.openaiTtsVoice}, format=${this.sessionConfig.openaiTtsFormat})`
     );
-    this.info(`Agent runtime: ${this.sessionConfig.agentRuntime}.`);
     if (this.sessionConfig.projectContext) {
       this.info("Project context attached to this session.");
     }
@@ -488,9 +510,37 @@ class BotSession {
       const source = normalizeText(event.source || "openai-stt") || "openai-stt";
       const type = normalizeText(event.type || "").toLowerCase();
       const text = normalizeText(event.text || "");
+      const isRealtimeSource = source === "openai-realtime";
 
       if (text) {
         this.markSourceActivity(source);
+      }
+
+      if (isRealtimeSource && type === "assistant.audio.chunk") {
+        this.queueRealtimeAudioPlayback(event);
+        return;
+      }
+
+      if (isRealtimeSource && type === "assistant.response.started") {
+        this.handleRealtimeResponseStarted(event);
+        return;
+      }
+
+      if (isRealtimeSource && type === "assistant.text.final") {
+        this.handleRealtimeAssistantTextFinal(event);
+        return;
+      }
+
+      if (isRealtimeSource && type === "assistant.response.done") {
+        this.handleRealtimeResponseDone(event);
+        return;
+      }
+
+      if (isRealtimeSource && type === "realtime.error") {
+        this.warn(
+          `Realtime transport event: ${normalizeText(event.reason || "unknown error")}.`
+        );
+        return;
       }
 
       if (type === "vad.start") {
@@ -503,6 +553,12 @@ class BotSession {
             event.reason || "n/a"
           ) || "n/a"}, peak=${peak}).`
         );
+        const realtimeVadSource =
+          isRealtimeSource ||
+          (this.isRealtimePipelineActive() && source === "openai-stt");
+        if (realtimeVadSource && this.sessionConfig?.softInterruptEnabled) {
+          this.setBridgeTtsDucking(true);
+        }
         this.maybeStartSoftInterrupt({
           source,
           reason: normalizeText(event.reason || "vad-start") || "vad-start"
@@ -522,6 +578,15 @@ class BotSession {
             event.reason || "n/a"
           ) || "n/a"}).`
         );
+        if (isRealtimeSource) {
+          this.handleRealtimeConfirmedVadBargeIn({
+            source,
+            reason: normalizeText(event.reason || "vad-confirmed") || "vad-confirmed",
+            speechMs,
+            peak: Number(event.peak || 0)
+          });
+          return;
+        }
         this.handleConfirmedVadBargeIn({
           source,
           reason: normalizeText(event.reason || "vad-confirmed") || "vad-confirmed",
@@ -537,6 +602,12 @@ class BotSession {
             event.reason || "n/a"
           ) || "n/a"}).`
         );
+        const realtimeVadSource =
+          isRealtimeSource ||
+          (this.isRealtimePipelineActive() && source === "openai-stt");
+        if (realtimeVadSource && this.sessionConfig?.softInterruptEnabled) {
+          this.setBridgeTtsDucking(false);
+        }
         this.handleSoftInterruptStop({
           source,
           reason: normalizeText(event.reason || "vad-stop") || "vad-stop"
@@ -552,7 +623,7 @@ class BotSession {
         if (this.sessionConfig?.openaiSttLogPartials) {
           this.stt(`[${source}] partial: ${text}`);
         }
-        if (this.sessionConfig?.partialSpeculationEnabled) {
+        if (!isRealtimeSource && this.sessionConfig?.partialSpeculationEnabled) {
           void this.maybeStartSpeculativePrefetch({
             source,
             text,
@@ -560,11 +631,23 @@ class BotSession {
           });
         }
         if (this.sessionConfig?.bargeInOnPartials) {
-          this.maybeInterruptAssistantOutput({
-            source,
-            text,
-            reason: "partial-transcript"
-          });
+          if (isRealtimeSource) {
+            if (this.realtimeResponseInProgress) {
+              void this.interruptRealtimeOutput(
+                `barge-in:${source}:partial-transcript`,
+                {
+                  source,
+                  text
+                }
+              );
+            }
+          } else {
+            this.maybeInterruptAssistantOutput({
+              source,
+              text,
+              reason: "partial-transcript"
+            });
+          }
         }
         return;
       }
@@ -590,6 +673,13 @@ class BotSession {
               120
             )}").`
           );
+          return;
+        }
+        if (isRealtimeSource) {
+          this.handleRealtimeUserFinal({
+            source,
+            text
+          });
           return;
         }
         const accepted = this.enqueueTranscript(text, source, {
@@ -618,7 +708,15 @@ class BotSession {
       this.browser = await launchBrowser(this.sessionConfig);
 
       this.bridgeBindings = {
-        onAudioChunk: (payload) => this.openAiSttStream?.enqueueChunk(payload),
+        onAudioChunk: (payload) => {
+          if (this.isRealtimePipelineActive() && this.realtimeAdapter) {
+            void this.realtimeAdapter.appendAudioChunk(payload).catch((err) => {
+              this.warn(`Realtime input audio append failed: ${err?.message || err}`);
+            });
+            return;
+          }
+          this.openAiSttStream?.enqueueChunk(payload);
+        },
         onBridgeLog: (line) => this.bridge(line),
         onBridgeEvent: handleBridgeEvent
       };
@@ -661,28 +759,11 @@ class BotSession {
         );
       }
 
-      const openAiTurnSilenceMs = Math.max(
-        150,
-        Number(this.sessionConfig.turnSilenceMs || 700)
-      );
-      this.openAiSttStream = new OpenAiSttTurnStream({
-        turnSilenceMs: openAiTurnSilenceMs,
-        apiKey: this.sessionConfig.openaiApiKey,
-        model: this.sessionConfig.openaiSttModel,
-        language: this.sessionConfig.openaiSttLanguage,
-        timeoutMs: this.sessionConfig.openaiSttTimeoutMs,
-        maxRetries: this.sessionConfig.openaiSttMaxRetries,
-        minChunkBytes: this.sessionConfig.openaiSttMinChunkBytes,
-        maxQueueChunks: this.sessionConfig.openaiSttMaxQueueChunks,
-        onEvent: handleBridgeEvent,
-        onLog: (line) => this.bridge(line)
-      });
-      this.info(
-        `OpenAI STT turn settings: turnSilenceMs=${openAiTurnSilenceMs}, vadThreshold=${this.sessionConfig.openaiSttVadThreshold}, hangoverMs=${this.sessionConfig.openaiSttHangoverMs}, segmentMinMs=${this.sessionConfig.openaiSttSegmentMinMs}, segmentMaxMs=${this.sessionConfig.openaiSttSegmentMaxMs}, partialsEnabled=${this.sessionConfig.openaiSttPartialsEnabled}, partialEmitMs=${this.sessionConfig.openaiSttPartialEmitMs}.`
-      );
-      const started = await this.transportAdapter.startStt({
+      const buildBridgeSttOptions = ({ realtime = false } = {}) => ({
         chunkMs: this.sessionConfig.openaiSttChunkMs,
-        partialsEnabled: this.sessionConfig.openaiSttPartialsEnabled,
+        partialsEnabled: realtime
+          ? true
+          : this.sessionConfig.openaiSttPartialsEnabled,
         partialEmitMs: this.sessionConfig.openaiSttPartialEmitMs,
         mimeType: this.sessionConfig.openaiSttMimeType,
         deviceId: this.sessionConfig.openaiSttDeviceId,
@@ -696,18 +777,125 @@ class BotSession {
         segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs,
         bargeInMinMs: this.sessionConfig.bargeInMinMs
       });
-      if (!started) {
-        throw new Error("OpenAI STT audio capture could not be started in bridge page.");
+
+      const requestedRealtime = this.requestedVoicePipelineMode === "realtime";
+      if (requestedRealtime) {
+        try {
+          this.info(
+            `Starting realtime voice pipeline (model=${this.sessionConfig.openaiRealtimeModel}, turnDetection=${this.sessionConfig.openaiRealtimeTurnDetection}).`
+          );
+          this.realtimeAdapter = new RealtimeTransportAdapter({
+            apiKey: this.sessionConfig.openaiApiKey,
+            model: this.sessionConfig.openaiRealtimeModel,
+            language: this.sessionConfig.openaiSttLanguage,
+            instructions: sessionSystemPrompt,
+            voice: this.sessionConfig.openaiTtsVoice,
+            temperature: this.sessionConfig.openaiTemperature,
+            inputSampleRateHz: this.sessionConfig.openaiRealtimeInputSampleRateHz,
+            outputSampleRateHz: this.sessionConfig.openaiRealtimeOutputSampleRateHz,
+            outputChunkMs: this.sessionConfig.openaiRealtimeOutputChunkMs,
+            connectTimeoutMs: this.sessionConfig.openaiRealtimeConnectTimeoutMs,
+            inputTranscriptionModel:
+              this.sessionConfig.openaiRealtimeInputTranscriptionModel,
+            turnDetection: this.sessionConfig.openaiRealtimeTurnDetection,
+            turnDetectionEagerness:
+              this.sessionConfig.openaiRealtimeTurnEagerness,
+            vadThreshold: this.sessionConfig.openaiRealtimeVadThreshold,
+            vadSilenceMs: this.sessionConfig.openaiRealtimeVadSilenceMs,
+            vadPrefixPaddingMs: this.sessionConfig.openaiRealtimeVadPrefixPaddingMs,
+            interruptResponseOnTurn:
+              this.sessionConfig.openaiRealtimeInterruptResponseOnTurn,
+            maxResponseOutputTokens:
+              this.sessionConfig.openaiRealtimeMaxResponseOutputTokens,
+            bargeInMinMs: this.sessionConfig.bargeInMinMs,
+            onEvent: handleBridgeEvent,
+            onLog: (line) => this.bridge(line)
+          });
+          await this.realtimeAdapter.start();
+
+          const realtimeSttStarted = await this.transportAdapter.startStt(
+            buildBridgeSttOptions({ realtime: true })
+          );
+          if (!realtimeSttStarted) {
+            throw new Error(
+              "Bridge audio capture could not be started for realtime pipeline."
+            );
+          }
+
+          this.activeVoicePipelineMode = "realtime";
+          this.activeSttSource = "bridge-input-realtime";
+          this.openAiSttStream = null;
+          this.info(
+            "Realtime voice pipeline is active (WS Realtime API with bridge audio input)."
+          );
+          if (normalizeText(this.sessionConfig?.wakeWord)) {
+            this.warn(
+              "WAKE_WORD filtering is not enforced in realtime mode; apply wake-word behavior in system prompt if needed."
+            );
+          }
+        } catch (realtimeError) {
+          const message = realtimeError?.message || realtimeError;
+          if (!this.sessionConfig.voicePipelineFallbackToHybrid) {
+            throw realtimeError;
+          }
+
+          this.warn(
+            `Realtime pipeline failed (${message}); falling back to hybrid STT->LLM->TTS pipeline.`
+          );
+          if (this.realtimeAdapter) {
+            try {
+              await this.realtimeAdapter.stop();
+            } catch (_) {
+              // Ignore realtime adapter shutdown errors during fallback.
+            }
+            this.realtimeAdapter = null;
+          }
+        }
       }
-      this.info(
-        `OpenAI STT turn streaming enabled (model=${this.sessionConfig.openaiSttModel}).`
-      );
-      this.activeSttSource = "bridge-input";
+
+      if (this.activeVoicePipelineMode !== "realtime") {
+        const openAiTurnSilenceMs = Math.max(
+          150,
+          Number(this.sessionConfig.turnSilenceMs || 700)
+        );
+        this.openAiSttStream = new OpenAiSttTurnStream({
+          turnSilenceMs: openAiTurnSilenceMs,
+          apiKey: this.sessionConfig.openaiApiKey,
+          model: this.sessionConfig.openaiSttModel,
+          language: this.sessionConfig.openaiSttLanguage,
+          timeoutMs: this.sessionConfig.openaiSttTimeoutMs,
+          maxRetries: this.sessionConfig.openaiSttMaxRetries,
+          minChunkBytes: this.sessionConfig.openaiSttMinChunkBytes,
+          maxQueueChunks: this.sessionConfig.openaiSttMaxQueueChunks,
+          onEvent: handleBridgeEvent,
+          onLog: (line) => this.bridge(line)
+        });
+        this.info(
+          `OpenAI STT turn settings: turnSilenceMs=${openAiTurnSilenceMs}, vadThreshold=${this.sessionConfig.openaiSttVadThreshold}, hangoverMs=${this.sessionConfig.openaiSttHangoverMs}, segmentMinMs=${this.sessionConfig.openaiSttSegmentMinMs}, segmentMaxMs=${this.sessionConfig.openaiSttSegmentMaxMs}, partialsEnabled=${this.sessionConfig.openaiSttPartialsEnabled}, partialEmitMs=${this.sessionConfig.openaiSttPartialEmitMs}.`
+        );
+        const started = await this.transportAdapter.startStt(
+          buildBridgeSttOptions({ realtime: false })
+        );
+        if (!started) {
+          throw new Error(
+            "OpenAI STT audio capture could not be started in bridge page."
+          );
+        }
+        this.info(
+          `OpenAI STT turn streaming enabled (model=${this.sessionConfig.openaiSttModel}).`
+        );
+        this.activeVoicePipelineMode = "hybrid";
+        this.activeSttSource = "bridge-input";
+      }
 
       this.status = "running";
-      this.info(
-        "Bot is running. If WAKE_WORD is set, only phrases containing it will be processed."
-      );
+      if (this.activeVoicePipelineMode === "realtime") {
+        this.info("Bot is running in realtime mode.");
+      } else {
+        this.info(
+          "Bot is running. If WAKE_WORD is set, only phrases containing it will be processed."
+        );
+      }
       this.startJoinStateMonitor({ responder });
       void this.runAutoGreeting({ responder });
       return this.getStatus();
@@ -747,6 +935,14 @@ class BotSession {
           }
           this.openAiSttStream = null;
         }
+        if (this.realtimeAdapter) {
+          try {
+            await this.realtimeAdapter.stop();
+          } catch (_) {
+            // Ignore realtime adapter stop errors.
+          }
+          this.realtimeAdapter = null;
+        }
 
         this.queue = [];
         this.processQueueHandler = null;
@@ -759,6 +955,15 @@ class BotSession {
         this.isAssistantAudioPlaying = false;
         this.lastAssistantAudioAtMs = 0;
         this.bridgeBindings = null;
+        this.requestedVoicePipelineMode = "hybrid";
+        this.activeVoicePipelineMode = "";
+        this.realtimeResponseInProgress = false;
+        this.realtimeCurrentResponseId = "";
+        this.realtimePendingUserTurnText = "";
+        this.realtimeUserTurnByResponseId = {};
+        this.realtimeAssistantTextByResponseId = {};
+        this.realtimeAudioPlaybackChain = Promise.resolve();
+        this.realtimeAudioPlaybackGeneration = 0;
         this.activeSttSource = "";
         this.lastBridgeRecoveryAtMs = 0;
         this.hasProcessedUserTurn = false;
@@ -834,9 +1039,19 @@ class BotSession {
         this.joinStateMonitorStopRequested = true;
         this.joinStateMonitorPromise = null;
         this.transportAdapter = null;
+        this.realtimeAdapter = null;
         this.bridgePage = null;
         this.meetPage = null;
         this.meetJoinState = null;
+        this.requestedVoicePipelineMode = "hybrid";
+        this.activeVoicePipelineMode = "";
+        this.realtimeResponseInProgress = false;
+        this.realtimeCurrentResponseId = "";
+        this.realtimePendingUserTurnText = "";
+        this.realtimeUserTurnByResponseId = {};
+        this.realtimeAssistantTextByResponseId = {};
+        this.realtimeAudioPlaybackChain = Promise.resolve();
+        this.realtimeAudioPlaybackGeneration = 0;
         this.activeSttSource = "";
         this.responder = null;
         this.lastAcceptedText = "";
@@ -1312,11 +1527,22 @@ class BotSession {
       `Auto greeting started (chars=${prompt.length}, source=system).`
     );
     try {
-      await this.respondToCommand({
-        responder,
-        source: "system",
-        commandText: prompt
-      });
+      if (this.isRealtimePipelineActive()) {
+        const delivered = await this.realtimeAdapter?.createTextTurn({
+          role: "system",
+          text: prompt,
+          createResponse: true
+        });
+        if (!delivered) {
+          throw new Error("Realtime auto greeting was not delivered.");
+        }
+      } else {
+        await this.respondToCommand({
+          responder,
+          source: "system",
+          commandText: prompt
+        });
+      }
       this.autoGreetingCompleted = true;
       this.trace("Auto greeting completed.");
     } catch (err) {
@@ -1324,6 +1550,260 @@ class BotSession {
     } finally {
       this.autoGreetingInFlight = false;
     }
+  }
+
+  isRealtimePipelineActive() {
+    return (
+      this.activeVoicePipelineMode === "realtime" &&
+      this.realtimeAdapter &&
+      this.status !== "stopped"
+    );
+  }
+
+  queueRealtimeAudioPlayback(event = {}) {
+    if (!this.isRealtimePipelineActive()) {
+      return;
+    }
+
+    const audioBase64 = normalizeText(event.audioBase64 || "");
+    if (!audioBase64) {
+      return;
+    }
+
+    const generation = this.realtimeAudioPlaybackGeneration;
+    const payload = {
+      audioBase64,
+      mimeType: normalizeText(event.mimeType || "audio/wav") || "audio/wav",
+      text: normalizeText(event.text || "")
+    };
+    const responseId = normalizeText(event.responseId || "");
+
+    this.realtimeAudioPlaybackChain = this.realtimeAudioPlaybackChain
+      .then(async () => {
+        if (!this.isRealtimePipelineActive()) {
+          return;
+        }
+        if (generation !== this.realtimeAudioPlaybackGeneration) {
+          return;
+        }
+        this.isAssistantAudioPlaying = true;
+        this.lastAssistantAudioAtMs = Date.now();
+        const played = await this.playAudioOnBridge(payload);
+        if (!played) {
+          this.warn(
+            `Realtime audio playback failed${
+              responseId ? ` (responseId=${responseId})` : ""
+            }.`
+          );
+        }
+      })
+      .catch((err) => {
+        this.warn(`Realtime audio queue failure: ${err?.message || err}`);
+      })
+      .finally(() => {
+        this.isAssistantAudioPlaying = false;
+        this.lastAssistantAudioAtMs = Date.now();
+      });
+  }
+
+  handleRealtimeResponseStarted(event = {}) {
+    const responseId = normalizeText(event.responseId || "");
+    this.realtimeResponseInProgress = true;
+    this.realtimeCurrentResponseId = responseId || this.realtimeCurrentResponseId || "";
+    this.setBridgeTtsDucking(false);
+    if (responseId && this.realtimePendingUserTurnText) {
+      this.realtimeUserTurnByResponseId[responseId] = this.realtimePendingUserTurnText;
+      this.realtimePendingUserTurnText = "";
+    }
+    this.trace(
+      `Realtime assistant response started${
+        responseId ? ` (${responseId})` : ""
+      }.`
+    );
+  }
+
+  handleRealtimeAssistantTextFinal(event = {}) {
+    const responseId = normalizeText(event.responseId || "");
+    const text = normalizeText(event.text || "");
+    if (!text) {
+      return;
+    }
+
+    if (responseId) {
+      this.realtimeAssistantTextByResponseId[responseId] = text;
+    }
+
+    this.bot(text);
+    this.rememberBotOutput(text);
+  }
+
+  handleRealtimeResponseDone(event = {}) {
+    const responseId = normalizeText(event.responseId || "");
+    const status = normalizeText(event.status || "unknown") || "unknown";
+    const reason = normalizeText(event.reason || "");
+    this.realtimeResponseInProgress = false;
+    if (!responseId || this.realtimeCurrentResponseId === responseId) {
+      this.realtimeCurrentResponseId = "";
+    }
+    this.setBridgeTtsDucking(false);
+
+    const assistantText = responseId
+      ? normalizeText(this.realtimeAssistantTextByResponseId[responseId] || "")
+      : "";
+    const userText = responseId
+      ? normalizeText(this.realtimeUserTurnByResponseId[responseId] || "")
+      : "";
+
+    if (assistantText && userText) {
+      this.appendConversationTurn({
+        source: "openai-realtime",
+        user: userText,
+        bot: assistantText
+      });
+    }
+
+    if (responseId) {
+      delete this.realtimeAssistantTextByResponseId[responseId];
+      delete this.realtimeUserTurnByResponseId[responseId];
+    }
+    this.trace(
+      `Realtime assistant response finished${
+        responseId ? ` (${responseId})` : ""
+      }, status=${status}${reason ? `, reason=${reason}` : ""}.`
+    );
+  }
+
+  handleRealtimeUserFinal({ source = "openai-realtime", text = "" } = {}) {
+    const normalizedText = normalizeText(text);
+    if (!normalizedText) {
+      return;
+    }
+    const normalizedSource = normalizeText(source || "openai-realtime") || "openai-realtime";
+
+    if (
+      this.shouldDropInboundTranscript({
+        source: normalizedSource,
+        text: normalizedText
+      })
+    ) {
+      return;
+    }
+
+    this.latestPartialsBySource[normalizedSource] = {
+      text: normalizedText,
+      at: Date.now()
+    };
+    this.lastUserTurnText = normalizedText;
+    this.hasProcessedUserTurn = true;
+    this.realtimePendingUserTurnText = normalizedText;
+    if (
+      this.realtimeResponseInProgress &&
+      this.realtimeCurrentResponseId &&
+      !this.realtimeUserTurnByResponseId[this.realtimeCurrentResponseId]
+    ) {
+      this.realtimeUserTurnByResponseId[this.realtimeCurrentResponseId] =
+        normalizedText;
+      this.realtimePendingUserTurnText = "";
+    }
+    this.user(`[${normalizedSource}] ${normalizedText}`);
+  }
+
+  handleRealtimeConfirmedVadBargeIn({
+    source = "openai-realtime",
+    reason = "vad-confirmed",
+    speechMs = 0,
+    peak = 0
+  } = {}) {
+    if (!this.sessionConfig?.bargeInEnabled) {
+      return;
+    }
+    if (!this.realtimeResponseInProgress) {
+      return;
+    }
+
+    const minBargeInMs = Number(this.sessionConfig?.bargeInMinMs || 0);
+    if (Number(speechMs || 0) < minBargeInMs) {
+      return;
+    }
+
+    const latestPartial = this.getLatestPartial(source);
+    const partialAgeMs = latestPartial?.at
+      ? Date.now() - Number(latestPartial.at)
+      : Number.MAX_SAFE_INTEGER;
+    const partialText =
+      latestPartial && partialAgeMs <= 1600 ? normalizeText(latestPartial.text) : "";
+
+    if (partialText && this.isLikelyBotEcho(partialText)) {
+      return;
+    }
+
+    this.markPendingUserContinuation({
+      source,
+      text: partialText
+    });
+    this.appendInterruptionContext({
+      source,
+      reason,
+      text: partialText || "[realtime-vad-confirmed-without-text]"
+    });
+    this.trace(
+      `Realtime VAD-confirmed barge-in accepted (${source}:${reason}, speechMs=${Math.max(
+        0,
+        Number(speechMs || 0)
+      )}, peak=${Number(peak || 0).toFixed(4)}).`
+    );
+    void this.interruptRealtimeOutput(`barge-in:${source}:${reason}`, {
+      source,
+      text: partialText
+    });
+  }
+
+  async interruptRealtimeOutput(
+    reason = "realtime-interrupt",
+    { source = "openai-realtime", text = "" } = {}
+  ) {
+    if (!this.isRealtimePipelineActive()) {
+      return false;
+    }
+    if (!this.realtimeResponseInProgress && !this.isAssistantAudioPlaying) {
+      return false;
+    }
+
+    this.clearSpeculativePrefetch(`realtime-interrupt:${reason}`);
+    this.clearSoftInterrupt({ resumeAudio: false, reason: "realtime hard interrupt" });
+    this.realtimeAudioPlaybackGeneration += 1;
+    this.realtimeResponseInProgress = false;
+    this.realtimeCurrentResponseId = "";
+
+    try {
+      if (this.transportAdapter && this.bridgePage) {
+        await this.transportAdapter.stopSpeaking({
+          flush: true,
+          resumeGateMs: 24
+        });
+      }
+    } catch (_) {
+      // Ignore bridge stop errors while interrupting realtime output.
+    }
+
+    try {
+      await this.realtimeAdapter?.interrupt({
+        reason,
+        clearInputBuffer: true
+      });
+    } catch (_) {
+      // Ignore realtime interrupt errors.
+    }
+
+    this.setBridgeTtsDucking(false);
+    if (text) {
+      this.markPendingUserContinuation({
+        source,
+        text
+      });
+    }
+    this.info(`Realtime assistant output interrupted (${reason}).`);
+    return true;
   }
 
   async recoverBridgePage(reason = "bridge transport failure") {
@@ -1348,7 +1828,9 @@ class BotSession {
       this.bridgePage = await this.transportAdapter.reopenBridge();
       await this.transportAdapter.startStt({
         chunkMs: this.sessionConfig.openaiSttChunkMs,
-        partialsEnabled: this.sessionConfig.openaiSttPartialsEnabled,
+        partialsEnabled: this.isRealtimePipelineActive()
+          ? true
+          : this.sessionConfig.openaiSttPartialsEnabled,
         partialEmitMs: this.sessionConfig.openaiSttPartialEmitMs,
         mimeType: this.sessionConfig.openaiSttMimeType,
         deviceId: this.sessionConfig.openaiSttDeviceId,
@@ -1907,17 +2389,35 @@ class BotSession {
   }
 
   appendInterruptionContext({ source, reason, text = "" }) {
-    if (!this.responder || typeof this.responder.appendInterruptionContext !== "function") {
-      return;
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    const normalizedReason = normalizeText(reason || "unknown") || "unknown";
+    const normalizedText = normalizeText(text || "");
+
+    if (this.responder && typeof this.responder.appendInterruptionContext === "function") {
+      try {
+        this.responder.appendInterruptionContext({
+          source: normalizedSource,
+          reason: normalizedReason,
+          text: normalizedText
+        });
+      } catch (_) {
+        // Ignore interruption context injection failures.
+      }
     }
-    try {
-      this.responder.appendInterruptionContext({
-        source,
-        reason,
-        text
-      });
-    } catch (_) {
-      // Ignore interruption context injection failures.
+
+    if (
+      this.isRealtimePipelineActive() &&
+      this.realtimeAdapter &&
+      typeof this.realtimeAdapter.appendSystemContext === "function"
+    ) {
+      const note = normalizeText(
+        `Interruption context: user started speaking over assistant output (source=${normalizedSource}, reason=${normalizedReason}). Latest user fragment: ${
+          normalizedText || "<none>"
+        }`
+      );
+      if (note) {
+        void this.realtimeAdapter.appendSystemContext(note).catch(() => {});
+      }
     }
   }
 
@@ -2150,12 +2650,19 @@ class BotSession {
     }
 
     const run = this.activeAssistantRun;
-    if (!run || this.isStopping || run.abortController?.signal?.aborted) {
+    const hasHybridRun =
+      Boolean(run) && !run?.abortController?.signal?.aborted && !this.isStopping;
+    const hasRealtimeRun =
+      this.isRealtimePipelineActive() && this.realtimeResponseInProgress && !this.isStopping;
+    if (!hasHybridRun && !hasRealtimeRun) {
       return;
     }
 
     const normalizedSource = normalizeText(source || "unknown") || "unknown";
-    if (normalizedSource !== "openai-stt") {
+    if (
+      normalizedSource !== "openai-stt" &&
+      normalizedSource !== "openai-realtime"
+    ) {
       return;
     }
 
@@ -2208,6 +2715,13 @@ class BotSession {
         peak || 0
       ).toFixed(4)}).`
     );
+    if (hasRealtimeRun) {
+      void this.interruptRealtimeOutput(`barge-in:${normalizedSource}:${reason}`, {
+        source: normalizedSource,
+        text: partialText
+      });
+      return;
+    }
     void this.interruptAssistantRun(`barge-in:${normalizedSource}:${reason}`);
   }
 
@@ -2345,6 +2859,9 @@ class BotSession {
   async interruptAssistantRun(reason = "interrupted") {
     const run = this.activeAssistantRun;
     if (!run || run.abortController?.signal?.aborted) {
+      if (this.isRealtimePipelineActive()) {
+        return this.interruptRealtimeOutput(reason);
+      }
       return false;
     }
 

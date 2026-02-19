@@ -13,7 +13,6 @@
     "test": "node --test"
   },
   "dependencies": {
-    "@langchain/core": "^1.1.19",
     "@langchain/langgraph": "^1.1.4",
     "@langchain/openai": "^1.2.5",
     "dotenv": "^16.4.7",
