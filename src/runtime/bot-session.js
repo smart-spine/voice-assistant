@@ -2,7 +2,11 @@ const { startBridgeServer } = require("../bridge-server");
 const { OpenAIResponder } = require("../openai-service");
 const { launchBrowser } = require("../meet-controller");
 const { createTransportAdapter } = require("../transports/transport-factory");
-const { RealtimeTransportAdapter } = require("../transports/realtime-transport-adapter");
+const {
+  RealtimeTransportAdapter,
+  extractWavPcm16,
+  encodeWavFromPcm16
+} = require("../transports/realtime-transport-adapter");
 const { OpenAiSttTurnStream } = require("../openai-stt-service");
 const { SemanticTurnDetector } = require("../semantic-turn-detector");
 const {
@@ -287,6 +291,26 @@ function truncateForLog(text, maxChars = 180) {
   return `${normalized.slice(0, limit)}...`;
 }
 
+const REALTIME_PLAYBACK_IDLE_FLUSH_MS = 24;
+const REALTIME_PLAYBACK_MULTIPLIER = 3.5;
+const REALTIME_PLAYBACK_MAX_MULTIPLIER = 7;
+
+function msToPcm16Bytes(sampleRateHz, durationMs) {
+  const rate = Math.max(8000, Math.trunc(Number(sampleRateHz) || 24000));
+  const ms = Math.max(1, Math.trunc(Number(durationMs) || 1));
+  const raw = Math.max(2, Math.round((rate * 2 * ms) / 1000));
+  return raw % 2 === 0 ? raw : raw + 1;
+}
+
+function pcm16BytesToMs(byteLength, sampleRateHz) {
+  const rate = Math.max(8000, Math.trunc(Number(sampleRateHz) || 24000));
+  const bytes = Math.max(0, Math.trunc(Number(byteLength) || 0));
+  if (!bytes) {
+    return 0;
+  }
+  return Math.max(1, Math.round((bytes / 2 / rate) * 1000));
+}
+
 class BotSession {
   constructor({ config, sessionId } = {}) {
     this.baseConfig = config;
@@ -340,6 +364,11 @@ class BotSession {
     this.realtimeAssistantTextByResponseId = {};
     this.realtimeAudioPlaybackChain = Promise.resolve();
     this.realtimeAudioPlaybackGeneration = 0;
+    this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
+    this.realtimePlaybackSampleRateHz = 0;
+    this.realtimePlaybackCurrentResponseId = "";
+    this.realtimePlaybackFirstChunkSent = false;
+    this.realtimePlaybackIdleFlushTimer = null;
     this.activeSttSource = "";
     this.lastBridgeRecoveryAtMs = 0;
     this.hasProcessedUserTurn = false;
@@ -420,6 +449,11 @@ class BotSession {
     this.realtimeAssistantTextByResponseId = {};
     this.realtimeAudioPlaybackChain = Promise.resolve();
     this.realtimeAudioPlaybackGeneration = 0;
+    this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
+    this.realtimePlaybackSampleRateHz = 0;
+    this.realtimePlaybackCurrentResponseId = "";
+    this.realtimePlaybackFirstChunkSent = false;
+    this.clearRealtimePlaybackIdleFlushTimer();
     this.activeSttSource = "";
     this.lastBridgeRecoveryAtMs = 0;
     this.hasProcessedUserTurn = false;
@@ -962,6 +996,11 @@ class BotSession {
         this.realtimeAssistantTextByResponseId = {};
         this.realtimeAudioPlaybackChain = Promise.resolve();
         this.realtimeAudioPlaybackGeneration = 0;
+        this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
+        this.realtimePlaybackSampleRateHz = 0;
+        this.realtimePlaybackCurrentResponseId = "";
+        this.realtimePlaybackFirstChunkSent = false;
+        this.clearRealtimePlaybackIdleFlushTimer();
         this.activeSttSource = "";
         this.lastBridgeRecoveryAtMs = 0;
         this.hasProcessedUserTurn = false;
@@ -1050,6 +1089,11 @@ class BotSession {
         this.realtimeAssistantTextByResponseId = {};
         this.realtimeAudioPlaybackChain = Promise.resolve();
         this.realtimeAudioPlaybackGeneration = 0;
+        this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
+        this.realtimePlaybackSampleRateHz = 0;
+        this.realtimePlaybackCurrentResponseId = "";
+        this.realtimePlaybackFirstChunkSent = false;
+        this.clearRealtimePlaybackIdleFlushTimer();
         this.activeSttSource = "";
         this.responder = null;
         this.lastAcceptedText = "";
@@ -1558,23 +1602,40 @@ class BotSession {
     );
   }
 
-  queueRealtimeAudioPlayback(event = {}) {
-    if (!this.isRealtimePipelineActive()) {
+  clearRealtimePlaybackIdleFlushTimer() {
+    if (!this.realtimePlaybackIdleFlushTimer) {
       return;
     }
+    clearTimeout(this.realtimePlaybackIdleFlushTimer);
+    this.realtimePlaybackIdleFlushTimer = null;
+  }
 
-    const audioBase64 = normalizeText(event.audioBase64 || "");
-    if (!audioBase64) {
-      return;
-    }
+  getRealtimePlaybackChunkTargets(sampleRateHz = 24000) {
+    const baseChunkMs = Math.max(
+      60,
+      Math.trunc(Number(this.sessionConfig?.openaiRealtimeOutputChunkMs || 120))
+    );
+    const firstChunkMs = Math.max(80, Math.min(220, baseChunkMs));
+    const steadyChunkMs = Math.max(
+      firstChunkMs + 80,
+      Math.min(900, Math.round(baseChunkMs * REALTIME_PLAYBACK_MULTIPLIER))
+    );
+    const maxBufferMs = Math.max(
+      steadyChunkMs + 120,
+      Math.min(1800, Math.round(baseChunkMs * REALTIME_PLAYBACK_MAX_MULTIPLIER))
+    );
 
-    const generation = this.realtimeAudioPlaybackGeneration;
-    const payload = {
-      audioBase64,
-      mimeType: normalizeText(event.mimeType || "audio/wav") || "audio/wav",
-      text: normalizeText(event.text || "")
+    return {
+      firstChunkBytes: msToPcm16Bytes(sampleRateHz, firstChunkMs),
+      steadyChunkBytes: msToPcm16Bytes(sampleRateHz, steadyChunkMs),
+      maxBufferBytes: msToPcm16Bytes(sampleRateHz, maxBufferMs),
+      idleFlushMs: REALTIME_PLAYBACK_IDLE_FLUSH_MS
     };
-    const responseId = normalizeText(event.responseId || "");
+  }
+
+  enqueueRealtimeAudioPayload(payload = {}, { responseId = "" } = {}) {
+    const generation = this.realtimeAudioPlaybackGeneration;
+    const normalizedResponseId = normalizeText(responseId || "");
 
     this.realtimeAudioPlaybackChain = this.realtimeAudioPlaybackChain
       .then(async () => {
@@ -1590,7 +1651,7 @@ class BotSession {
         if (!played) {
           this.warn(
             `Realtime audio playback failed${
-              responseId ? ` (responseId=${responseId})` : ""
+              normalizedResponseId ? ` (responseId=${normalizedResponseId})` : ""
             }.`
           );
         }
@@ -1604,10 +1665,176 @@ class BotSession {
       });
   }
 
+  flushRealtimePlaybackBuffer({ force = false, responseId = "" } = {}) {
+    if (!this.realtimePlaybackPcmBuffer.length) {
+      this.clearRealtimePlaybackIdleFlushTimer();
+      return 0;
+    }
+
+    const sampleRateHz = Math.max(
+      8000,
+      Math.trunc(
+        Number(
+          this.realtimePlaybackSampleRateHz ||
+            this.sessionConfig?.openaiRealtimeOutputSampleRateHz ||
+            24000
+        )
+      )
+    );
+    const targets = this.getRealtimePlaybackChunkTargets(sampleRateHz);
+    const normalizedResponseId = normalizeText(
+      responseId || this.realtimePlaybackCurrentResponseId || this.realtimeCurrentResponseId
+    );
+    let emittedChunks = 0;
+
+    while (this.realtimePlaybackPcmBuffer.length > 0) {
+      const chunkTargetBytes = this.realtimePlaybackFirstChunkSent
+        ? targets.steadyChunkBytes
+        : targets.firstChunkBytes;
+
+      if (!force && this.realtimePlaybackPcmBuffer.length < chunkTargetBytes) {
+        break;
+      }
+
+      let chunkBytes = force ? this.realtimePlaybackPcmBuffer.length : chunkTargetBytes;
+      if (!force && this.realtimePlaybackPcmBuffer.length > targets.maxBufferBytes) {
+        chunkBytes = Math.min(this.realtimePlaybackPcmBuffer.length, targets.maxBufferBytes);
+      }
+      if (chunkBytes < 2) {
+        break;
+      }
+      if (chunkBytes % 2 !== 0) {
+        chunkBytes -= 1;
+      }
+      if (chunkBytes < 2) {
+        break;
+      }
+
+      const pcmChunk = this.realtimePlaybackPcmBuffer.subarray(0, chunkBytes);
+      this.realtimePlaybackPcmBuffer = this.realtimePlaybackPcmBuffer.subarray(chunkBytes);
+      this.realtimePlaybackFirstChunkSent = true;
+      emittedChunks += 1;
+
+      const wavBytes = encodeWavFromPcm16(pcmChunk, sampleRateHz, 1);
+      this.enqueueRealtimeAudioPayload(
+        {
+          audioBase64: wavBytes.toString("base64"),
+          mimeType: "audio/wav",
+          text: "",
+          durationMs: pcm16BytesToMs(pcmChunk.length, sampleRateHz)
+        },
+        { responseId: normalizedResponseId }
+      );
+    }
+
+    if (this.realtimePlaybackPcmBuffer.length === 0) {
+      this.clearRealtimePlaybackIdleFlushTimer();
+    }
+    return emittedChunks;
+  }
+
+  queueRealtimeAudioPlayback(event = {}) {
+    if (!this.isRealtimePipelineActive()) {
+      return;
+    }
+
+    const audioBase64 = normalizeText(event.audioBase64 || "");
+    if (!audioBase64) {
+      return;
+    }
+
+    const responseId = normalizeText(event.responseId || "");
+
+    let decoded;
+    try {
+      decoded = extractWavPcm16(Buffer.from(audioBase64, "base64"));
+    } catch (err) {
+      this.warn(`Realtime audio chunk decode failed: ${err?.message || err}`);
+      return;
+    }
+
+    if (!decoded?.samples?.length) {
+      return;
+    }
+
+    const sampleRateHz = Math.max(8000, Math.trunc(Number(decoded.sampleRate) || 24000));
+    if (
+      this.realtimePlaybackCurrentResponseId &&
+      responseId &&
+      this.realtimePlaybackCurrentResponseId !== responseId
+    ) {
+      this.flushRealtimePlaybackBuffer({
+        force: true,
+        responseId: this.realtimePlaybackCurrentResponseId
+      });
+      this.realtimePlaybackCurrentResponseId = responseId;
+      this.realtimePlaybackFirstChunkSent = false;
+    } else if (responseId && !this.realtimePlaybackCurrentResponseId) {
+      this.realtimePlaybackCurrentResponseId = responseId;
+    }
+
+    if (
+      this.realtimePlaybackSampleRateHz &&
+      this.realtimePlaybackSampleRateHz !== sampleRateHz &&
+      this.realtimePlaybackPcmBuffer.length > 0
+    ) {
+      this.flushRealtimePlaybackBuffer({
+        force: true,
+        responseId:
+          this.realtimePlaybackCurrentResponseId ||
+          responseId ||
+          this.realtimeCurrentResponseId
+      });
+    }
+    this.realtimePlaybackSampleRateHz = sampleRateHz;
+
+    const pcmBytes = Buffer.from(
+      decoded.samples.buffer,
+      decoded.samples.byteOffset,
+      decoded.samples.byteLength
+    );
+    this.realtimePlaybackPcmBuffer = this.realtimePlaybackPcmBuffer.length
+      ? Buffer.concat([this.realtimePlaybackPcmBuffer, pcmBytes])
+      : pcmBytes;
+
+    this.flushRealtimePlaybackBuffer({
+      force: false,
+      responseId: responseId || this.realtimePlaybackCurrentResponseId
+    });
+
+    this.clearRealtimePlaybackIdleFlushTimer();
+    const idleFlushMs = this.getRealtimePlaybackChunkTargets(sampleRateHz).idleFlushMs;
+    this.realtimePlaybackIdleFlushTimer = setTimeout(() => {
+      this.realtimePlaybackIdleFlushTimer = null;
+      this.flushRealtimePlaybackBuffer({
+        force: true,
+        responseId: responseId || this.realtimePlaybackCurrentResponseId
+      });
+    }, idleFlushMs);
+    if (typeof this.realtimePlaybackIdleFlushTimer?.unref === "function") {
+      this.realtimePlaybackIdleFlushTimer.unref();
+    }
+  }
+
   handleRealtimeResponseStarted(event = {}) {
     const responseId = normalizeText(event.responseId || "");
+    if (
+      responseId &&
+      this.realtimePlaybackCurrentResponseId &&
+      this.realtimePlaybackCurrentResponseId !== responseId &&
+      this.realtimePlaybackPcmBuffer.length > 0
+    ) {
+      this.flushRealtimePlaybackBuffer({
+        force: true,
+        responseId: this.realtimePlaybackCurrentResponseId
+      });
+    }
     this.realtimeResponseInProgress = true;
     this.realtimeCurrentResponseId = responseId || this.realtimeCurrentResponseId || "";
+    if (responseId) {
+      this.realtimePlaybackCurrentResponseId = responseId;
+      this.realtimePlaybackFirstChunkSent = false;
+    }
     this.setBridgeTtsDucking(false);
     if (responseId && this.realtimePendingUserTurnText) {
       this.realtimeUserTurnByResponseId[responseId] = this.realtimePendingUserTurnText;
@@ -1639,6 +1866,18 @@ class BotSession {
     const responseId = normalizeText(event.responseId || "");
     const status = normalizeText(event.status || "unknown") || "unknown";
     const reason = normalizeText(event.reason || "");
+    this.flushRealtimePlaybackBuffer({
+      force: true,
+      responseId: responseId || this.realtimePlaybackCurrentResponseId
+    });
+    if (
+      !responseId ||
+      !this.realtimePlaybackCurrentResponseId ||
+      this.realtimePlaybackCurrentResponseId === responseId
+    ) {
+      this.realtimePlaybackCurrentResponseId = "";
+      this.realtimePlaybackFirstChunkSent = false;
+    }
     this.realtimeResponseInProgress = false;
     if (!responseId || this.realtimeCurrentResponseId === responseId) {
       this.realtimeCurrentResponseId = "";
@@ -1770,6 +2009,11 @@ class BotSession {
     this.clearSpeculativePrefetch(`realtime-interrupt:${reason}`);
     this.clearSoftInterrupt({ resumeAudio: false, reason: "realtime hard interrupt" });
     this.realtimeAudioPlaybackGeneration += 1;
+    this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
+    this.realtimePlaybackSampleRateHz = 0;
+    this.realtimePlaybackCurrentResponseId = "";
+    this.realtimePlaybackFirstChunkSent = false;
+    this.clearRealtimePlaybackIdleFlushTimer();
     this.realtimeResponseInProgress = false;
     this.realtimeCurrentResponseId = "";
 
