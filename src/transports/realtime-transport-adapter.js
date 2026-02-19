@@ -394,7 +394,6 @@ class RealtimeTransportAdapter {
         },
         voice: this.voice,
         temperature: this.temperature,
-        max_response_output_tokens: this.maxResponseOutputTokens,
         turn_detection: this.buildTurnDetectionConfig()
       }
     };
@@ -932,8 +931,7 @@ class RealtimeTransportAdapter {
             event_id: createEventId("resp_create"),
             response: {
               modalities: ["audio", "text"],
-              output_audio_format: "pcm16",
-              max_output_tokens: this.maxResponseOutputTokens
+              output_audio_format: "pcm16"
             }
           });
         })
@@ -983,8 +981,7 @@ class RealtimeTransportAdapter {
         event_id: createEventId("resp_create"),
         response: {
           modalities: ["audio", "text"],
-          output_audio_format: "pcm16",
-          max_output_tokens: this.maxResponseOutputTokens
+          output_audio_format: "pcm16"
         }
       });
     }
