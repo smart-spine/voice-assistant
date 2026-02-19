@@ -933,7 +933,7 @@ class RealtimeTransportAdapter {
             response: {
               modalities: ["audio", "text"],
               output_audio_format: "pcm16",
-              max_response_output_tokens: this.maxResponseOutputTokens
+              max_output_tokens: this.maxResponseOutputTokens
             }
           });
         })
@@ -984,7 +984,7 @@ class RealtimeTransportAdapter {
         response: {
           modalities: ["audio", "text"],
           output_audio_format: "pcm16",
-          max_response_output_tokens: this.maxResponseOutputTokens
+          max_output_tokens: this.maxResponseOutputTokens
         }
       });
     }
