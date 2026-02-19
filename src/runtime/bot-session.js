@@ -805,8 +805,6 @@ class BotSession {
             vadPrefixPaddingMs: this.sessionConfig.openaiRealtimeVadPrefixPaddingMs,
             interruptResponseOnTurn:
               this.sessionConfig.openaiRealtimeInterruptResponseOnTurn,
-            maxResponseOutputTokens:
-              this.sessionConfig.openaiRealtimeMaxResponseOutputTokens,
             bargeInMinMs: this.sessionConfig.bargeInMinMs,
             onEvent: handleBridgeEvent,
             onLog: (line) => this.bridge(line)

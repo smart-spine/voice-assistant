@@ -223,18 +223,6 @@ const config = {
     process.env.OPENAI_REALTIME_INTERRUPT_RESPONSE_ON_TURN,
     true
   ),
-  openaiRealtimeMaxResponseOutputTokens:
-    cleanString(
-      process.env.OPENAI_REALTIME_MAX_RESPONSE_OUTPUT_TOKENS,
-      "inf"
-    ).toLowerCase() === "inf"
-      ? "inf"
-      : asBoundedNumber(process.env.OPENAI_REALTIME_MAX_RESPONSE_OUTPUT_TOKENS, {
-          fallback: 512,
-          min: 16,
-          max: 4096,
-          integer: true
-        }),
   openaiTtsTimeoutMs: asBoundedNumber(process.env.OPENAI_TTS_TIMEOUT_MS, {
     fallback: 8000,
     min: 1000,

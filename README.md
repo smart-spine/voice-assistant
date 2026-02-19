@@ -118,7 +118,6 @@ The ubuntu startup script prepares virtual PulseAudio devices and exports device
 - `OPENAI_REALTIME_VAD_SILENCE_MS`
 - `OPENAI_REALTIME_VAD_PREFIX_PADDING_MS`
 - `OPENAI_REALTIME_INTERRUPT_RESPONSE_ON_TURN`
-- `OPENAI_REALTIME_MAX_RESPONSE_OUTPUT_TOKENS`
 
 ### Hybrid STT/TTS fallback
 - `OPENAI_STT_MODEL`

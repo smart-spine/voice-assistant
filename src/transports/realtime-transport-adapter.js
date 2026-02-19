@@ -219,7 +219,6 @@ class RealtimeTransportAdapter {
     vadSilenceMs = 280,
     vadPrefixPaddingMs = 180,
     interruptResponseOnTurn = true,
-    maxResponseOutputTokens = "inf",
     bargeInMinMs = 220,
     onEvent = () => {},
     onLog = () => {}
@@ -282,13 +281,6 @@ class RealtimeTransportAdapter {
     );
 
     this.interruptResponseOnTurn = Boolean(interruptResponseOnTurn);
-    this.maxResponseOutputTokens =
-      maxResponseOutputTokens === "inf"
-        ? "inf"
-        : Math.max(
-            16,
-            Math.min(4096, Math.trunc(Number(maxResponseOutputTokens) || 512))
-          );
 
     this.bargeInMinMs = Math.max(
       80,
