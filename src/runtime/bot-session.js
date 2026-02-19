@@ -3,6 +3,7 @@ const { createResponder } = require("../responder-factory");
 const { launchBrowser } = require("../meet-controller");
 const { createTransportAdapter } = require("../transports/transport-factory");
 const { OpenAiSttTurnStream } = require("../openai-stt-service");
+const { SemanticTurnDetector } = require("../semantic-turn-detector");
 const {
   extractCommandByWakeWord,
   countWords,
@@ -261,6 +262,18 @@ function mergeUserContinuationText(baseText, continuationText) {
   return normalizeText(`${base} ${continuation}`);
 }
 
+function isComparablePrefixMatch(seedText, finalText) {
+  const seedComparable = normalizeComparableText(seedText);
+  const finalComparable = normalizeComparableText(finalText);
+  if (!seedComparable || !finalComparable) {
+    return false;
+  }
+  return (
+    finalComparable.startsWith(seedComparable) ||
+    seedComparable.startsWith(finalComparable)
+  );
+}
+
 function truncateForLog(text, maxChars = 180) {
   const normalized = normalizeText(text);
   if (!normalized) {
@@ -325,6 +338,12 @@ class BotSession {
     this.softInterruptRunId = "";
     this.softInterruptSource = "";
     this.softInterruptTimer = null;
+    this.semanticTurnDetector = null;
+    this.speculativePrefetch = null;
+    this.latestPartialsBySource = {};
+    this.semanticTurnDetector = null;
+    this.speculativePrefetch = null;
+    this.latestPartialsBySource = {};
     this.joinStateMonitorStopRequested = false;
     this.joinStateMonitorPromise = null;
     this.responder = null;
@@ -437,6 +456,22 @@ class BotSession {
       streamChunkMaxLatencyMs: this.sessionConfig.replyChunkMaxLatencyMs
     });
     this.responder = responder;
+    this.semanticTurnDetector = new SemanticTurnDetector({
+      enabled: this.sessionConfig.semanticEotEnabled,
+      useLlm: this.sessionConfig.semanticEotUseLlm,
+      apiKey: this.sessionConfig.openaiApiKey,
+      model: this.sessionConfig.semanticEotModel,
+      timeoutMs: this.sessionConfig.semanticEotTimeoutMs,
+      minDelayMs: this.sessionConfig.semanticEotMinDelayMs,
+      maxDelayMs: this.sessionConfig.semanticEotMaxDelayMs
+    });
+    if (this.sessionConfig.semanticEotEnabled) {
+      this.info(
+        `Semantic EoT enabled (llm=${Boolean(
+          this.sessionConfig.semanticEotUseLlm
+        )}, model=${this.sessionConfig.semanticEotModel}, minDelayMs=${this.sessionConfig.semanticEotMinDelayMs}, maxDelayMs=${this.sessionConfig.semanticEotMaxDelayMs}).`
+      );
+    }
     this.processQueueHandler = async () => {
       await this.processQueue(responder);
     };
@@ -475,6 +510,27 @@ class BotSession {
         return;
       }
 
+      if (type === "vad.confirmed") {
+        const peak = Number.isFinite(Number(event.peak))
+          ? Number(event.peak).toFixed(4)
+          : "n/a";
+        const speechMs = Number.isFinite(Number(event.speechMs))
+          ? Math.max(0, Math.trunc(Number(event.speechMs)))
+          : 0;
+        this.trace(
+          `Bridge event (${source}): vad.confirmed (speechMs=${speechMs}, peak=${peak}, reason=${normalizeText(
+            event.reason || "n/a"
+          ) || "n/a"}).`
+        );
+        this.handleConfirmedVadBargeIn({
+          source,
+          reason: normalizeText(event.reason || "vad-confirmed") || "vad-confirmed",
+          speechMs,
+          peak: Number(event.peak || 0)
+        });
+        return;
+      }
+
       if (type === "vad.stop") {
         this.trace(
           `Bridge event (${source}): vad.stop (reason=${normalizeText(
@@ -489,8 +545,19 @@ class BotSession {
       }
 
       if (type === "transcript.partial" && text) {
+        this.latestPartialsBySource[source] = {
+          text,
+          at: Date.now()
+        };
         if (this.sessionConfig?.openaiSttLogPartials) {
           this.stt(`[${source}] partial: ${text}`);
+        }
+        if (this.sessionConfig?.partialSpeculationEnabled) {
+          void this.maybeStartSpeculativePrefetch({
+            source,
+            text,
+            responder
+          });
         }
         if (this.sessionConfig?.bargeInOnPartials) {
           this.maybeInterruptAssistantOutput({
@@ -530,6 +597,10 @@ class BotSession {
           receivedAtMs: event.ts,
           segmentDurationMs: event.segmentDurationMs
         });
+        this.latestPartialsBySource[source] = {
+          text,
+          at: Date.now()
+        };
         if (!accepted) {
           return;
         }
@@ -607,10 +678,12 @@ class BotSession {
         onLog: (line) => this.bridge(line)
       });
       this.info(
-        `OpenAI STT turn settings: turnSilenceMs=${openAiTurnSilenceMs}, vadThreshold=${this.sessionConfig.openaiSttVadThreshold}, hangoverMs=${this.sessionConfig.openaiSttHangoverMs}, segmentMinMs=${this.sessionConfig.openaiSttSegmentMinMs}, segmentMaxMs=${this.sessionConfig.openaiSttSegmentMaxMs}.`
+        `OpenAI STT turn settings: turnSilenceMs=${openAiTurnSilenceMs}, vadThreshold=${this.sessionConfig.openaiSttVadThreshold}, hangoverMs=${this.sessionConfig.openaiSttHangoverMs}, segmentMinMs=${this.sessionConfig.openaiSttSegmentMinMs}, segmentMaxMs=${this.sessionConfig.openaiSttSegmentMaxMs}, partialsEnabled=${this.sessionConfig.openaiSttPartialsEnabled}, partialEmitMs=${this.sessionConfig.openaiSttPartialEmitMs}.`
       );
       const started = await this.transportAdapter.startStt({
         chunkMs: this.sessionConfig.openaiSttChunkMs,
+        partialsEnabled: this.sessionConfig.openaiSttPartialsEnabled,
+        partialEmitMs: this.sessionConfig.openaiSttPartialEmitMs,
         mimeType: this.sessionConfig.openaiSttMimeType,
         deviceId: this.sessionConfig.openaiSttDeviceId,
         deviceLabel: this.sessionConfig.openaiSttDeviceLabel,
@@ -620,7 +693,8 @@ class BotSession {
         vadThreshold: this.sessionConfig.openaiSttVadThreshold,
         hangoverMs: this.sessionConfig.openaiSttHangoverMs,
         segmentMinMs: this.sessionConfig.openaiSttSegmentMinMs,
-        segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs
+        segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs,
+        bargeInMinMs: this.sessionConfig.bargeInMinMs
       });
       if (!started) {
         throw new Error("OpenAI STT audio capture could not be started in bridge page.");
@@ -661,6 +735,7 @@ class BotSession {
     this.stopPromise = (async () => {
       this.info(`Shutting down (${reason})...`);
       try {
+        this.clearSpeculativePrefetch("session-stop");
         this.clearSoftInterrupt({ resumeAudio: true });
         await this.interruptAssistantRun("session-stop");
         await this.stopJoinStateMonitor();
@@ -698,6 +773,9 @@ class BotSession {
         this.softInterruptRunId = "";
         this.softInterruptSource = "";
         this.softInterruptTimer = null;
+        this.semanticTurnDetector = null;
+        this.speculativePrefetch = null;
+        this.latestPartialsBySource = {};
 
         if (this.transportAdapter) {
           try {
@@ -766,6 +844,9 @@ class BotSession {
         this.lastUserTurnText = "";
         this.pendingContinuationBaseText = "";
         this.pendingContinuationSetAtMs = 0;
+        this.semanticTurnDetector = null;
+        this.speculativePrefetch = null;
+        this.latestPartialsBySource = {};
         this.status = "stopped";
         this.stoppedAt = new Date().toISOString();
         this.isStopping = false;
@@ -1056,10 +1137,15 @@ class BotSession {
       this.trace(
         `Dispatching turn to responder (${item.source}, chars=${commandText.length}).`
       );
+      const openingPrefetch = await this.consumeSpeculativePrefetch({
+        source: item.source,
+        commandText
+      });
       await this.respondToCommand({
         responder,
         source: item.source,
-        commandText
+        commandText,
+        openingPrefetch
       });
     } catch (err) {
       this.error(err?.stack || err?.message || String(err));
@@ -1262,6 +1348,8 @@ class BotSession {
       this.bridgePage = await this.transportAdapter.reopenBridge();
       await this.transportAdapter.startStt({
         chunkMs: this.sessionConfig.openaiSttChunkMs,
+        partialsEnabled: this.sessionConfig.openaiSttPartialsEnabled,
+        partialEmitMs: this.sessionConfig.openaiSttPartialEmitMs,
         mimeType: this.sessionConfig.openaiSttMimeType,
         deviceId: this.sessionConfig.openaiSttDeviceId,
         deviceLabel: this.sessionConfig.openaiSttDeviceLabel,
@@ -1271,7 +1359,8 @@ class BotSession {
         vadThreshold: this.sessionConfig.openaiSttVadThreshold,
         hangoverMs: this.sessionConfig.openaiSttHangoverMs,
         segmentMinMs: this.sessionConfig.openaiSttSegmentMinMs,
-        segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs
+        segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs,
+        bargeInMinMs: this.sessionConfig.bargeInMinMs
       });
       this.setBridgeTtsDucking(this.softInterruptActive);
 
@@ -1324,11 +1413,18 @@ class BotSession {
     }
   }
 
-  async respondToCommand({ responder, source, commandText }) {
+  async respondToCommand({
+    responder,
+    source,
+    commandText,
+    openingPrefetch = null
+  }) {
     const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const abortController = new AbortController();
     const llmStartedAtMs = Date.now();
     let firstTextChunkAtMs = 0;
+    let prefetchComparable = "";
+    let prefetchConsumed = false;
     this.trace(
       `Assistant run started (${runId}, source=${source}, userChars=${commandText.length}).`
     );
@@ -1342,7 +1438,10 @@ class BotSession {
     this.setBridgeTtsDucking(false);
 
     let playbackChain = Promise.resolve();
-    const queueChunkPlayback = (chunkText) => {
+    const queueChunkPlayback = (
+      chunkText,
+      { prefetchedAudio = null, chunkOrigin = "stream" } = {}
+    ) => {
       const text = normalizeText(chunkText);
       if (!text) {
         return;
@@ -1351,7 +1450,7 @@ class BotSession {
         firstTextChunkAtMs = Date.now();
       }
       this.trace(
-        `Assistant text chunk queued (${runId}, chars=${text.length}).`
+        `Assistant text chunk queued (${runId}, chars=${text.length}, origin=${chunkOrigin}).`
       );
 
       playbackChain = playbackChain
@@ -1360,7 +1459,8 @@ class BotSession {
             responder,
             text,
             runId,
-            signal: abortController.signal
+            signal: abortController.signal,
+            prefetchedAudio
           })
         )
         .catch((err) => {
@@ -1370,12 +1470,31 @@ class BotSession {
         });
     };
 
+    if (openingPrefetch?.audioPayload && openingPrefetch?.text) {
+      prefetchComparable = normalizeComparableText(openingPrefetch.text);
+      queueChunkPlayback(openingPrefetch.text, {
+        prefetchedAudio: openingPrefetch.audioPayload,
+        chunkOrigin: "speculative-prefetch"
+      });
+    }
+
     let streamResult = null;
     try {
       try {
         streamResult = await responder.streamReply(commandText, {
           signal: abortController.signal,
           onTextChunk: async (chunk) => {
+            if (
+              !prefetchConsumed &&
+              prefetchComparable &&
+              isComparablePrefixMatch(chunk, openingPrefetch?.text || "")
+            ) {
+              prefetchConsumed = true;
+              this.trace(
+                `Skipped streamed chunk in favor of speculative prefetch (${runId}).`
+              );
+              return;
+            }
             queueChunkPlayback(chunk);
           }
         });
@@ -1447,7 +1566,13 @@ class BotSession {
     }
   }
 
-  async playAssistantChunk({ responder, text, runId, signal }) {
+  async playAssistantChunk({
+    responder,
+    text,
+    runId,
+    signal,
+    prefetchedAudio = null
+  }) {
     const chunkText = stripControlTokens(
       text,
       this.sessionConfig?.intakeCompleteToken
@@ -1471,11 +1596,13 @@ class BotSession {
     );
 
     try {
-      const timedAudio = await withTimeout(
-        responder.synthesizeSpeech(chunkText, { signal }),
-        this.sessionConfig.openaiTtsTimeoutMs,
-        "OpenAI TTS chunk"
-      );
+      const timedAudio = prefetchedAudio?.audioBase64
+        ? prefetchedAudio
+        : await withTimeout(
+            responder.synthesizeSpeech(chunkText, { signal }),
+            this.sessionConfig.openaiTtsTimeoutMs,
+            "OpenAI TTS chunk"
+          );
 
       if (signal?.aborted || (runId && this.activeAssistantRun?.id !== runId)) {
         return;
@@ -1779,6 +1906,311 @@ class BotSession {
     }, confirmMs);
   }
 
+  appendInterruptionContext({ source, reason, text = "" }) {
+    if (!this.responder || typeof this.responder.appendInterruptionContext !== "function") {
+      return;
+    }
+    try {
+      this.responder.appendInterruptionContext({
+        source,
+        reason,
+        text
+      });
+    } catch (_) {
+      // Ignore interruption context injection failures.
+    }
+  }
+
+  getLatestPartial(source) {
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    const entry = this.latestPartialsBySource?.[normalizedSource];
+    if (!entry || !normalizeText(entry.text)) {
+      return null;
+    }
+    return {
+      source: normalizedSource,
+      text: normalizeText(entry.text),
+      at: Number.isFinite(Number(entry.at)) ? Number(entry.at) : 0
+    };
+  }
+
+  async maybeStartSpeculativePrefetch({ source, text, responder }) {
+    if (!this.sessionConfig?.partialSpeculationEnabled) {
+      return;
+    }
+    if (!responder || this.isStopping || this.status !== "running") {
+      return;
+    }
+    if (this.activeAssistantRun) {
+      return;
+    }
+
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    if (normalizedSource !== "openai-stt") {
+      return;
+    }
+
+    const normalizedText = normalizeText(text);
+    if (!normalizedText) {
+      return;
+    }
+    const minWords = Math.max(
+      1,
+      Number(this.sessionConfig?.partialSpeculationMinWords || 3)
+    );
+    if (countWords(normalizedText) < minWords) {
+      return;
+    }
+
+    if (this.speculativePrefetch?.pending) {
+      const previousText = normalizeText(this.speculativePrefetch?.seedText);
+      if (
+        previousText &&
+        (isComparablePrefixMatch(previousText, normalizedText) ||
+          isComparablePrefixMatch(normalizedText, previousText))
+      ) {
+        return;
+      }
+      this.clearSpeculativePrefetch("new partial superseded previous seed");
+    }
+
+    let semantic = null;
+    if (this.semanticTurnDetector) {
+      semantic = await this.semanticTurnDetector.evaluate(normalizedText, {
+        isFirstUserTurn: !this.hasProcessedUserTurn
+      });
+    }
+    if (
+      semantic &&
+      (semantic.status === "incomplete" ||
+        Number(semantic.recommendedDelayMs || 0) >
+          Number(this.sessionConfig?.semanticEotMinDelayMs || 250) + 200)
+    ) {
+      return;
+    }
+
+    const prefetchId = `spec_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const abortController = new AbortController();
+    const timeoutMs = Math.max(
+      120,
+      Number(this.sessionConfig?.partialSpeculationTimeoutMs || 1400)
+    );
+    const prefetchState = {
+      id: prefetchId,
+      source: normalizedSource,
+      seedText: normalizedText,
+      createdAt: Date.now(),
+      firstChunkText: "",
+      audioPayload: null,
+      pending: true,
+      abortController
+    };
+    this.speculativePrefetch = prefetchState;
+    this.trace(
+      `Speculative prefetch started (${prefetchId}, source=${normalizedSource}, chars=${normalizedText.length}).`
+    );
+
+    const timeout = setTimeout(() => {
+      abortController.abort();
+    }, timeoutMs);
+
+    try {
+      await responder.streamReply(normalizedText, {
+        signal: abortController.signal,
+        commitHistory: false,
+        onTextChunk: async (chunk) => {
+          if (!chunk || prefetchState.firstChunkText) {
+            return;
+          }
+          const firstChunkText = normalizeText(chunk);
+          if (!firstChunkText) {
+            return;
+          }
+          prefetchState.firstChunkText = firstChunkText;
+          try {
+            const audioPayload = await withTimeout(
+              responder.synthesizeSpeech(firstChunkText, {
+                signal: abortController.signal
+              }),
+              this.sessionConfig.openaiTtsTimeoutMs,
+              "Speculative TTS prefetch"
+            );
+            if (audioPayload?.audioBase64) {
+              prefetchState.audioPayload = audioPayload;
+              this.trace(
+                `Speculative prefetch ready (${prefetchId}, chunkChars=${firstChunkText.length}).`
+              );
+            }
+          } catch (prefetchErr) {
+            if (!isAbortErrorLike(prefetchErr)) {
+              this.trace(
+                `Speculative prefetch TTS failed (${prefetchId}): ${
+                  prefetchErr?.message || prefetchErr
+                }`
+              );
+            }
+          } finally {
+            abortController.abort();
+          }
+        }
+      });
+    } catch (err) {
+      if (!isAbortErrorLike(err)) {
+        this.trace(
+          `Speculative prefetch failed (${prefetchId}): ${err?.message || err}`
+        );
+      }
+    } finally {
+      clearTimeout(timeout);
+      if (this.speculativePrefetch?.id === prefetchId) {
+        this.speculativePrefetch.pending = false;
+      }
+    }
+  }
+
+  clearSpeculativePrefetch(reason = "") {
+    const active = this.speculativePrefetch;
+    if (!active) {
+      return;
+    }
+    try {
+      active.abortController?.abort();
+    } catch (_) {
+      // Ignore abort errors.
+    }
+    this.speculativePrefetch = null;
+    if (reason) {
+      this.trace(`Speculative prefetch cleared (${reason}).`);
+    }
+  }
+
+  async consumeSpeculativePrefetch({ source, commandText }) {
+    const active = this.speculativePrefetch;
+    if (!active) {
+      return null;
+    }
+
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    if (normalizedSource !== active.source) {
+      this.clearSpeculativePrefetch("source mismatch");
+      return null;
+    }
+
+    const normalizedCommand = normalizeText(commandText);
+    if (!normalizedCommand) {
+      this.clearSpeculativePrefetch("empty command");
+      return null;
+    }
+    if (!isComparablePrefixMatch(active.seedText, normalizedCommand)) {
+      this.clearSpeculativePrefetch("seed mismatch");
+      return null;
+    }
+
+    const maxAgeMs = Math.max(
+      120,
+      Number(this.sessionConfig?.partialSpeculationMaxAgeMs || 1800)
+    );
+    if (Date.now() - Number(active.createdAt || 0) > maxAgeMs) {
+      this.clearSpeculativePrefetch("stale");
+      return null;
+    }
+
+    const timeoutMs = 80;
+    const startedAt = Date.now();
+    while (
+      this.speculativePrefetch &&
+      this.speculativePrefetch.id === active.id &&
+      this.speculativePrefetch.pending &&
+      Date.now() - startedAt < timeoutMs
+    ) {
+      await sleep(10);
+    }
+
+    const current = this.speculativePrefetch;
+    this.speculativePrefetch = null;
+    if (!current?.audioPayload?.audioBase64 || !current.firstChunkText) {
+      return null;
+    }
+    this.trace(
+      `Speculative prefetch consumed (${current.id}, seedChars=${current.seedText.length}, commandChars=${normalizedCommand.length}).`
+    );
+    return {
+      text: current.firstChunkText,
+      audioPayload: current.audioPayload,
+      seedText: current.seedText
+    };
+  }
+
+  handleConfirmedVadBargeIn({ source, reason, speechMs = 0, peak = 0 }) {
+    if (!this.sessionConfig?.bargeInOnVadConfirmed) {
+      return;
+    }
+    if (!this.sessionConfig?.bargeInEnabled) {
+      return;
+    }
+
+    const run = this.activeAssistantRun;
+    if (!run || this.isStopping || run.abortController?.signal?.aborted) {
+      return;
+    }
+
+    const normalizedSource = normalizeText(source || "unknown") || "unknown";
+    if (normalizedSource !== "openai-stt") {
+      return;
+    }
+
+    const minBargeInMs = Number(this.sessionConfig?.bargeInMinMs || 0);
+    if (Number(speechMs || 0) < minBargeInMs) {
+      return;
+    }
+
+    const minPeak = Math.max(
+      0,
+      Number(this.sessionConfig?.bargeInVadMinPeak || 0)
+    );
+    if (Number(peak || 0) < minPeak) {
+      this.trace(
+        `VAD-confirmed barge-in ignored (${normalizedSource}:${reason}): peak ${Number(
+          peak || 0
+        ).toFixed(4)} < min ${minPeak.toFixed(4)}.`
+      );
+      return;
+    }
+
+    const latestPartial = this.getLatestPartial(normalizedSource);
+    const partialAgeMs = latestPartial?.at
+      ? Date.now() - Number(latestPartial.at)
+      : Number.MAX_SAFE_INTEGER;
+    const partialText =
+      latestPartial && partialAgeMs <= 1600 ? normalizeText(latestPartial.text) : "";
+    if (partialText && this.isLikelyBotEcho(partialText)) {
+      return;
+    }
+
+    this.clearSpeculativePrefetch("confirmed barge-in");
+    if (this.softInterruptActive) {
+      this.clearSoftInterrupt({
+        resumeAudio: false,
+        reason: "vad-confirmed hard interrupt"
+      });
+    }
+    this.markPendingUserContinuation({
+      source: normalizedSource,
+      text: partialText
+    });
+    this.appendInterruptionContext({
+      source: normalizedSource,
+      reason,
+      text: partialText || "[vad-confirmed-without-text]"
+    });
+    this.trace(
+      `VAD-confirmed barge-in accepted (${normalizedSource}:${reason}, speechMs=${speechMs}, peak=${Number(
+        peak || 0
+      ).toFixed(4)}).`
+    );
+    void this.interruptAssistantRun(`barge-in:${normalizedSource}:${reason}`);
+  }
+
   maybeInterruptAssistantOutput({ source, text, reason }) {
     if (!this.sessionConfig?.bargeInEnabled) {
       return;
@@ -1839,8 +2271,14 @@ class BotSession {
     this.trace(
       `Barge-in accepted (${source}:${reason}) -> interrupting assistant.`
     );
+    this.clearSpeculativePrefetch("hard barge-in");
     this.markPendingUserContinuation({
       source: normalizedSource,
+      text
+    });
+    this.appendInterruptionContext({
+      source: normalizedSource,
+      reason,
       text
     });
     void this.interruptAssistantRun(`barge-in:${source}:${reason}`);
@@ -1910,11 +2348,20 @@ class BotSession {
       return false;
     }
 
+    this.clearSpeculativePrefetch(`interrupt:${reason}`);
     this.clearSoftInterrupt({ resumeAudio: false, reason: "hard interrupt" });
     run.abortController.abort();
     try {
       if (this.transportAdapter && this.bridgePage) {
-        await this.transportAdapter.stopSpeaking();
+        await this.transportAdapter.stopSpeaking({
+          flush: true,
+          resumeGateMs: 40
+        });
+        await sleep(20);
+        await this.transportAdapter.stopSpeaking({
+          flush: true,
+          resumeGateMs: 40
+        });
       }
     } catch (_) {
       // Ignore playback interruption transport errors.
@@ -1963,8 +2410,8 @@ class BotSession {
       ? Math.max(0, configuredDelayMsRaw)
       : 0;
     const continuationSilenceMs = Number.isFinite(continuationSilenceMsRaw)
-      ? Math.max(500, continuationSilenceMsRaw)
-      : 3000;
+      ? Math.max(120, continuationSilenceMsRaw)
+      : 360;
 
     let delayMs = isOpenAiSttSource
       ? continuationSilenceMs
@@ -1976,8 +2423,40 @@ class BotSession {
       return resolved;
     }
     const initialResolved = resolved;
+
+    let semanticSummary = null;
+    const semanticEnabled =
+      isOpenAiSttSource &&
+      this.sessionConfig?.semanticEotEnabled &&
+      this.semanticTurnDetector;
+    if (semanticEnabled) {
+      const semantic = await this.semanticTurnDetector.evaluate(resolved, {
+        isFirstUserTurn
+      });
+      if (semantic) {
+        const minDelayMs = Math.max(
+          120,
+          Number(this.sessionConfig?.semanticEotMinDelayMs || 250)
+        );
+        const maxDelayMs = Math.max(
+          minDelayMs,
+          Number(this.sessionConfig?.semanticEotMaxDelayMs || 900)
+        );
+        delayMs = Math.max(
+          minDelayMs,
+          Math.min(maxDelayMs, Number(semantic.recommendedDelayMs || delayMs))
+        );
+        semanticSummary = semantic;
+      }
+    }
     this.trace(
-      `Turn delay start (${normalizedSource}): targetSilenceMs=${delayMs}, continuationSilenceMs=${continuationSilenceMs}, postTurnDelayMs=${configuredDelayMs}.`
+      `Turn delay start (${normalizedSource}): targetSilenceMs=${delayMs}, continuationSilenceMs=${continuationSilenceMs}, postTurnDelayMs=${configuredDelayMs}${
+        semanticSummary
+          ? `, semanticStatus=${semanticSummary.status}, semanticReason=${semanticSummary.reason}, semanticLlm=${Boolean(
+              semanticSummary.llmUsed
+            )}`
+          : ""
+      }.`
     );
 
     const isIncompleteIntakeStub = isLikelyIncompleteIntakeStub(resolved);
@@ -1995,7 +2474,7 @@ class BotSession {
       const currentSegmentDurationMs = Number(initialSegmentDurationMs || 0);
       const likelyForcedByMaxDuration =
         Number.isFinite(currentSegmentDurationMs) &&
-        currentSegmentDurationMs >= Math.max(1000, segmentMaxMs - 250);
+        currentSegmentDurationMs >= Math.max(240, segmentMaxMs - 220);
       if (likelyForcedByMaxDuration) {
         // When a segment is force-flushed by max duration, wait for the next
         // segment so long monologues are merged before generating a reply.
@@ -2028,6 +2507,7 @@ class BotSession {
         : Date.now()
     };
 
+    let lastSemanticComparable = normalizeComparableText(resolved);
     const startedAt = Date.now();
     while (Date.now() - startedAt < hardMaxWaitMs) {
       resolved = this.consumeExpandedQueueText({
@@ -2036,6 +2516,36 @@ class BotSession {
         includeTurnFinal: true,
         stitchState
       });
+
+      if (semanticEnabled) {
+        const comparable = normalizeComparableText(resolved);
+        if (comparable && comparable !== lastSemanticComparable) {
+          lastSemanticComparable = comparable;
+          const semantic = await this.semanticTurnDetector.evaluate(resolved, {
+            isFirstUserTurn
+          });
+          if (semantic) {
+            const minDelayMs = Math.max(
+              120,
+              Number(this.sessionConfig?.semanticEotMinDelayMs || 250)
+            );
+            const maxDelayMs = Math.max(
+              minDelayMs,
+              Number(this.sessionConfig?.semanticEotMaxDelayMs || 900)
+            );
+            const nextDelayMs = Math.max(
+              minDelayMs,
+              Math.min(maxDelayMs, Number(semantic.recommendedDelayMs || delayMs))
+            );
+            if (nextDelayMs !== delayMs) {
+              this.trace(
+                `Semantic EoT delay updated (${normalizedSource}): ${delayMs}ms -> ${nextDelayMs}ms (status=${semantic.status}, reason=${semantic.reason}).`
+              );
+            }
+            delayMs = nextDelayMs;
+          }
+        }
+      }
 
       if (this.isStopping || this.status !== "running") {
         this.trace(

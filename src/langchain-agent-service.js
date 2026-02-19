@@ -136,8 +136,29 @@ class LangChainAgentResponder {
     ];
   }
 
+  pushHistoryMessages(messages = []) {
+    const valid = Array.isArray(messages)
+      ? messages.filter(
+          (item) =>
+            item &&
+            (item.role === "system" ||
+              item.role === "user" ||
+              item.role === "assistant") &&
+            normalizeText(item.content)
+        )
+      : [];
+    if (valid.length === 0) {
+      return;
+    }
+
+    this.history.push(...valid);
+    if (this.history.length > this.maxHistoryMessages) {
+      this.history = this.history.slice(-this.maxHistoryMessages);
+    }
+  }
+
   appendHistory({ userText, assistantReply }) {
-    this.history.push(
+    this.pushHistoryMessages([
       {
         role: "user",
         content: userText
@@ -146,14 +167,33 @@ class LangChainAgentResponder {
         role: "assistant",
         content: assistantReply
       }
-    );
-
-    if (this.history.length > this.maxHistoryMessages) {
-      this.history = this.history.slice(-this.maxHistoryMessages);
-    }
+    ]);
   }
 
-  async streamReply(userText, { signal, onTextChunk = async () => {} } = {}) {
+  appendInterruptionContext({ source = "", reason = "", text = "" } = {}) {
+    const note = normalizeText(
+      `Interruption context: user started speaking over assistant output (source=${normalizeText(
+        source || "unknown"
+      ) || "unknown"}, reason=${normalizeText(reason || "unknown") || "unknown"}). Latest user fragment: ${limitText(
+        text,
+        220
+      ) || "<none>"}`
+    );
+    if (!note) {
+      return;
+    }
+    this.pushHistoryMessages([
+      {
+        role: "system",
+        content: note
+      }
+    ]);
+  }
+
+  async streamReply(
+    userText,
+    { signal, onTextChunk = async () => {}, commitHistory = true } = {}
+  ) {
     const safeUserText = limitText(userText, this.maxUserMessageChars);
     if (!safeUserText) {
       throw new Error("User message is empty.");
@@ -236,7 +276,7 @@ class LangChainAgentResponder {
       throw new Error("LangChain returned an empty streamed reply.");
     }
 
-    if (!aborted) {
+    if (!aborted && commitHistory) {
       this.appendHistory({
         userText: safeUserText,
         assistantReply: finalReply

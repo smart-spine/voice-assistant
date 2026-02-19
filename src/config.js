@@ -34,11 +34,11 @@ function pickAudioFormat(rawValue) {
 }
 
 function pickAgentRuntime(rawValue) {
-  const value = String(rawValue || "langchain").toLowerCase();
+  const value = String(rawValue || "openai").toLowerCase();
   if (["langchain", "openai"].includes(value)) {
     return value;
   }
-  return "langchain";
+  return "openai";
 }
 
 function pickOpenAiSttSource(rawValue) {
@@ -226,7 +226,7 @@ const config = {
   replyChunkMaxLatencyMs: asBoundedNumber(
     process.env.REPLY_CHUNK_MAX_LATENCY_MS,
     {
-      fallback: 850,
+      fallback: 220,
       min: 50,
       max: 5000,
       integer: true
@@ -258,11 +258,20 @@ const config = {
     }
   ),
   bargeInOnPartials: asBoolean(process.env.BARGE_IN_ON_PARTIALS, false),
+  bargeInOnVadConfirmed: asBoolean(
+    process.env.BARGE_IN_ON_VAD_CONFIRMED,
+    true
+  ),
+  bargeInVadMinPeak: asBoundedNumber(process.env.BARGE_IN_VAD_MIN_PEAK, {
+    fallback: 0.018,
+    min: 0,
+    max: 1
+  }),
   softInterruptEnabled: asBoolean(process.env.SOFT_INTERRUPT_ENABLED, true),
   softInterruptConfirmMs: asBoundedNumber(
     process.env.SOFT_INTERRUPT_CONFIRM_MS,
     {
-      fallback: 700,
+      fallback: 280,
       min: 150,
       max: 6000,
       integer: true
@@ -302,14 +311,27 @@ const config = {
     process.env.OPENAI_STT_LANGUAGE,
     cleanString(process.env.LANGUAGE, "en-US")
   ),
+  openaiSttPartialsEnabled: asBoolean(
+    process.env.OPENAI_STT_PARTIALS_ENABLED,
+    true
+  ),
+  openaiSttPartialEmitMs: asBoundedNumber(
+    process.env.OPENAI_STT_PARTIAL_EMIT_MS,
+    {
+      fallback: 240,
+      min: 120,
+      max: 3000,
+      integer: true
+    }
+  ),
   openaiSttChunkMs: asBoundedNumber(process.env.OPENAI_STT_CHUNK_MS, {
-    fallback: 700,
-    min: 300,
+    fallback: 260,
+    min: 120,
     max: 10000,
     integer: true
   }),
   openaiSttTimeoutMs: asBoundedNumber(process.env.OPENAI_STT_TIMEOUT_MS, {
-    fallback: 9000,
+    fallback: 4500,
     min: 1000,
     max: 60000,
     integer: true
@@ -335,7 +357,7 @@ const config = {
   openaiSttMaxQueueChunks: asBoundedNumber(
     process.env.OPENAI_STT_MAX_QUEUE_CHUNKS,
     {
-      fallback: 6,
+      fallback: 8,
       min: 1,
       max: 64,
       integer: true
@@ -379,7 +401,7 @@ const config = {
   openaiSttHangoverMs: asBoundedNumber(
     process.env.OPENAI_STT_HANGOVER_MS,
     {
-      fallback: 700,
+      fallback: 300,
       min: 120,
       max: 8000,
       integer: true
@@ -388,7 +410,7 @@ const config = {
   openaiSttSegmentMinMs: asBoundedNumber(
     process.env.OPENAI_STT_SEGMENT_MIN_MS,
     {
-      fallback: 900,
+      fallback: 240,
       min: 120,
       max: 12000,
       integer: true
@@ -397,7 +419,7 @@ const config = {
   openaiSttSegmentMaxMs: asBoundedNumber(
     process.env.OPENAI_STT_SEGMENT_MAX_MS,
     {
-      fallback: 15000,
+      fallback: 7000,
       min: 400,
       max: 30000,
       integer: true
@@ -422,8 +444,69 @@ const config = {
     process.env.AUTO_GREETING_PROMPT,
     "System event: The Google Meet call has just connected and the user is silent. Start with one short friendly opening, briefly introduce yourself as SmartSpine's live assistant, then ask for the user's name and goal. Do not use rigid scripted wording."
   ),
+  semanticEotEnabled: asBoolean(process.env.SEMANTIC_EOT_ENABLED, true),
+  semanticEotUseLlm: asBoolean(process.env.SEMANTIC_EOT_USE_LLM, false),
+  semanticEotModel: cleanString(
+    process.env.SEMANTIC_EOT_MODEL,
+    process.env.OPENAI_MODEL || "gpt-4o-mini"
+  ),
+  semanticEotTimeoutMs: asBoundedNumber(process.env.SEMANTIC_EOT_TIMEOUT_MS, {
+    fallback: 180,
+    min: 60,
+    max: 5000,
+    integer: true
+  }),
+  semanticEotMinDelayMs: asBoundedNumber(
+    process.env.SEMANTIC_EOT_MIN_DELAY_MS,
+    {
+      fallback: 250,
+      min: 120,
+      max: 1500,
+      integer: true
+    }
+  ),
+  semanticEotMaxDelayMs: asBoundedNumber(
+    process.env.SEMANTIC_EOT_MAX_DELAY_MS,
+    {
+      fallback: 900,
+      min: 180,
+      max: 6000,
+      integer: true
+    }
+  ),
+  partialSpeculationEnabled: asBoolean(
+    process.env.PARTIAL_SPECULATION_ENABLED,
+    true
+  ),
+  partialSpeculationMinWords: asBoundedNumber(
+    process.env.PARTIAL_SPECULATION_MIN_WORDS,
+    {
+      fallback: 3,
+      min: 1,
+      max: 20,
+      integer: true
+    }
+  ),
+  partialSpeculationTimeoutMs: asBoundedNumber(
+    process.env.PARTIAL_SPECULATION_TIMEOUT_MS,
+    {
+      fallback: 1400,
+      min: 100,
+      max: 10000,
+      integer: true
+    }
+  ),
+  partialSpeculationMaxAgeMs: asBoundedNumber(
+    process.env.PARTIAL_SPECULATION_MAX_AGE_MS,
+    {
+      fallback: 1800,
+      min: 100,
+      max: 15000,
+      integer: true
+    }
+  ),
   turnSilenceMs: asBoundedNumber(process.env.TURN_SILENCE_MS, {
-    fallback: 420,
+    fallback: 280,
     min: 120,
     max: 6000,
     integer: true
@@ -440,8 +523,8 @@ const config = {
   turnContinuationSilenceMs: asBoundedNumber(
     process.env.TURN_CONTINUATION_SILENCE_MS,
     {
-      fallback: 3000,
-      min: 500,
+      fallback: 360,
+      min: 120,
       max: 10000,
       integer: true
     }
@@ -454,7 +537,7 @@ const config = {
     integer: true
   }),
   silenceAfterSpeakMs: asBoundedNumber(process.env.SILENCE_AFTER_SPEAK_MS, {
-    fallback: 1000,
+    fallback: 180,
     min: 0,
     max: 8000,
     integer: true

@@ -184,7 +184,7 @@ class OpenAiSttTurnStream {
       return;
     }
 
-    this.queue.push({
+    const nextChunk = {
       audioBase64,
       mimeType: String(chunk.mimeType || "audio/webm;codecs=opus").trim(),
       ts: Number.isFinite(Number(chunk.ts)) ? Number(chunk.ts) : Date.now(),
@@ -192,7 +192,20 @@ class OpenAiSttTurnStream {
         ? Number(chunk.durationMs)
         : undefined,
       isSegmentFinal: Boolean(chunk.isSegmentFinal)
-    });
+    };
+
+    if (nextChunk.isSegmentFinal && this.queue.length > 0) {
+      const previousLength = this.queue.length;
+      this.queue = this.queue.filter((item) => Boolean(item?.isSegmentFinal));
+      const droppedPartials = previousLength - this.queue.length;
+      if (droppedPartials > 0) {
+        this.log(
+          `openai-stt dropped ${droppedPartials} queued partial chunk(s) before final segment.`
+        );
+      }
+    }
+
+    this.queue.push(nextChunk);
     if (this.queue.length > this.maxQueueChunks) {
       const dropCount = this.queue.length - this.maxQueueChunks;
       this.queue.splice(0, dropCount);

@@ -2,10 +2,10 @@ const { OpenAIResponder } = require("./openai-service");
 const { LangChainAgentResponder } = require("./langchain-agent-service");
 
 function createResponder({
-  runtime = "langchain",
+  runtime = "openai",
   ...options
 } = {}) {
-  const normalizedRuntime = String(runtime || "langchain")
+  const normalizedRuntime = String(runtime || "openai")
     .trim()
     .toLowerCase();
 

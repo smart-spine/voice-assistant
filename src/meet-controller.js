@@ -71,6 +71,9 @@ async function setupBridgePage({
       peak: Number.isFinite(Number(payload.peak))
         ? Number(payload.peak)
         : undefined,
+      speechMs: Number.isFinite(Number(payload.speechMs))
+        ? Number(payload.speechMs)
+        : undefined,
       turnId:
         typeof payload.turnId === "string" && payload.turnId
           ? payload.turnId
@@ -221,13 +224,13 @@ async function bridgePrepareTtsOutput(page) {
   });
 }
 
-async function bridgeStopSpeaking(page) {
-  return page.evaluate(() => {
+async function bridgeStopSpeaking(page, options = {}) {
+  return page.evaluate((stopOptions) => {
     if (!window.botBridge?.stopSpeaking) {
       return false;
     }
-    return window.botBridge.stopSpeaking();
-  });
+    return window.botBridge.stopSpeaking(stopOptions || {});
+  }, options);
 }
 
 async function bridgeSetTtsDucking(page, options = {}) {

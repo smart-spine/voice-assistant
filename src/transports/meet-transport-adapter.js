@@ -73,11 +73,11 @@ class MeetTransportAdapter extends BaseTransportAdapter {
     return bridgeSpeakAudio(this.bridgePage, payload);
   }
 
-  async stopSpeaking() {
+  async stopSpeaking(options = {}) {
     if (!this.bridgePage || this.bridgePage.isClosed()) {
       return false;
     }
-    return bridgeStopSpeaking(this.bridgePage);
+    return bridgeStopSpeaking(this.bridgePage, options);
   }
 
   async setTtsDucking(options = {}) {
