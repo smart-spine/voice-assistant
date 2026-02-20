@@ -48,6 +48,21 @@ function isAbortError(err) {
   );
 }
 
+function isUnknownParameterError(err, parameterName = "") {
+  const message = String(err?.message || "");
+  const code = String(err?.code || "");
+  const param = String(err?.param || "");
+  const needle = String(parameterName || "");
+  if (!needle) {
+    return code === "unknown_parameter" || /unknown parameter/i.test(message);
+  }
+  return (
+    code === "unknown_parameter" ||
+    param === needle ||
+    message.toLowerCase().includes(`unknown parameter: '${needle.toLowerCase()}'`)
+  );
+}
+
 function findSplitIndex(text, { minChars, targetChars, maxChars, force = false }) {
   const value = String(text || "");
   if (!value) {
@@ -142,6 +157,10 @@ class OpenAIResponder {
     model,
     ttsModel = "gpt-4o-mini-tts",
     ttsVoice = "alloy",
+    ttsVoiceId = "",
+    ttsInstructions = "",
+    ttsSpeed = 1,
+    ttsStreamFormat = "audio",
     ttsFormat = "mp3",
     systemPrompt,
     maxUserMessageChars = 600,
@@ -157,6 +176,15 @@ class OpenAIResponder {
     this.model = model;
     this.ttsModel = ttsModel;
     this.ttsVoice = ttsVoice;
+    this.ttsVoiceId = String(ttsVoiceId || "").trim();
+    this.ttsInstructions = String(ttsInstructions || "").trim();
+    this.ttsSpeed = Number.isFinite(Number(ttsSpeed))
+      ? Math.min(4, Math.max(0.25, Number(ttsSpeed)))
+      : 1;
+    this.ttsStreamFormat =
+      String(ttsStreamFormat || "audio").trim().toLowerCase() === "sse"
+        ? "sse"
+        : "audio";
     this.ttsFormat = ttsFormat;
     this.systemPrompt = systemPrompt;
     this.maxUserMessageChars = maxUserMessageChars;
@@ -346,15 +374,44 @@ class OpenAIResponder {
       return null;
     }
 
-    const response = await this.client.audio.speech.create(
-      {
+    const useLegacyVoiceModels = ["tts-1", "tts-1-hd"].includes(this.ttsModel);
+    const voice = this.ttsVoiceId ? { id: this.ttsVoiceId } : this.ttsVoice;
+
+    const modernPayload = {
+      model: this.ttsModel,
+      voice,
+      input,
+      response_format: this.ttsFormat,
+      speed: this.ttsSpeed
+    };
+    if (!useLegacyVoiceModels && this.ttsInstructions) {
+      modernPayload.instructions = this.ttsInstructions;
+    }
+    if (!useLegacyVoiceModels && this.ttsStreamFormat) {
+      modernPayload.stream_format = this.ttsStreamFormat;
+    }
+
+    let response = null;
+    try {
+      response = await this.client.audio.speech.create(modernPayload, { signal });
+    } catch (err) {
+      const shouldFallbackToLegacy =
+        isUnknownParameterError(err, "response_format") ||
+        isUnknownParameterError(err, "stream_format") ||
+        isUnknownParameterError(err, "instructions") ||
+        isUnknownParameterError(err, "voice");
+      if (!shouldFallbackToLegacy) {
+        throw err;
+      }
+
+      const legacyPayload = {
         model: this.ttsModel,
         voice: this.ttsVoice,
         input,
         format: this.ttsFormat
-      },
-      { signal }
-    );
+      };
+      response = await this.client.audio.speech.create(legacyPayload, { signal });
+    }
 
     const audioBuffer = Buffer.from(await response.arrayBuffer());
     if (audioBuffer.length === 0) {

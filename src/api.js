@@ -1,23 +1,55 @@
-const { config, validateCoreConfig } = require("./config");
 const { BotSessionManager } = require("./runtime/session-manager");
 const { startControlServer } = require("./api/control-server");
+const { ConfigService } = require("./config-service");
 const { log, warn, error } = require("./logger");
 
+function loadConfigModule() {
+  const modulePath = require.resolve("./config");
+  delete require.cache[modulePath];
+  return require("./config");
+}
+
 async function main() {
-  const missing = validateCoreConfig(config);
+  const boot = loadConfigModule();
+  const bootConfig = boot.config;
+
+  let manager = null;
+  const configService = new ConfigService({
+    encryptionKey: bootConfig.configEncryptionKey,
+    overridesFile: bootConfig.configOverridesFile,
+    auditFile: bootConfig.configAuditFile,
+    backupsDir: bootConfig.configBackupsDir,
+    onReload: async ({ changedKeys = [] } = {}) => {
+      const loaded = loadConfigModule();
+      if (manager) {
+        manager.updateConfig(loaded.config);
+      }
+      return {
+        changedKeys,
+        appliedAt: new Date().toISOString()
+      };
+    }
+  });
+
+  const loaded = loadConfigModule();
+  const config = loaded.config;
+  const missing = loaded.validateCoreConfig(config);
   if (missing.length > 0) {
     throw new Error(
       `Missing required environment variables: ${missing.join(", ")}`
     );
   }
 
-  const manager = new BotSessionManager({ config });
+  manager = new BotSessionManager({ config });
   const controlApi = await startControlServer({
     port: config.controlApiPort,
     host: config.controlApiHost,
     authToken: config.controlApiToken,
     allowAnyMeetUrl: config.allowAnyMeetUrl,
-    manager
+    corsAllowlist: config.controlApiCorsAllowlist,
+    manager,
+    configService,
+    getRuntimeConfig: () => manager.getConfig()
   });
 
   if (!config.controlApiToken) {

@@ -62,6 +62,20 @@ class BotSessionManager {
     return this.activeSession.getStatus();
   }
 
+  getConfig() {
+    return this.config;
+  }
+
+  updateConfig(nextConfig = {}) {
+    if (!nextConfig || typeof nextConfig !== "object") {
+      return this.config;
+    }
+    this.config = {
+      ...nextConfig
+    };
+    return this.config;
+  }
+
   isSessionActive() {
     if (!this.activeSession) {
       return false;

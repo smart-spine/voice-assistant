@@ -137,10 +137,6 @@ async function setupBridgePage({
     "silenceMs",
     String(config.silenceAfterSpeakMs)
   );
-  bridgeUrlObject.searchParams.set(
-    "turnSilenceMs",
-    String(config.turnSilenceMs)
-  );
   if (config.bridgeTtsOutputDeviceId) {
     bridgeUrlObject.searchParams.set(
       "ttsOutputDeviceId",

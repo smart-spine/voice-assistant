@@ -1,234 +1,190 @@
 # Google Meet Voice Bot
 
-Ultra-low-latency voice bot for Google Meet with OpenAI Realtime pipeline and hybrid fallback.
+Ultra-low-latency voice bot for Google Meet with OpenAI Realtime pipeline, secure Control API, and Control-UI voice/settings workflows.
 
 ## Runtime architecture
 
-The bot now has two execution paths:
+### 1) Meet bot runtime
 
-1. `realtime` (recommended)
-- Browser bridge establishes direct WebRTC to OpenAI Realtime.
-- User speech transcription and assistant audio come back over the Realtime data/audio channels.
-- Assistant audio is rendered directly from remote WebRTC track.
-- Barge-in cancels active response immediately (`response.cancel` + output/input buffer clear).
+- `realtime` mode (recommended): bridge page opens direct WebRTC session to OpenAI Realtime.
+- `hybrid` fallback: bridge VAD segments -> OpenAI STT -> LLM stream -> OpenAI TTS.
 
-2. `hybrid` (fallback)
-- Bridge VAD segments -> OpenAI STT (`gpt-4o-*-transcribe`) -> OpenAI chat stream -> OpenAI TTS.
+Switch with `VOICE_PIPELINE_MODE=realtime|hybrid`.
+Fallback is controlled by `VOICE_PIPELINE_FALLBACK_TO_HYBRID=true|false`.
 
-`VOICE_PIPELINE_MODE` controls the primary path.
-`VOICE_PIPELINE_FALLBACK_TO_HYBRID=true` allows automatic fallback if realtime init fails.
+### 2) Control API
 
-## Project structure
+- REST control endpoints for bot lifecycle.
+- Secure config endpoints with validation + preview/apply.
+- Voice websocket endpoint (`/ws/voice`) for browser-to-bot realtime voice sessions.
 
-- `/Users/uladzislaupraskou/voice-assistant/src/index.js` - CLI entrypoint (`npm start`).
-- `/Users/uladzislaupraskou/voice-assistant/src/api.js` - Control API entrypoint (`npm run start:api`).
-- `/Users/uladzislaupraskou/voice-assistant/src/runtime/bot-session.js` - session lifecycle, turn logic, barge-in.
-- `/Users/uladzislaupraskou/voice-assistant/src/runtime/session-manager.js` - single active session manager.
-- `/Users/uladzislaupraskou/voice-assistant/src/transports/bridge-realtime-adapter.js` - bridge-facing realtime controller.
-- `/Users/uladzislaupraskou/voice-assistant/src/openai-stt-service.js` - hybrid STT turn stream.
-- `/Users/uladzislaupraskou/voice-assistant/src/openai-service.js` - OpenAI chat + TTS responder.
-- `/Users/uladzislaupraskou/voice-assistant/src/meet-controller.js` - Puppeteer + bridge wiring.
-- `/Users/uladzislaupraskou/voice-assistant/src/transports/meet-transport-adapter.js` - Meet transport implementation.
-- `/Users/uladzislaupraskou/voice-assistant/src/workflows/call-summary-graph.js` - post-call summary workflow.
-- `/Users/uladzislaupraskou/voice-assistant/public/bridge.html` - browser audio bridge (capture/playback/VAD events).
-- `/Users/uladzislaupraskou/voice-assistant/prompts/system-prompt.txt` - base system prompt.
+### 3) Control-UI
 
-## Requirements
+- Dashboard (API process + bot + logs).
+- `Voice Bot` tab (mic, transcript, assistant audio, latency indicators).
+- `Settings` tab (schema-driven config dictionary with secure apply flow).
 
-- Node.js 18+
-- Google Chrome (or `CHROME_PATH`)
-- OpenAI API key
-- Signed-in Google account in `CHROME_USER_DATA_DIR`
+## Key paths
+
+- `/Users/uladzislaupraskou/voice-assistant/src/api.js` - Control API entrypoint
+- `/Users/uladzislaupraskou/voice-assistant/src/runtime/bot-session.js` - Meet bot session lifecycle
+- `/Users/uladzislaupraskou/voice-assistant/src/api/control-server.js` - REST + WS endpoints
+- `/Users/uladzislaupraskou/voice-assistant/src/api/voice-ws-server.js` - voice WS runtime bridge
+- `/Users/uladzislaupraskou/voice-assistant/src/config-service.js` - secure config preview/apply
+- `/Users/uladzislaupraskou/voice-assistant/src/config-overrides-store.js` - encrypted overrides store
+- `/Users/uladzislaupraskou/voice-assistant/src/config-audit-log.js` - config audit log
+- `/Users/uladzislaupraskou/voice-assistant/control-ui/app/page.js` - tabs UI (Dashboard / Voice Bot / Settings)
 
 ## Quick start
 
 ```bash
 npm install
 cp .env.example .env
-npm start
-```
-
-Required env:
-- `OPENAI_API_KEY`
-- `MEET_URL`
-
-## Control API
-
-```bash
 npm run start:api
 ```
 
-Default address: `http://127.0.0.1:3200`
+Required minimum:
 
-If `CONTROL_API_TOKEN` is set, send:
-`Authorization: Bearer <token>`
+- `OPENAI_API_KEY`
+- `CONTROL_API_TOKEN` (strongly recommended for all non-local environments)
 
-## Control UI
+For direct Meet auto-join session startup (`npm start`), also set:
 
-`/Users/uladzislaupraskou/voice-assistant/control-ui`
+- `MEET_URL`
+
+## Control API endpoints
+
+### Existing bot control
+
+- `GET /health`
+- `GET /api/v1/bot/status`
+- `POST /api/v1/bot/start`
+- `POST /api/v1/bot/stop`
+
+### New secure config endpoints
+
+- `GET /api/v1/config/schema`
+- `GET /api/v1/config?search=...`
+- `PUT /api/v1/config` (validate + preview)
+- `POST /api/v1/config/apply`
+- `GET /api/v1/config/audit`
+
+### Voice session endpoints
+
+- `POST /api/v1/voice/ws-ticket` (short-lived WS auth ticket)
+- `WS /ws/voice` (requires bearer token or valid ticket)
+
+### Restart-request flag endpoint
+
+- `GET /api/v1/restart-request`
+- `POST /api/v1/restart-request`
+
+No remote shell or generic file-edit endpoints are exposed.
+
+## Voice Bot tab (Control-UI)
+
+In `Control-UI -> Voice Bot`:
+
+1. Click `Connect` (WS session to Control API).
+2. Pick microphone/speaker (if browser exposes devices).
+3. Start mic (toggle mode) or hold `Hold To Talk` (PTT mode).
+4. Watch:
+   - user partial/final transcript,
+   - assistant text,
+   - assistant audio playback,
+   - latency counters (STT partial/final, first audio).
+
+## Safe configuration system
+
+### Source precedence
+
+1. Base `.env`
+2. Encrypted UI overrides (`config.overrides.enc`)
+3. Runtime merged config
+
+### Storage
+
+Overrides are encrypted at rest (AES-256-GCM) and written atomically:
+
+- default overrides: `.config/config.overrides.enc`
+- default backups: `.config/config-backups/`
+- default audit log: `.config/config.audit.log`
+
+Set a 32-byte key:
+
+```env
+CONFIG_ENCRYPTION_KEY=...
+```
+
+Accepted formats:
+
+- 64-char hex
+- base64 of 32 bytes
+- raw 32-byte UTF-8 string
+
+### Apply flow
+
+1. UI submits changeset (`set` / `unset`).
+2. Server validates key names + value types + allowlist.
+3. Server returns preview diff.
+4. UI applies by `previewId`.
+5. Server atomically persists encrypted overrides, logs audit entry, updates runtime env.
+
+Sensitive keys are always masked in API responses and audit diff.
+
+## TTS config mapping (OpenAI Speech Create)
+
+Supported vars:
+
+- `OPENAI_TTS_MODEL`
+- `OPENAI_TTS_VOICE`
+- `OPENAI_TTS_VOICE_ID` (if set, used as custom voice object)
+- `OPENAI_TTS_FORMAT`
+- `OPENAI_TTS_INSTRUCTIONS`
+- `OPENAI_TTS_SPEED`
+- `OPENAI_TTS_STREAM_FORMAT`
+
+Runtime uses modern speech params and falls back to legacy payload if provider rejects unknown fields.
+
+## Security model summary
+
+Protected against:
+
+- unauthenticated config/voice API access (bearer token + WS ticket)
+- unauthorized cross-origin browser calls (strict CORS allowlist)
+- plaintext secret exposure (masking + log redaction)
+- unsafe env/file mutation (schema allowlist + dangerous key blocklist)
+- non-atomic config writes (temp + fsync + rename)
+
+Not provided by design:
+
+- remote command execution
+- generic file browser/editor endpoints
+
+## Migration plan (.env -> UI config)
+
+1. Keep current `.env` as base configuration.
+2. Set `CONFIG_ENCRYPTION_KEY` on server.
+3. Restart API once so secure config service is active.
+4. In Control-UI `Settings` tab:
+   - apply non-secret tweaks first,
+   - rotate secrets using new values (never revealed afterward).
+5. Use preview/apply workflow for all further updates.
+6. For changes marked `restart`, restart API process from Control-UI dashboard.
+
+If needed, rollback by restoring latest backup from `.config/config-backups/`.
+
+## Tests
+
+Run root tests:
+
+```bash
+npm test
+```
+
+Run Control-UI build validation:
 
 ```bash
 cd control-ui
-cp .env.example .env
-npm install
-npm run dev
+npm run build
 ```
-
-UI: `http://127.0.0.1:3300`
-
-## Ubuntu / Hetzner runbook
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  xvfb pulseaudio pulseaudio-utils \
-  chromium-browser fonts-liberation fonts-noto-color-emoji
-
-npm install
-cp .env.example .env
-npm run start:api:ubuntu
-```
-
-The ubuntu startup script prepares virtual PulseAudio devices and exports device labels for bridge STT/TTS routing.
-
-## Environment variables
-
-### Core
-- `OPENAI_API_KEY`
-- `MEET_URL`
-- `OPENAI_MODEL`
-- `OPENAI_TEMPERATURE`
-- `SYSTEM_PROMPT_FILE`
-- `SYSTEM_PROMPT`
-
-### Voice pipeline
-- `VOICE_PIPELINE_MODE` (`realtime` or `hybrid`)
-- `VOICE_PIPELINE_FALLBACK_TO_HYBRID`
-
-### Realtime mode
-- `OPENAI_REALTIME_MODEL`
-- `OPENAI_REALTIME_CONNECT_TIMEOUT_MS`
-- `OPENAI_REALTIME_INPUT_TRANSCRIPTION_MODEL`
-- `OPENAI_REALTIME_TURN_DETECTION` (`manual`, `server_vad`, `semantic_vad`)
-- For live voice input, use `server_vad` or `semantic_vad` (not `manual`).
-- `OPENAI_REALTIME_TURN_EAGERNESS`
-- `OPENAI_REALTIME_VAD_THRESHOLD`
-- `OPENAI_REALTIME_VAD_SILENCE_MS`
-- `OPENAI_REALTIME_VAD_PREFIX_PADDING_MS`
-- `OPENAI_REALTIME_INTERRUPT_RESPONSE_ON_TURN`
-
-### Hybrid STT/TTS fallback
-- `OPENAI_STT_MODEL`
-- `OPENAI_STT_LANGUAGE`
-- `OPENAI_STT_CHUNK_MS`
-- `OPENAI_STT_TIMEOUT_MS`
-- `OPENAI_STT_LOG_FINALS`
-- `OPENAI_STT_LOG_PARTIALS`
-- `OPENAI_STT_PARTIALS_ENABLED`
-- `OPENAI_STT_PARTIAL_EMIT_MS`
-- `OPENAI_STT_MAX_RETRIES`
-- `OPENAI_STT_MIN_CHUNK_BYTES`
-- `OPENAI_STT_MAX_QUEUE_CHUNKS`
-- `OPENAI_STT_MIME_TYPE`
-- `OPENAI_STT_DEVICE_ID`
-- `OPENAI_STT_DEVICE_LABEL`
-- `OPENAI_STT_PREFER_LOOPBACK`
-- `OPENAI_STT_AUDIO_BITS_PER_SECOND`
-- `OPENAI_STT_MIN_SIGNAL_PEAK`
-- `OPENAI_STT_VAD_THRESHOLD`
-- `OPENAI_STT_HANGOVER_MS`
-- `OPENAI_STT_SEGMENT_MIN_MS`
-- `OPENAI_STT_SEGMENT_MAX_MS`
-- `OPENAI_TTS_MODEL`
-- `OPENAI_TTS_VOICE`
-- `OPENAI_TTS_FORMAT`
-- `OPENAI_TTS_TIMEOUT_MS`
-- `BRIDGE_TTS_OUTPUT_DEVICE_ID`
-- `BRIDGE_TTS_OUTPUT_DEVICE_LABEL`
-
-### Turn-taking / interruption
-- `TURN_SILENCE_MS`
-- `TURN_CONTINUATION_SILENCE_MS`
-- `POST_TURN_RESPONSE_DELAY_MS`
-- `TURN_STITCH_ENABLED`
-- `TURN_STITCH_WINDOW_MS`
-- `SEMANTIC_EOT_ENABLED`
-- `SEMANTIC_EOT_USE_LLM`
-- `SEMANTIC_EOT_MODEL`
-- `SEMANTIC_EOT_TIMEOUT_MS`
-- `SEMANTIC_EOT_MIN_DELAY_MS`
-- `SEMANTIC_EOT_MAX_DELAY_MS`
-- `BARGE_IN_ENABLED`
-- `BARGE_IN_ON_PARTIALS`
-- `BARGE_IN_ON_VAD_CONFIRMED`
-- `BARGE_IN_VAD_MIN_PEAK`
-- `BARGE_IN_MIN_MS`
-- `BARGE_IN_MIN_WORDS_OPENAI_STT`
-- `BARGE_IN_CONTINUATION_WINDOW_MS`
-- `SOFT_INTERRUPT_ENABLED`
-- `SOFT_INTERRUPT_CONFIRM_MS`
-- `SOFT_INTERRUPT_DUCK_LEVEL`
-- `SILENCE_AFTER_SPEAK_MS`
-- `INBOUND_DEDUP_MS`
-
-### Browser / Meet
-- `HEADLESS`
-- `CHROME_PATH`
-- `CHROME_USER_DATA_DIR`
-- `MEET_ASSUME_LOGGED_IN`
-- `MEET_JOIN_STATE_TIMEOUT_MS`
-- `MEET_JOIN_POLL_MS`
-- `MEET_JOIN_CLICK_ATTEMPTS`
-- `MEET_JOIN_CLICK_RETRY_MS`
-- `BRIDGE_HOST`
-- `BRIDGE_PORT`
-
-### API
-- `CONTROL_API_HOST`
-- `CONTROL_API_PORT`
-- `CONTROL_API_TOKEN`
-- `ALLOW_ANY_MEET_URL`
-
-### Call summary
-- `CALL_SUMMARY_ENABLED`
-- `CALL_SUMMARY_MODEL`
-- `CALL_SUMMARY_TEMPERATURE`
-- `CALL_SUMMARY_MAX_TURNS`
-- `CALL_SUMMARY_MAX_TRANSCRIPT_CHARS`
-- `CALL_SUMMARY_MAX_OUTPUT_CHARS`
-- `CALL_SUMMARY_TIMEOUT_MS`
-
-## Health / control endpoints
-
-```bash
-curl http://127.0.0.1:3200/health
-curl http://127.0.0.1:3200/api/v1/bot/status
-```
-
-Start session:
-
-```bash
-curl -X POST http://127.0.0.1:3200/api/v1/bot/start \
-  -H "Content-Type: application/json" \
-  -d '{
-    "meetUrl": "https://meet.google.com/xxx-xxxx-xxx",
-    "forceRestart": false,
-    "projectContext": {
-      "requestedProduct": "AI sales call assistant"
-    }
-  }'
-```
-
-Stop session:
-
-```bash
-curl -X POST http://127.0.0.1:3200/api/v1/bot/stop \
-  -H "Content-Type: application/json" \
-  -d '{"reason":"manual stop"}'
-```
-
-## Security
-
-- Keep API on localhost unless protected by trusted proxy.
-- Set `CONTROL_API_TOKEN` outside local dev.
-- Do not commit real `.env` secrets.

@@ -586,3 +586,33 @@ test("runAutoGreeting uses realtime adapter when realtime mode is active", async
   assert.equal(called, 1);
   assert.equal(session.autoGreetingCompleted, true);
 });
+
+test("realtime intake completion token triggers session stop", async () => {
+  const session = new BotSession({ config: {} });
+  session.status = "running";
+  session.sessionConfig = {
+    intakeCompleteToken: "[[INTAKE_COMPLETE]]",
+    autoLeaveOnIntakeComplete: true,
+    intakeCompleteLeaveDelayMs: 0
+  };
+
+  let stopReason = "";
+  session.stop = async ({ reason } = {}) => {
+    stopReason = String(reason || "");
+    session.status = "stopped";
+    return session.getStatus();
+  };
+
+  session.handleRealtimeAssistantTextFinal({
+    responseId: "resp_complete",
+    text: "Great, intake is done [[INTAKE_COMPLETE]]"
+  });
+
+  await sleep(30);
+
+  assert.equal(stopReason, "intake complete");
+  assert.equal(
+    session.realtimeAssistantTextByResponseId.resp_complete,
+    "Great, intake is done"
+  );
+});

@@ -1,6 +1,11 @@
 const dotenv = require("dotenv");
 const fs = require("fs");
 const path = require("path");
+const {
+  loadEncryptedOverrides,
+  applyOverridesToProcessEnv,
+  loadDotEnvFile
+} = require("./config-overrides-store");
 
 dotenv.config();
 
@@ -31,6 +36,27 @@ function pickAudioFormat(rawValue) {
     return value;
   }
   return "mp3";
+}
+
+function pickTtsStreamFormat(rawValue) {
+  const value = String(rawValue || "audio")
+    .trim()
+    .toLowerCase();
+  if (["audio", "sse"].includes(value)) {
+    return value;
+  }
+  return "audio";
+}
+
+function parseCsvList(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return [];
+  }
+  return normalized
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function pickVoicePipelineMode(rawValue) {
@@ -101,6 +127,34 @@ function loadSystemPrompt({
   return fallbackPrompt;
 }
 
+function preloadUiManagedOverrides(env = process.env) {
+  const encryptionKey = cleanString(env.CONFIG_ENCRYPTION_KEY);
+  if (!encryptionKey) {
+    return;
+  }
+
+  try {
+    const loaded = loadEncryptedOverrides({
+      overridesFile: env.CONFIG_OVERRIDES_FILE,
+      encryptionKey
+    });
+    const baseDotEnv = loadDotEnvFile(".env");
+    applyOverridesToProcessEnv({
+      overrides: loaded?.payload?.overrides || {},
+      previousOverrides: {},
+      baseDotEnv,
+      env
+    });
+  } catch (err) {
+    // Keep startup resilient; invalid encrypted store should not expose secrets.
+    console.warn(
+      `[CONFIG] UI overrides were not applied: ${String(
+        err?.message || "unknown error"
+      ).replace(/\s+/g, " ")}`
+    );
+  }
+}
+
 function isAllowedMeetUrl(value, { allowAnyMeetUrl = false } = {}) {
   try {
     const parsed = new URL(String(value || ""));
@@ -121,6 +175,8 @@ function isAllowedMeetUrl(value, { allowAnyMeetUrl = false } = {}) {
 const defaultSystemPrompt =
   "You are a helpful assistant in a Google Meet call. Reply briefly and clearly.";
 
+preloadUiManagedOverrides(process.env);
+
 const systemPromptFile = resolvePathFromCwd(
   process.env.SYSTEM_PROMPT_FILE,
   "prompts/system-prompt.txt"
@@ -137,6 +193,14 @@ const config = {
   openaiTtsModel: process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts",
   openaiTtsVoice: process.env.OPENAI_TTS_VOICE || "alloy",
   openaiTtsFormat: pickAudioFormat(process.env.OPENAI_TTS_FORMAT),
+  openaiTtsVoiceId: cleanString(process.env.OPENAI_TTS_VOICE_ID),
+  openaiTtsInstructions: cleanString(process.env.OPENAI_TTS_INSTRUCTIONS),
+  openaiTtsSpeed: asBoundedNumber(process.env.OPENAI_TTS_SPEED, {
+    fallback: 1,
+    min: 0.25,
+    max: 4
+  }),
+  openaiTtsStreamFormat: pickTtsStreamFormat(process.env.OPENAI_TTS_STREAM_FORMAT),
   voicePipelineMode: pickVoicePipelineMode(process.env.VOICE_PIPELINE_MODE),
   voicePipelineFallbackToHybrid: asBoolean(
     process.env.VOICE_PIPELINE_FALLBACK_TO_HYBRID,
@@ -629,6 +693,20 @@ const config = {
   }),
   controlApiHost: cleanString(process.env.CONTROL_API_HOST, "127.0.0.1"),
   controlApiToken: cleanString(process.env.CONTROL_API_TOKEN),
+  controlApiCorsAllowlist: parseCsvList(process.env.CONTROL_API_CORS_ALLOWLIST),
+  configEncryptionKey: cleanString(process.env.CONFIG_ENCRYPTION_KEY),
+  configOverridesFile: cleanString(
+    process.env.CONFIG_OVERRIDES_FILE,
+    ".config/config.overrides.enc"
+  ),
+  configAuditFile: cleanString(
+    process.env.CONFIG_AUDIT_FILE,
+    ".config/config.audit.log"
+  ),
+  configBackupsDir: cleanString(
+    process.env.CONFIG_BACKUPS_DIR,
+    ".config/config-backups"
+  ),
   allowAnyMeetUrl: asBoolean(process.env.ALLOW_ANY_MEET_URL, false),
   headless: asBoolean(process.env.HEADLESS, false),
   chromePath: cleanString(process.env.CHROME_PATH),

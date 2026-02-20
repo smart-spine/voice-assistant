@@ -1,19 +1,29 @@
 # Voice Bot Control UI
 
-Dark-green Next.js dashboard for operating the existing voice-bot stack.
+Control dashboard for Meet Voice Bot operations.
 
-Supports the current backend runtime (OpenAI Realtime pipeline with hybrid fallback).
+## Tabs
 
-## What it does
+- `Dashboard`:
+  - managed API process start/stop
+  - bot start/stop
+  - health/status
+  - live logs
 
-- Starts/stops the local bot Control API process (`npm run start:api` or custom command).
-- Starts/stops bot sessions via existing REST API (`/api/v1/bot/start`, `/api/v1/bot/stop`, `/api/v1/bot/status`).
-- Streams unified logs in one place:
-  - managed API stdout/stderr,
-  - control actions from UI,
-  - network/control errors.
+- `Voice Bot`:
+  - realtime connect/disconnect
+  - mic toggle + push-to-talk mode
+  - input/output device selectors
+  - transcript stream (partial/final)
+  - assistant audio playback
+  - latency indicators (STT partial/final, first audio)
 
-Because bot session logs are emitted by the API process, API + bot logs appear in one stream.
+- `Settings`:
+  - schema-aware config dictionary
+  - add/update/delete keys
+  - preview diff before apply
+  - apply preview by ID
+  - audit log list
 
 ## Quick start
 
@@ -24,38 +34,41 @@ npm install
 npm run dev
 ```
 
-Open: `http://localhost:3300`
+UI: `http://127.0.0.1:3300`
 
 ## Environment
 
-See `.env.example`.
+- `CONTROL_API_BASE_URL` - Control API base URL
+- `CONTROL_API_TOKEN` - bearer token used by server-side proxy routes
+- `MANAGED_API_ENABLED` - allow UI to control local API process
+- `MANAGED_API_COMMAND` - command to launch API
+- `MANAGED_API_CWD` - working directory for managed command
+- `CONTROL_API_TIMEOUT_MS` - default proxy timeout
+- `CONTROL_API_START_TIMEOUT_MS` - longer timeout for `/bot/start`
 
-Key values:
+## Internal routes (UI server)
 
-- `CONTROL_API_BASE_URL` - where existing bot control API is reachable.
-- `CONTROL_API_TOKEN` - optional Bearer token for protected API.
-- `CONTROL_API_START_TIMEOUT_MS` - timeout for `/api/v1/bot/start` (default `120000` ms).
-- `MANAGED_API_ENABLED` - if `true`, UI can start/stop local API process.
-- `MANAGED_API_COMMAND` - command to launch API process.
-- `MANAGED_API_CWD` - working dir for command (default `..`, repo root from `control-ui`).
+- `GET /api/system/state`
+- `POST /api/system/api`
+- `POST /api/system/bot`
+- `GET /api/system/logs`
+- `GET /api/system/logs/stream`
 
-### Ubuntu/Hetzner recommended command
+Config routes:
 
-If API should bootstrap Xvfb/PulseAudio automatically:
+- `GET /api/system/config/schema`
+- `GET /api/system/config`
+- `PUT /api/system/config`
+- `POST /api/system/config/apply`
+- `GET /api/system/config/audit`
 
-```env
-MANAGED_API_COMMAND=npm run start:api:ubuntu
-```
+Voice route:
 
-## Internal API routes (inside control-ui)
+- `POST /api/system/voice/ticket`
 
-- `GET /api/system/state` - snapshot of managed process + remote bot status.
-- `POST /api/system/api` - `{ action: "start" | "stop" }` for managed API process.
-- `POST /api/system/bot` - `{ action: "start" | "stop", ... }` for bot session.
-- `GET /api/system/logs` - buffered logs snapshot.
-- `GET /api/system/logs/stream` - SSE stream for live logs.
+The browser never receives `CONTROL_API_TOKEN` directly; proxy routes add it server-side.
 
-## Production run
+## Production
 
 ```bash
 cd control-ui
@@ -63,4 +76,4 @@ npm run build
 npm run start
 ```
 
-By default `start` binds `0.0.0.0:3300`.
+Default bind: `0.0.0.0:3300`.

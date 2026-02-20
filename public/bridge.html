@@ -70,11 +70,9 @@
       (() => {
         const state = {
           speaking: false,
-          shouldListen: false,
           audioUnlocked: false,
           language: "en-US",
           silenceMs: 1000,
-          turnSilenceMs: 700,
           ttsDuckLevel: 0.22,
           ttsDuckActive: false,
           ttsOutputDeviceId: "",
@@ -216,8 +214,6 @@
           const params = new URLSearchParams(window.location.search);
           state.language = params.get("lang") || state.language;
           state.silenceMs = Number(params.get("silenceMs")) || state.silenceMs;
-          state.turnSilenceMs =
-            Number(params.get("turnSilenceMs")) || state.turnSilenceMs;
           const duckLevel = Number(params.get("ttsDuckLevel"));
           if (Number.isFinite(duckLevel)) {
             state.ttsDuckLevel = Math.max(0, Math.min(1, duckLevel));
@@ -1113,7 +1109,9 @@
             const responseId = String(
               event?.response?.id || state.realtime.currentResponseId || ""
             ).trim();
-            const status = String(event?.response?.status || "unknown").trim() || "unknown";
+            const status = String(
+              event?.response?.status || event?.status || "unknown"
+            ).trim() || "unknown";
             const reason = String(event?.response?.status_details?.reason || "").trim();
             emitRealtimePlaybackEnd({
               interrupted: status !== "completed" && status !== "incomplete"
@@ -1430,7 +1428,7 @@
           try {
             await stopRealtime({ reason: "restart-before-start" }).catch(() => {});
             if (state.stt.active) {
-              stopOpenAiStt({ preserveShouldListen: true });
+              stopOpenAiStt();
             }
             await unlockAudio();
 
@@ -1734,12 +1732,7 @@
           return true;
         }
 
-        function stopOpenAiStt(options = {}) {
-          const preserveShouldListen = Boolean(options.preserveShouldListen);
-          if (!preserveShouldListen) {
-            state.shouldListen = false;
-          }
-
+        function stopOpenAiStt() {
           const stream = state.stt.stream;
           const audioContext = state.stt.audioContext;
           const sourceNode = state.stt.sourceNode;
@@ -1824,7 +1817,6 @@
             return false;
           }
 
-          state.shouldListen = true;
           if (state.stt.active) {
             return true;
           }
@@ -2275,9 +2267,6 @@
           if (Number.isFinite(options.silenceMs)) {
             state.silenceMs = options.silenceMs;
           }
-          if (Number.isFinite(options.turnSilenceMs)) {
-            state.turnSilenceMs = Math.max(120, options.turnSilenceMs);
-          }
           if (Number.isFinite(options.ttsDuckLevel)) {
             state.ttsDuckLevel = Math.max(0, Math.min(1, options.ttsDuckLevel));
             applyCurrentAudioVolume();
@@ -2302,7 +2291,6 @@
         configure({
           language: state.language,
           silenceMs: state.silenceMs,
-          turnSilenceMs: state.turnSilenceMs,
           ttsDuckLevel: state.ttsDuckLevel,
           ttsOutputDeviceId: state.ttsOutputDeviceId,
           ttsOutputDeviceLabel: state.ttsOutputDeviceLabel

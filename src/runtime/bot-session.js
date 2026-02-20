@@ -466,6 +466,10 @@ class BotSession {
       model: this.sessionConfig.openaiModel,
       ttsModel: this.sessionConfig.openaiTtsModel,
       ttsVoice: this.sessionConfig.openaiTtsVoice,
+      ttsVoiceId: this.sessionConfig.openaiTtsVoiceId,
+      ttsInstructions: this.sessionConfig.openaiTtsInstructions,
+      ttsSpeed: this.sessionConfig.openaiTtsSpeed,
+      ttsStreamFormat: this.sessionConfig.openaiTtsStreamFormat,
       ttsFormat: this.sessionConfig.openaiTtsFormat,
       systemPrompt: sessionSystemPrompt,
       maxUserMessageChars: this.sessionConfig.maxUserMessageChars,
@@ -759,11 +763,9 @@ class BotSession {
         );
       }
 
-      const buildBridgeSttOptions = ({ realtime = false } = {}) => ({
+      const buildBridgeSttOptions = () => ({
         chunkMs: this.sessionConfig.openaiSttChunkMs,
-        partialsEnabled: realtime
-          ? true
-          : this.sessionConfig.openaiSttPartialsEnabled,
+        partialsEnabled: this.sessionConfig.openaiSttPartialsEnabled,
         partialEmitMs: this.sessionConfig.openaiSttPartialEmitMs,
         mimeType: this.sessionConfig.openaiSttMimeType,
         deviceId: this.sessionConfig.openaiSttDeviceId,
@@ -861,9 +863,7 @@ class BotSession {
         this.info(
           `OpenAI STT turn settings: turnSilenceMs=${openAiTurnSilenceMs}, vadThreshold=${this.sessionConfig.openaiSttVadThreshold}, hangoverMs=${this.sessionConfig.openaiSttHangoverMs}, segmentMinMs=${this.sessionConfig.openaiSttSegmentMinMs}, segmentMaxMs=${this.sessionConfig.openaiSttSegmentMaxMs}, partialsEnabled=${this.sessionConfig.openaiSttPartialsEnabled}, partialEmitMs=${this.sessionConfig.openaiSttPartialEmitMs}.`
         );
-        const started = await this.transportAdapter.startStt(
-          buildBridgeSttOptions({ realtime: false })
-        );
+        const started = await this.transportAdapter.startStt(buildBridgeSttOptions());
         if (!started) {
           throw new Error(
             "OpenAI STT audio capture could not be started in bridge page."
@@ -1564,17 +1564,30 @@ class BotSession {
 
   handleRealtimeAssistantTextFinal(event = {}) {
     const responseId = normalizeText(event.responseId || "");
-    const text = normalizeText(event.text || "");
-    if (!text) {
+    const rawText = normalizeText(event.text || "");
+    if (!rawText) {
       return;
     }
+    const completionDetected = hasCompletionToken(
+      rawText,
+      this.sessionConfig?.intakeCompleteToken
+    );
+    const text = stripControlTokens(
+      rawText,
+      this.sessionConfig?.intakeCompleteToken
+    );
 
-    if (responseId) {
+    if (responseId && text) {
       this.realtimeAssistantTextByResponseId[responseId] = text;
     }
 
-    this.bot(text);
-    this.rememberBotOutput(text);
+    if (text) {
+      this.bot(text);
+      this.rememberBotOutput(text);
+    }
+    if (completionDetected) {
+      void this.handleIntakeCompletion();
+    }
   }
 
   handleRealtimeResponseDone(event = {}) {
