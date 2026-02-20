@@ -802,6 +802,11 @@ export default function HomePage() {
         return;
       }
 
+      if (type === "input_committed") {
+        appendVoiceDebugLog("event", "upstream input buffer committed");
+        return;
+      }
+
       if (type === "input_rejected") {
         appendVoiceDebugLog(
           "warn",
@@ -902,6 +907,15 @@ export default function HomePage() {
       if (!context || !source) {
         throw new Error("Microphone stream is not initialized.");
       }
+
+      setVoiceMetrics({
+        sttPartialMs: null,
+        sttFinalMs: null,
+        firstAudioMs: null
+      });
+      voiceUserSpeechStartRef.current = 0;
+      voiceLastUserFinalAtRef.current = 0;
+      voiceFirstAudioAfterFinalRef.current = false;
 
       appendVoiceDebugLog(
         "info",
@@ -1037,8 +1051,11 @@ export default function HomePage() {
         appendVoiceDebugLog("info", `mic stop (commit=${commit ? "yes" : "no"})`);
 
         if (commit) {
-          sendVoiceMessage({ type: "commit" });
-          appendVoiceDebugLog("event", "input committed");
+          sendVoiceMessage({
+            type: "commit",
+            create_response: true
+          });
+          appendVoiceDebugLog("event", "input committed + response requested");
         }
       } finally {
         setVoiceBusy((prev) => ({ ...prev, stoppingMic: false }));
@@ -1318,10 +1335,12 @@ export default function HomePage() {
       const target = !voiceConnected
         ? 0
         : assistantActive
-          ? Math.max(0.32, voiceLevel)
+          ? Math.max(0.28, voiceLevel)
           : userActive
-            ? Math.max(0.2, voiceLevel)
-            : 0.08;
+            ? Math.max(0.16, voiceLevel)
+            : voiceRecording
+              ? 0.03
+              : 0.015;
 
       setVoiceOrbLevel((prev) => prev + (target - prev) * 0.24);
 

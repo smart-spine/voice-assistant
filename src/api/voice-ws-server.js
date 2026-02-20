@@ -175,6 +175,16 @@ class VoiceRealtimeBridgeSession {
     this.lastUserSpeechStartedAt = 0;
     this.lastAssistantAudioAt = 0;
     this.lastAssistantTranscript = "";
+    this.lastResponseCreatedAt = 0;
+    this.pendingCommitResponseTimer = null;
+  }
+
+  clearPendingCommitResponseTimer() {
+    if (!this.pendingCommitResponseTimer) {
+      return;
+    }
+    clearTimeout(this.pendingCommitResponseTimer);
+    this.pendingCommitResponseTimer = null;
   }
 
   send(event = {}) {
@@ -294,6 +304,8 @@ class VoiceRealtimeBridgeSession {
     this.ttsSeq = 0;
     this.partialBufferByItem.clear();
     this.assistantTextByResponse.clear();
+    this.lastResponseCreatedAt = 0;
+    this.clearPendingCommitResponseTimer();
     this.lastAssistantAudioAt = 0;
     this.lastAssistantTranscript = "";
 
@@ -399,6 +411,14 @@ class VoiceRealtimeBridgeSession {
       return;
     }
 
+    if (type === "input_audio_buffer.committed") {
+      this.send({
+        type: "input_committed",
+        t_ms: nowMs()
+      });
+      return;
+    }
+
     if (type === "conversation.item.input_audio_transcription.delta") {
       const itemId = String(event?.item_id || "").trim();
       const delta = String(event?.delta || "").trim();
@@ -467,6 +487,8 @@ class VoiceRealtimeBridgeSession {
 
     if (type === "response.created") {
       this.assistantInProgress = true;
+      this.lastResponseCreatedAt = nowMs();
+      this.clearPendingCommitResponseTimer();
       this.send({
         type: "assistant_state",
         state: "speaking",
@@ -593,7 +615,7 @@ class VoiceRealtimeBridgeSession {
     }
   }
 
-  handleAudioChunk({ audioBase64 = "", commit = false } = {}) {
+  handleAudioChunk({ audioBase64 = "", commit = false, createResponse = false } = {}) {
     if (!this.started || !this.upstream) {
       throw new Error("Voice session is not started.");
     }
@@ -608,29 +630,70 @@ class VoiceRealtimeBridgeSession {
     });
 
     if (commit) {
-      this.commitInput();
+      this.commitInput({
+        createResponse,
+        reason: "audio_chunk_commit"
+      });
     }
   }
 
-  commitInput() {
-    if (!this.started) {
-      return;
-    }
-    this.sendUpstream({ type: "input_audio_buffer.commit" });
-    if (this.clientTurnDetection === "manual") {
+  requestResponseFromCommit({ reason = "client_commit", commitAt = nowMs() } = {}) {
+    this.clearPendingCommitResponseTimer();
+    this.pendingCommitResponseTimer = setTimeout(() => {
+      this.pendingCommitResponseTimer = null;
+      if (!this.started || !this.upstream) {
+        return;
+      }
+
+      if (this.assistantInProgress) {
+        return;
+      }
+
+      if (this.lastResponseCreatedAt >= commitAt) {
+        return;
+      }
+
       this.sendUpstream({
         type: "response.create",
         response: {
           modalities: ["audio", "text"]
         }
       });
+
+      this.send({
+        type: "assistant_state",
+        state: "requested",
+        reason: normalizeText(reason) || "client_commit",
+        t_ms: nowMs()
+      });
+    }, 140);
+  }
+
+  commitInput({ createResponse = false, reason = "client_commit" } = {}) {
+    if (!this.started) {
+      return;
     }
+    const commitAt = nowMs();
+    this.clearPendingCommitResponseTimer();
+    this.sendUpstream({ type: "input_audio_buffer.commit" });
+
+    if (this.clientTurnDetection === "manual" || createResponse) {
+      this.requestResponseFromCommit({ reason, commitAt });
+      return;
+    }
+
+    // Safety net: for noisy inputs server_vad may never auto-trigger response on commit.
+    this.requestResponseFromCommit({
+      reason: `${reason}:fallback`,
+      commitAt
+    });
   }
 
   interruptAssistant({ reason = "interrupt" } = {}) {
     if (!this.started) {
       return;
     }
+    this.clearPendingCommitResponseTimer();
     this.sendUpstream({ type: "response.cancel" });
     this.sendUpstream({ type: "output_audio_buffer.clear" });
     this.assistantInProgress = false;
@@ -643,6 +706,7 @@ class VoiceRealtimeBridgeSession {
   }
 
   async stopSession({ reason = "stop" } = {}) {
+    this.clearPendingCommitResponseTimer();
     if (this.upstream) {
       try {
         this.upstream.close();
@@ -657,6 +721,7 @@ class VoiceRealtimeBridgeSession {
     this.assistantTextByResponse.clear();
     this.lastAssistantAudioAt = 0;
     this.lastAssistantTranscript = "";
+    this.lastResponseCreatedAt = 0;
     this.send({
       type: "session_state",
       state: "stopped",
@@ -698,13 +763,19 @@ class VoiceRealtimeBridgeSession {
     if (type === "audio_chunk") {
       this.handleAudioChunk({
         audioBase64: payload.audio_base64 || payload.audioBase64 || "",
-        commit: payload.commit === true
+        commit: payload.commit === true,
+        createResponse:
+          payload.create_response !== false && payload.createResponse !== false
       });
       return;
     }
 
     if (type === "commit") {
-      this.commitInput();
+      this.commitInput({
+        createResponse:
+          payload.create_response !== false && payload.createResponse !== false,
+        reason: "client_commit"
+      });
       return;
     }
 
