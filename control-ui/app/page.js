@@ -301,6 +301,7 @@ export default function HomePage() {
   const [voiceConnected, setVoiceConnected] = useState(false);
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [voiceMode, setVoiceMode] = useState("toggle");
+  const [voiceSettingsOpen, setVoiceSettingsOpen] = useState(false);
   const [voiceUserSpeaking, setVoiceUserSpeaking] = useState(false);
   const [voiceAssistantSpeaking, setVoiceAssistantSpeaking] = useState(false);
   const [voicePlaybackActive, setVoicePlaybackActive] = useState(false);
@@ -1066,6 +1067,7 @@ export default function HomePage() {
     setVoiceUserSpeaking(false);
     setVoiceAssistantSpeaking(false);
     setVoicePlaybackActive(false);
+    setVoiceSettingsOpen(false);
 
     await teardownVoiceMedia();
   }, [appendVoiceDebugLog, teardownVoiceMedia]);
@@ -1153,6 +1155,7 @@ export default function HomePage() {
         setVoiceUserSpeaking(false);
         setVoiceAssistantSpeaking(false);
         setVoicePlaybackActive(false);
+        setVoiceSettingsOpen(false);
       };
 
       socket.onerror = () => {
@@ -1845,7 +1848,9 @@ export default function HomePage() {
             </button>
 
             <button
-              className={`btn ${voiceRecording ? "btn-danger" : ""}`}
+              className={`voice-mic-btn ${
+                voiceRecording ? "is-live" : ""
+              } ${voiceBusy.startMic || voiceBusy.stoppingMic ? "is-busy" : ""}`}
               onClick={() => {
                 if (voiceRecording) {
                   void stopVoiceRecording({ commit: true });
@@ -1854,38 +1859,96 @@ export default function HomePage() {
                 }
               }}
               disabled={!voiceConnected || voiceBusy.startMic || voiceBusy.stoppingMic}
+              aria-label={voiceRecording ? "Stop microphone" : "Start microphone"}
+              title={voiceRecording ? "Stop microphone" : "Start microphone"}
             >
-              {voiceRecording ? "Stop Mic" : "Start Mic"}
+              <span className="voice-mic-icon" aria-hidden>
+                {voiceRecording ? "■" : "🎤"}
+              </span>
             </button>
 
-            <label className="inline-control">
-              <span>Mode</span>
-              <select
-                value={voiceMode}
-                onChange={(event) => {
-                  setVoiceMode(event.target.value);
-                }}
-              >
-                <option value="toggle">Toggle</option>
-                <option value="ptt">Push-to-talk</option>
-              </select>
-            </label>
-
-            <label className="checkbox voice-inline-check">
-              <input
-                type="checkbox"
-                checked={voiceEchoGuardEnabled}
-                onChange={(event) => {
-                  setVoiceEchoGuardEnabled(event.target.checked);
-                }}
-              />
-              <span>Echo guard</span>
-            </label>
+            <button
+              className={`btn btn-ghost icon-btn ${voiceSettingsOpen ? "is-active" : ""}`}
+              onClick={() => {
+                setVoiceSettingsOpen((prev) => !prev);
+              }}
+              aria-label="Toggle voice settings"
+              title="Voice settings"
+            >
+              <span aria-hidden>⚙</span>
+              <span className="sr-only">Voice settings</span>
+            </button>
           </div>
 
           <p className="help voice-help">
-            Echo guard suppresses weak mic chunks while assistant audio is playing to prevent self-trigger loops.
+            Use the mic button to talk. Device/mode options are under the settings gear.
           </p>
+
+          {voiceSettingsOpen ? (
+            <div className="voice-settings-pop">
+              <div className="voice-settings-top">
+                <label className="inline-control">
+                  <span>Mode</span>
+                  <select
+                    value={voiceMode}
+                    onChange={(event) => {
+                      setVoiceMode(event.target.value);
+                    }}
+                  >
+                    <option value="toggle">Toggle</option>
+                    <option value="ptt">Push-to-talk</option>
+                  </select>
+                </label>
+
+                <label className="checkbox voice-inline-check">
+                  <input
+                    type="checkbox"
+                    checked={voiceEchoGuardEnabled}
+                    onChange={(event) => {
+                      setVoiceEchoGuardEnabled(event.target.checked);
+                    }}
+                  />
+                  <span>Echo guard</span>
+                </label>
+              </div>
+
+              <div className="voice-devices">
+                <label>
+                  <span>Input Device</span>
+                  <select
+                    value={voiceSelectedInputId}
+                    onChange={(event) => {
+                      setVoiceSelectedInputId(event.target.value);
+                    }}
+                  >
+                    {voiceInputDevices.length === 0 ? <option value="">Default</option> : null}
+                    {voiceInputDevices.map((item, index) => (
+                      <option key={item.deviceId || index} value={item.deviceId || ""}>
+                        {item.label || `audioinput#${index + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label>
+                  <span>Output Device</span>
+                  <select
+                    value={voiceSelectedOutputId}
+                    onChange={(event) => {
+                      setVoiceSelectedOutputId(event.target.value);
+                    }}
+                  >
+                    {voiceOutputDevices.length === 0 ? <option value="">Default</option> : null}
+                    {voiceOutputDevices.map((item, index) => (
+                      <option key={item.deviceId || index} value={item.deviceId || ""}>
+                        {item.label || `audiooutput#${index + 1}`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+          ) : null}
 
           <div className="voice-orb-stage">
             <div
@@ -1942,52 +2005,6 @@ export default function HomePage() {
               </button>
             </div>
           ) : null}
-
-          <div className="voice-devices">
-            <label>
-              <span>Input Device</span>
-              <select
-                value={voiceSelectedInputId}
-                onChange={(event) => {
-                  setVoiceSelectedInputId(event.target.value);
-                }}
-              >
-                {voiceInputDevices.length === 0 ? <option value="">Default</option> : null}
-                {voiceInputDevices.map((item, index) => (
-                  <option key={item.deviceId || index} value={item.deviceId || ""}>
-                    {item.label || `audioinput#${index + 1}`}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              <span>Output Device</span>
-              <select
-                value={voiceSelectedOutputId}
-                onChange={(event) => {
-                  setVoiceSelectedOutputId(event.target.value);
-                }}
-              >
-                {voiceOutputDevices.length === 0 ? <option value="">Default</option> : null}
-                {voiceOutputDevices.map((item, index) => (
-                  <option key={item.deviceId || index} value={item.deviceId || ""}>
-                    {item.label || `audiooutput#${index + 1}`}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-
-          <div className="voice-meter-row">
-            <div className="voice-meter">
-              <div
-                className="voice-meter-fill"
-                style={{ width: `${Math.round(Math.max(0, Math.min(1, voiceLevel)) * 100)}%` }}
-              />
-            </div>
-            <span className="voice-meter-label">Input level</span>
-          </div>
 
           <div className="voice-latency">
             <span>STT partial: {voiceMetrics.sttPartialMs == null ? "-" : `${voiceMetrics.sttPartialMs} ms`}</span>

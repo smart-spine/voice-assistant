@@ -231,10 +231,10 @@ class VoiceRealtimeBridgeSession {
     const temperature = clampNumber(payload.temperature, {
       fallback: clampNumber(runtimeConfig?.openaiTemperature, {
         fallback: 0.8,
-        min: 0,
+        min: 0.6,
         max: 1.2
       }),
-      min: 0,
+      min: 0.6,
       max: 1.2
     });
 

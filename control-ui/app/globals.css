@@ -427,6 +427,7 @@ textarea {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+  align-items: center;
 }
 
 .inline-control {
@@ -444,6 +445,93 @@ textarea {
   margin-top: 8px;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.icon-btn {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.15rem;
+}
+
+.icon-btn.is-active {
+  border-color: rgba(108, 227, 145, 0.9);
+  background: rgba(25, 92, 65, 0.74);
+}
+
+.voice-mic-btn {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: 1px solid rgba(134, 218, 167, 0.34);
+  background: linear-gradient(145deg, rgba(30, 128, 82, 0.92), rgba(20, 82, 54, 0.9));
+  color: #e8ffef;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.16s ease, background 0.2s ease, border-color 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+.voice-mic-btn:hover:enabled {
+  transform: translateY(-1px);
+  border-color: rgba(108, 227, 145, 0.95);
+  box-shadow: 0 0 0 3px rgba(108, 227, 145, 0.2);
+}
+
+.voice-mic-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.voice-mic-btn.is-live {
+  background: linear-gradient(145deg, rgba(180, 58, 58, 0.95), rgba(137, 35, 35, 0.9));
+  border-color: rgba(255, 158, 158, 0.75);
+}
+
+.voice-mic-btn.is-busy {
+  opacity: 0.76;
+}
+
+.voice-mic-icon {
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.voice-settings-pop {
+  margin-top: 10px;
+  border: 1px solid rgba(110, 199, 150, 0.28);
+  border-radius: 14px;
+  background: rgba(8, 33, 23, 0.78);
+  padding: 10px 12px;
+}
+
+.voice-settings-top {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.voice-settings-pop .voice-devices {
+  margin-top: 10px;
+}
+
 .voice-orb-stage {
   margin-top: 12px;
   border-radius: 16px;
@@ -454,15 +542,15 @@ textarea {
   padding: 12px 14px;
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 20px;
 }
 
 .voice-orb {
   --orb-level: 0;
   --orb-tilt: 0deg;
   position: relative;
-  width: 122px;
-  height: 122px;
+  width: 188px;
+  height: 188px;
   border-radius: 50%;
   transform: scale(calc(0.94 + (var(--orb-level) * 0.3)));
   transition: transform 120ms linear, filter 140ms linear, opacity 200ms ease;
@@ -651,33 +739,6 @@ select:focus {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
-}
-
-.voice-meter-row {
-  margin-top: 14px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.voice-meter {
-  flex: 1;
-  height: 12px;
-  border-radius: 999px;
-  border: 1px solid rgba(110, 199, 150, 0.35);
-  background: rgba(3, 21, 14, 0.9);
-  overflow: hidden;
-}
-
-.voice-meter-fill {
-  height: 100%;
-  background: linear-gradient(90deg, #3cbc7f, #8df2ba);
-  transition: width 0.12s ease;
-}
-
-.voice-meter-label {
-  color: var(--text-1);
-  font-size: 0.84rem;
 }
 
 .voice-latency {
@@ -995,6 +1056,12 @@ select:focus {
     align-items: flex-start;
   }
 
+  .voice-settings-top {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
   .notes {
     grid-column: auto;
   }
@@ -1055,8 +1122,8 @@ select:focus {
   }
 
   .voice-orb {
-    width: 104px;
-    height: 104px;
+    width: 132px;
+    height: 132px;
   }
 
   .voice-orb-stage {
