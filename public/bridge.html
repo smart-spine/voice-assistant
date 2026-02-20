@@ -117,7 +117,10 @@
             lastSegmentDropLogAtMs: 0,
             vadEventActive: false
           },
-          currentPlayback: null
+          currentPlayback: null,
+          playbackQueue: [],
+          playbackQueueWaiters: [],
+          playbackLoopPromise: null
         };
 
         let unlockAudioContext = null;
@@ -662,18 +665,183 @@
           controller.stopHandlers.push(stopHandler);
         }
 
+        function notifyPlaybackQueueWaiters() {
+          if (!Array.isArray(state.playbackQueueWaiters) || !state.playbackQueueWaiters.length) {
+            return;
+          }
+          const waiters = state.playbackQueueWaiters.splice(0);
+          for (const notify of waiters) {
+            try {
+              notify(true);
+            } catch (_) {
+              // Ignore waiter notification errors.
+            }
+          }
+        }
+
+        function waitForPlaybackQueueSignal(timeoutMs = 45) {
+          if (Array.isArray(state.playbackQueue) && state.playbackQueue.length > 0) {
+            return Promise.resolve(true);
+          }
+
+          return new Promise((resolve) => {
+            let settled = false;
+            const complete = (value) => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              resolve(Boolean(value));
+            };
+            const timer = setTimeout(() => complete(false), Math.max(1, timeoutMs));
+            state.playbackQueueWaiters.push(() => {
+              clearTimeout(timer);
+              complete(true);
+            });
+          });
+        }
+
+        function resolveAndClearPlaybackQueue(result = false) {
+          if (!Array.isArray(state.playbackQueue) || state.playbackQueue.length === 0) {
+            return;
+          }
+          const pending = state.playbackQueue.splice(0);
+          for (const item of pending) {
+            try {
+              item?.resolve?.(Boolean(result));
+            } catch (_) {
+              // Ignore queue item resolve errors.
+            }
+          }
+        }
+
+        async function playAudioChunkWithPlayback({
+          audioBase64,
+          mimeType = "audio/mpeg",
+          playback
+        } = {}) {
+          const source = `data:${mimeType};base64,${audioBase64}`;
+          const audio = new Audio(source);
+          audio.preload = "auto";
+          audio.volume = effectiveTtsVolume();
+          await applyTtsOutputDevice(audio);
+          state.currentAudioElement = audio;
+
+          return new Promise((resolve) => {
+            let resolved = false;
+            const done = (ok, errorMessage = "") => {
+              if (resolved) {
+                return;
+              }
+              resolved = true;
+              if (state.currentAudioElement === audio) {
+                state.currentAudioElement = null;
+              }
+              resolve({
+                ok: Boolean(ok),
+                errorMessage: String(errorMessage || "")
+              });
+            };
+
+            attachPlaybackStop(playback, () => {
+              try {
+                audio.pause();
+                audio.currentTime = 0;
+                audio.src = "";
+                audio.load();
+              } catch (_) {
+                // Ignore audio teardown errors.
+              }
+              done(false, "playback interrupted");
+            });
+
+            audio.onended = () => done(true);
+            audio.onerror = () => done(false, "audio element error");
+
+            const playPromise = audio.play();
+            if (playPromise && typeof playPromise.catch === "function") {
+              playPromise.catch((err) => {
+                done(
+                  false,
+                  err?.message || (err instanceof Error ? err.message : String(err))
+                );
+              });
+            }
+          });
+        }
+
+        async function ensureStreamingPlaybackLoop() {
+          if (state.playbackLoopPromise) {
+            return state.playbackLoopPromise;
+          }
+
+          state.playbackLoopPromise = withSpeechLock(async (playback) => {
+            while (!playback.stopped) {
+              if (!Array.isArray(state.playbackQueue) || state.playbackQueue.length === 0) {
+                const hasMore = await waitForPlaybackQueueSignal(45);
+                if (!hasMore || playback.stopped) {
+                  break;
+                }
+              }
+
+              const nextItem = state.playbackQueue.shift();
+              if (!nextItem) {
+                continue;
+              }
+
+              const result = await playAudioChunkWithPlayback({
+                audioBase64: nextItem.audioBase64,
+                mimeType: nextItem.mimeType,
+                playback
+              });
+
+              if (result.ok) {
+                addLog(`synthesized(openai): ${nextItem.spokenText || "<audio>"}`);
+              } else if (result.errorMessage && result.errorMessage !== "playback interrupted") {
+                addLog(`openai-audio play failed: ${result.errorMessage}`);
+              }
+              nextItem.resolve(result.ok);
+            }
+
+            if (playback.stopped) {
+              resolveAndClearPlaybackQueue(false);
+            }
+          })
+            .catch((err) => {
+              addLog(`stream playback loop failed: ${err?.message || err}`);
+              resolveAndClearPlaybackQueue(false);
+            })
+            .finally(() => {
+              state.playbackLoopPromise = null;
+              notifyPlaybackQueueWaiters();
+            });
+
+          return state.playbackLoopPromise;
+        }
+
         function stopSpeaking(options = {}) {
           const flush = options?.flush !== false;
           const resumeGateMs = Number.isFinite(Number(options?.resumeGateMs))
             ? Math.max(0, Math.trunc(Number(options.resumeGateMs)))
             : Math.min(80, Math.max(0, Number(state.silenceMs || 0)));
+          const queuedCount = Array.isArray(state.playbackQueue)
+            ? state.playbackQueue.length
+            : 0;
+          if (queuedCount > 0) {
+            resolveAndClearPlaybackQueue(false);
+            notifyPlaybackQueueWaiters();
+          }
           const playback = state.currentPlayback;
           if (!playback || playback.stopped) {
-            addLog("stopSpeaking ignored: no active playback");
+            if (queuedCount > 0) {
+              addLog(`stopSpeaking cleared queued playback (${queuedCount} chunks)`);
+            } else {
+              addLog("stopSpeaking ignored: no active playback");
+            }
             if (flush) {
               state.stt.gateUntilMs = Date.now() + resumeGateMs;
             }
-            return false;
+            return queuedCount > 0;
           }
 
           playback.stopped = true;
@@ -1166,6 +1334,11 @@
           setSpeechState("speaking");
           state.currentPlayback = playback;
           addLog(`tts playback start (gateMs=${startGateMs})`);
+          emitBridgeEvent({
+            source: "bridge-tts",
+            type: "tts.playback.start",
+            gateMs: startGateMs
+          });
 
           try {
             await unlockAudio();
@@ -1183,6 +1356,12 @@
             addLog(
               `tts playback end (state=${playback.stopped ? "interrupted" : "completed"}, gateMs=${endGateMs})`
             );
+            emitBridgeEvent({
+              source: "bridge-tts",
+              type: "tts.playback.end",
+              gateMs: endGateMs,
+              interrupted: playback.stopped
+            });
           }
         }
 
@@ -1190,65 +1369,40 @@
           const audioBase64 = String(payload.audioBase64 || "").trim();
           const mimeType = String(payload.mimeType || "audio/mpeg").trim();
           const spokenText = String(payload.text || "").trim();
+          const stream = Boolean(payload.stream);
 
           if (!audioBase64) {
             addLog("openai-audio play skipped: empty payload");
             return false;
           }
 
-          let playbackError = null;
+          if (stream) {
+            state.playbackQueue.push({
+              audioBase64,
+              mimeType,
+              spokenText,
+              resolve: () => {}
+            });
+            notifyPlaybackQueueWaiters();
+            void ensureStreamingPlaybackLoop();
+            return true;
+          }
 
+          let playbackResult = { ok: false, errorMessage: "" };
           await withSpeechLock(async (playback) => {
-            const source = `data:${mimeType};base64,${audioBase64}`;
-            const audio = new Audio(source);
-            audio.preload = "auto";
-            audio.volume = effectiveTtsVolume();
-            await applyTtsOutputDevice(audio);
-            state.currentAudioElement = audio;
-
-            await new Promise((resolve) => {
-              let resolved = false;
-              const done = () => {
-                if (resolved) {
-                  return;
-                }
-                resolved = true;
-                resolve();
-              };
-
-              attachPlaybackStop(playback, () => {
-                try {
-                  audio.pause();
-                  audio.currentTime = 0;
-                  audio.src = "";
-                  audio.load();
-                } catch (_) {
-                  // Ignore audio teardown errors.
-                }
-                if (state.currentAudioElement === audio) {
-                  state.currentAudioElement = null;
-                }
-                done();
-              });
-
-              audio.onended = done;
-              audio.onerror = () => {
-                playbackError = new Error("audio element error");
-                done();
-              };
-
-              const playPromise = audio.play();
-              if (playPromise && typeof playPromise.catch === "function") {
-                playPromise.catch((err) => {
-                  playbackError = err instanceof Error ? err : new Error(String(err));
-                  done();
-                });
-              }
+            playbackResult = await playAudioChunkWithPlayback({
+              audioBase64,
+              mimeType,
+              playback
             });
           });
-
-          if (playbackError) {
-            addLog(`openai-audio play failed: ${playbackError.message}`);
+          if (!playbackResult.ok) {
+            if (
+              playbackResult.errorMessage &&
+              playbackResult.errorMessage !== "playback interrupted"
+            ) {
+              addLog(`openai-audio play failed: ${playbackResult.errorMessage}`);
+            }
             return false;
           }
 

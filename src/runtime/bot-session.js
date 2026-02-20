@@ -550,6 +550,18 @@ class BotSession {
         this.markSourceActivity(source);
       }
 
+      if (type === "tts.playback.start") {
+        this.isAssistantAudioPlaying = true;
+        this.lastAssistantAudioAtMs = Date.now();
+        return;
+      }
+
+      if (type === "tts.playback.end") {
+        this.isAssistantAudioPlaying = false;
+        this.lastAssistantAudioAtMs = Date.now();
+        return;
+      }
+
       if (isRealtimeSource && type === "assistant.audio.chunk") {
         this.queueRealtimeAudioPlayback(event);
         return;
@@ -1658,10 +1670,6 @@ class BotSession {
       })
       .catch((err) => {
         this.warn(`Realtime audio queue failure: ${err?.message || err}`);
-      })
-      .finally(() => {
-        this.isAssistantAudioPlaying = false;
-        this.lastAssistantAudioAtMs = Date.now();
       });
   }
 
@@ -1720,6 +1728,7 @@ class BotSession {
         {
           audioBase64: wavBytes.toString("base64"),
           mimeType: "audio/wav",
+          stream: true,
           text: "",
           durationMs: pcm16BytesToMs(pcmChunk.length, sampleRateHz)
         },
@@ -2016,6 +2025,8 @@ class BotSession {
     this.clearRealtimePlaybackIdleFlushTimer();
     this.realtimeResponseInProgress = false;
     this.realtimeCurrentResponseId = "";
+    this.isAssistantAudioPlaying = false;
+    this.lastAssistantAudioAtMs = Date.now();
 
     try {
       if (this.transportAdapter && this.bridgePage) {
