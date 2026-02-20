@@ -120,7 +120,24 @@
           currentPlayback: null,
           playbackQueue: [],
           playbackQueueWaiters: [],
-          playbackLoopPromise: null
+          playbackLoopPromise: null,
+          realtime: {
+            active: false,
+            starting: false,
+            model: "",
+            localStream: null,
+            localTrack: null,
+            peerConnection: null,
+            dataChannel: null,
+            responseInProgress: false,
+            currentResponseId: "",
+            speechActive: false,
+            speechStartedAtMs: 0,
+            bargeInMinMs: 220,
+            userPartialByItem: new Map(),
+            assistantTextByResponse: new Map(),
+            audioElement: null
+          }
         };
 
         let unlockAudioContext = null;
@@ -178,14 +195,20 @@
         }
 
         function applyCurrentAudioVolume() {
-          const audio = state.currentAudioElement;
-          if (!audio) {
-            return;
-          }
-          try {
-            audio.volume = effectiveTtsVolume();
-          } catch (_) {
-            // Ignore runtime audio volume update failures.
+          const volume = effectiveTtsVolume();
+          const audioElements = [
+            state.currentAudioElement,
+            state.realtime?.audioElement || null
+          ];
+          for (const audio of audioElements) {
+            if (!audio) {
+              continue;
+            }
+            try {
+              audio.volume = volume;
+            } catch (_) {
+              // Ignore runtime audio volume update failures.
+            }
           }
         }
 
@@ -817,6 +840,786 @@
             });
 
           return state.playbackLoopPromise;
+        }
+
+        function createRealtimeEventId(prefix = "evt") {
+          return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        }
+
+        function parseLanguageTag(value) {
+          const normalized = String(value || "").trim().toLowerCase();
+          if (!normalized) {
+            return "";
+          }
+          const [primary] = normalized.split("-");
+          if (!primary || primary.length < 2 || primary.length > 3) {
+            return "";
+          }
+          return primary;
+        }
+
+        function buildRealtimeTurnDetection(options = {}) {
+          const type = String(options.turnDetection || "manual")
+            .trim()
+            .toLowerCase();
+          if (type === "server_vad") {
+            return {
+              type: "server_vad",
+              threshold: Number.isFinite(Number(options.vadThreshold))
+                ? Math.max(0, Math.min(1, Number(options.vadThreshold)))
+                : 0.45,
+              silence_duration_ms: Number.isFinite(Number(options.vadSilenceMs))
+                ? Math.max(120, Math.min(2000, Math.trunc(Number(options.vadSilenceMs))))
+                : 280,
+              prefix_padding_ms: Number.isFinite(Number(options.vadPrefixPaddingMs))
+                ? Math.max(0, Math.min(1000, Math.trunc(Number(options.vadPrefixPaddingMs))))
+                : 180,
+              create_response: true,
+              interrupt_response: options.interruptResponseOnTurn !== false
+            };
+          }
+          if (type === "semantic_vad") {
+            const eagerness = String(options.turnDetectionEagerness || "auto")
+              .trim()
+              .toLowerCase();
+            return {
+              type: "semantic_vad",
+              eagerness: ["low", "medium", "high", "auto"].includes(eagerness)
+                ? eagerness
+                : "auto",
+              create_response: true,
+              interrupt_response: options.interruptResponseOnTurn !== false
+            };
+          }
+          return null;
+        }
+
+        function emitRealtimePlaybackStart({ responseId = "" } = {}) {
+          if (state.realtime.responseInProgress) {
+            return;
+          }
+          state.realtime.responseInProgress = true;
+          state.realtime.currentResponseId = String(responseId || "").trim();
+          addLog("tts playback start (gateMs=0, mode=realtime)");
+          emitBridgeEvent({
+            source: "bridge-tts",
+            type: "tts.playback.start",
+            gateMs: 0
+          });
+        }
+
+        function emitRealtimePlaybackEnd({ interrupted = false } = {}) {
+          if (!state.realtime.responseInProgress) {
+            return;
+          }
+          state.realtime.responseInProgress = false;
+          state.realtime.currentResponseId = "";
+          addLog(
+            `tts playback end (state=${interrupted ? "interrupted" : "completed"}, gateMs=0, mode=realtime)`
+          );
+          emitBridgeEvent({
+            source: "bridge-tts",
+            type: "tts.playback.end",
+            gateMs: 0,
+            interrupted: Boolean(interrupted)
+          });
+        }
+
+        function sendRealtimeEvent(event = {}) {
+          const channel = state.realtime.dataChannel;
+          if (!channel || channel.readyState !== "open") {
+            return false;
+          }
+          try {
+            channel.send(JSON.stringify(event));
+            return true;
+          } catch (_) {
+            return false;
+          }
+        }
+
+        function handleRealtimeServerEvent(event = {}) {
+          const type = String(event?.type || "").trim().toLowerCase();
+          if (!type) {
+            return;
+          }
+
+          if (type === "session.created") {
+            const model = String(event?.session?.model || state.realtime.model || "").trim();
+            addLog(`realtime connected (model=${model || "unknown"}).`);
+            return;
+          }
+
+          if (type === "session.updated") {
+            const td = String(event?.session?.turn_detection?.type || "manual").trim();
+            addLog(`realtime session updated (turn_detection=${td || "manual"}).`);
+            return;
+          }
+
+          if (type === "input_audio_buffer.speech_started") {
+            state.realtime.speechActive = true;
+            state.realtime.speechStartedAtMs = Date.now();
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "vad.start",
+              reason: "realtime-speech-started"
+            });
+            return;
+          }
+
+          if (type === "input_audio_buffer.speech_stopped") {
+            const speechMs = Math.max(
+              0,
+              Date.now() - Number(state.realtime.speechStartedAtMs || 0)
+            );
+            if (
+              state.realtime.speechActive &&
+              speechMs >= Math.max(80, Number(state.realtime.bargeInMinMs || 220))
+            ) {
+              emitBridgeEvent({
+                source: "openai-realtime",
+                type: "vad.confirmed",
+                reason: "realtime-speech-stopped",
+                speechMs
+              });
+            }
+            state.realtime.speechActive = false;
+            state.realtime.speechStartedAtMs = 0;
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "vad.stop",
+              reason: "realtime-speech-stopped"
+            });
+            return;
+          }
+
+          if (type === "conversation.item.input_audio_transcription.delta") {
+            const itemId = String(event?.item_id || "").trim();
+            const delta = String(event?.delta || "").trim();
+            if (!itemId || !delta) {
+              return;
+            }
+            const previous = state.realtime.userPartialByItem.get(itemId) || "";
+            const next = `${previous} ${delta}`.replace(/\s+/g, " ").trim();
+            if (!next) {
+              return;
+            }
+            state.realtime.userPartialByItem.set(itemId, next);
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "transcript.partial",
+              text: next,
+              turnId: itemId
+            });
+            return;
+          }
+
+          if (type === "conversation.item.input_audio_transcription.completed") {
+            const itemId = String(event?.item_id || "").trim();
+            const transcript = String(event?.transcript || "").trim();
+            if (itemId) {
+              state.realtime.userPartialByItem.delete(itemId);
+            }
+            if (!transcript) {
+              return;
+            }
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "transcript.final",
+              text: transcript,
+              isFinal: true,
+              turnId: itemId || undefined
+            });
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "turn.final",
+              text: transcript,
+              isFinal: true,
+              turnId: itemId || undefined
+            });
+            return;
+          }
+
+          if (type === "response.created") {
+            const responseId = String(event?.response?.id || "").trim();
+            emitRealtimePlaybackStart({ responseId });
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "assistant.response.started",
+              responseId: responseId || undefined
+            });
+            return;
+          }
+
+          if (type === "response.audio_transcript.delta") {
+            const responseId = String(event?.response_id || "").trim();
+            const delta = String(event?.delta || "").trim();
+            if (!responseId || !delta) {
+              return;
+            }
+            const previous = state.realtime.assistantTextByResponse.get(responseId) || "";
+            const next = `${previous} ${delta}`.replace(/\s+/g, " ").trim();
+            if (!next) {
+              return;
+            }
+            state.realtime.assistantTextByResponse.set(responseId, next);
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "assistant.text.partial",
+              responseId,
+              text: next
+            });
+            return;
+          }
+
+          if (type === "response.audio_transcript.done") {
+            const responseId = String(event?.response_id || "").trim();
+            const transcript = String(event?.transcript || "").trim();
+            if (!responseId || !transcript) {
+              return;
+            }
+            state.realtime.assistantTextByResponse.set(responseId, transcript);
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "assistant.text.final",
+              responseId,
+              text: transcript,
+              isFinal: true
+            });
+            return;
+          }
+
+          if (type === "response.text.done") {
+            const responseId = String(event?.response_id || "").trim();
+            const text = String(event?.text || "").trim();
+            if (!responseId || !text) {
+              return;
+            }
+            if (state.realtime.assistantTextByResponse.has(responseId)) {
+              return;
+            }
+            state.realtime.assistantTextByResponse.set(responseId, text);
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "assistant.text.final",
+              responseId,
+              text,
+              isFinal: true
+            });
+            return;
+          }
+
+          if (type === "response.done") {
+            const responseId = String(
+              event?.response?.id || state.realtime.currentResponseId || ""
+            ).trim();
+            const status = String(event?.response?.status || "unknown").trim() || "unknown";
+            const reason = String(event?.response?.status_details?.reason || "").trim();
+            emitRealtimePlaybackEnd({
+              interrupted: status !== "completed" && status !== "incomplete"
+            });
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "assistant.response.done",
+              responseId: responseId || undefined,
+              status,
+              reason: reason || undefined
+            });
+            return;
+          }
+
+          if (type === "error") {
+            const message =
+              String(event?.error?.message || event?.message || "Realtime transport error.")
+                .replace(/\s+/g, " ")
+                .trim() || "Realtime transport error.";
+            addLog(`realtime error: ${message}`);
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "realtime.error",
+              reason: message
+            });
+          }
+        }
+
+        async function createRealtimeEphemeralSession(options = {}) {
+          const response = await fetch("/realtime/session", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              model: options.model,
+              language: options.language,
+              instructions: options.instructions,
+              voice: options.voice,
+              temperature: options.temperature,
+              inputTranscriptionModel: options.inputTranscriptionModel,
+              turnDetection: options.turnDetection,
+              turnDetectionEagerness: options.turnDetectionEagerness,
+              vadThreshold: options.vadThreshold,
+              vadSilenceMs: options.vadSilenceMs,
+              vadPrefixPaddingMs: options.vadPrefixPaddingMs,
+              interruptResponseOnTurn: options.interruptResponseOnTurn
+            })
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(
+              String(payload?.error?.message || "Failed to create realtime session.")
+            );
+          }
+          const clientSecret = String(payload?.clientSecret || "").trim();
+          if (!clientSecret) {
+            throw new Error("Realtime session token is missing in bridge response.");
+          }
+          return {
+            clientSecret,
+            session: payload?.session || {}
+          };
+        }
+
+        async function resolveRealtimeInputStream(options = {}) {
+          const requestedDeviceId = String(options.inputDeviceId || "").trim();
+          const requestedDeviceLabel = String(options.inputDeviceLabel || "").trim();
+          const preferLoopbackOption = options.inputPreferLoopback;
+
+          const audioConstraints = {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 1
+          };
+
+          let selectedDeviceId = requestedDeviceId;
+          let selectedDeviceLabel = "";
+
+          if (!selectedDeviceId && requestedDeviceLabel) {
+            const devices = await ensureInputLabelsAvailable();
+            const byLabel = findDeviceByLabel(devices, requestedDeviceLabel);
+            if (byLabel?.deviceId) {
+              selectedDeviceId = byLabel.deviceId;
+              selectedDeviceLabel = byLabel.label || "";
+            }
+          } else if (!selectedDeviceId) {
+            const preferLoopback =
+              typeof preferLoopbackOption === "boolean"
+                ? preferLoopbackOption
+                : Boolean(state.stt.preferLoopback);
+            if (preferLoopback) {
+              const devices = await ensureInputLabelsAvailable();
+              const loopback = findLoopbackDevice(devices);
+              if (loopback?.deviceId) {
+                selectedDeviceId = loopback.deviceId;
+                selectedDeviceLabel = loopback.label || "";
+              }
+            }
+          }
+
+          if (selectedDeviceId) {
+            audioConstraints.deviceId = { exact: selectedDeviceId };
+          }
+
+          const requestStream = async (constraints) =>
+            navigator.mediaDevices.getUserMedia({
+              audio: constraints,
+              video: false
+            });
+
+          let stream;
+          try {
+            stream = await requestStream(audioConstraints);
+          } catch (err) {
+            const errorName = String(err?.name || "");
+            const isOverconstrained =
+              errorName === "OverconstrainedError" ||
+              errorName === "ConstraintNotSatisfiedError";
+            if (!isOverconstrained) {
+              throw err;
+            }
+
+            const relaxedWithDevice = selectedDeviceId
+              ? { deviceId: { exact: selectedDeviceId } }
+              : true;
+            try {
+              stream = await requestStream(relaxedWithDevice);
+            } catch (relaxedErr) {
+              const relaxedName = String(relaxedErr?.name || "");
+              const relaxedOverconstrained =
+                relaxedName === "OverconstrainedError" ||
+                relaxedName === "ConstraintNotSatisfiedError";
+              if (!selectedDeviceId || !relaxedOverconstrained) {
+                throw relaxedErr;
+              }
+              stream = await requestStream(true);
+              selectedDeviceId = "";
+              selectedDeviceLabel = "";
+            }
+          }
+
+          if (selectedDeviceLabel) {
+            addLog(
+              `realtime selected input: ${selectedDeviceLabel} [${selectedDeviceId || "default"}]`
+            );
+          }
+
+          return {
+            stream,
+            selectedDeviceId,
+            selectedDeviceLabel
+          };
+        }
+
+        async function waitForDataChannelOpen(channel, timeoutMs = 8000) {
+          if (!channel) {
+            throw new Error("Realtime data channel is not initialized.");
+          }
+          if (channel.readyState === "open") {
+            return true;
+          }
+
+          await new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (fn) => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              cleanup();
+              fn();
+            };
+
+            const cleanup = () => {
+              clearTimeout(timer);
+              channel.removeEventListener("open", onOpen);
+              channel.removeEventListener("error", onError);
+              channel.removeEventListener("close", onClose);
+            };
+
+            const onOpen = () => finish(() => resolve(true));
+            const onError = () => finish(() => reject(new Error("Realtime data channel error.")));
+            const onClose = () =>
+              finish(() => reject(new Error("Realtime data channel closed before opening.")));
+            const timer = setTimeout(() => {
+              finish(() =>
+                reject(new Error(`Realtime data channel open timed out after ${timeoutMs}ms.`))
+              );
+            }, Math.max(1000, Math.trunc(Number(timeoutMs) || 8000)));
+
+            channel.addEventListener("open", onOpen);
+            channel.addEventListener("error", onError);
+            channel.addEventListener("close", onClose);
+          });
+
+          return true;
+        }
+
+        async function stopRealtime(options = {}) {
+          const reason = String(options.reason || "stop").trim() || "stop";
+          const realtime = state.realtime;
+          if (!realtime.active && !realtime.starting) {
+            return false;
+          }
+
+          realtime.starting = false;
+          realtime.active = false;
+          if (realtime.responseInProgress) {
+            emitRealtimePlaybackEnd({ interrupted: true });
+          }
+          realtime.responseInProgress = false;
+          realtime.currentResponseId = "";
+          realtime.speechActive = false;
+          realtime.speechStartedAtMs = 0;
+          realtime.userPartialByItem.clear();
+          realtime.assistantTextByResponse.clear();
+
+          if (realtime.dataChannel) {
+            try {
+              realtime.dataChannel.close();
+            } catch (_) {
+              // Ignore data channel close errors.
+            }
+          }
+          if (realtime.peerConnection) {
+            try {
+              realtime.peerConnection.close();
+            } catch (_) {
+              // Ignore peer connection close errors.
+            }
+          }
+          if (realtime.localStream) {
+            for (const track of realtime.localStream.getTracks()) {
+              try {
+                track.stop();
+              } catch (_) {
+                // Ignore local track stop errors.
+              }
+            }
+          }
+          if (realtime.audioElement) {
+            try {
+              realtime.audioElement.pause();
+              realtime.audioElement.srcObject = null;
+            } catch (_) {
+              // Ignore audio element cleanup errors.
+            }
+          }
+
+          realtime.localStream = null;
+          realtime.localTrack = null;
+          realtime.dataChannel = null;
+          realtime.peerConnection = null;
+          realtime.audioElement = null;
+          realtime.model = "";
+          addLog(`realtime stopped (reason=${reason})`);
+          return true;
+        }
+
+        async function startRealtime(options = {}) {
+          const realtime = state.realtime;
+          if (realtime.active) {
+            return true;
+          }
+          if (realtime.starting) {
+            return false;
+          }
+
+          realtime.starting = true;
+          realtime.bargeInMinMs = Number.isFinite(Number(options.bargeInMinMs))
+            ? Math.max(80, Math.min(5000, Math.trunc(Number(options.bargeInMinMs))))
+            : realtime.bargeInMinMs;
+
+          try {
+            await stopRealtime({ reason: "restart-before-start" }).catch(() => {});
+            if (state.stt.active) {
+              stopOpenAiStt({ preserveShouldListen: true });
+            }
+            await unlockAudio();
+
+            const connectTimeoutMs = Number.isFinite(Number(options.connectTimeoutMs))
+              ? Math.max(1000, Math.min(30000, Math.trunc(Number(options.connectTimeoutMs))))
+              : 8000;
+            const model = String(options.model || "gpt-4o-mini-realtime-preview-2024-12-17")
+              .trim();
+
+            const token = await createRealtimeEphemeralSession({
+              model,
+              language: parseLanguageTag(options.language),
+              instructions: String(options.instructions || ""),
+              voice: String(options.voice || "alloy"),
+              temperature: Number(options.temperature),
+              inputTranscriptionModel: String(
+                options.inputTranscriptionModel || "gpt-4o-mini-transcribe"
+              ),
+              turnDetection: String(options.turnDetection || "manual"),
+              turnDetectionEagerness: String(options.turnDetectionEagerness || "auto"),
+              vadThreshold: Number(options.vadThreshold),
+              vadSilenceMs: Number(options.vadSilenceMs),
+              vadPrefixPaddingMs: Number(options.vadPrefixPaddingMs),
+              interruptResponseOnTurn: options.interruptResponseOnTurn !== false
+            });
+
+            const { stream } = await resolveRealtimeInputStream(options);
+            const connection = new RTCPeerConnection();
+            const dataChannel = connection.createDataChannel("oai-events");
+
+            const realtimeAudio = new Audio();
+            realtimeAudio.autoplay = true;
+            realtimeAudio.playsInline = true;
+            realtimeAudio.volume = effectiveTtsVolume();
+            await applyTtsOutputDevice(realtimeAudio);
+            realtime.audioElement = realtimeAudio;
+
+            connection.ontrack = (event) => {
+              const [streamFromTrack] = event.streams || [];
+              if (streamFromTrack) {
+                realtimeAudio.srcObject = streamFromTrack;
+              }
+            };
+
+            connection.onconnectionstatechange = () => {
+              const stateName = String(connection.connectionState || "unknown");
+              if (stateName === "failed" || stateName === "disconnected") {
+                addLog(`realtime peer connection state: ${stateName}`);
+                emitBridgeEvent({
+                  source: "openai-realtime",
+                  type: "realtime.error",
+                  reason: `peer connection ${stateName}`
+                });
+              }
+            };
+
+            dataChannel.addEventListener("message", (messageEvent) => {
+              try {
+                const parsed = JSON.parse(String(messageEvent?.data || "{}"));
+                handleRealtimeServerEvent(parsed);
+              } catch (_) {
+                // Ignore malformed realtime events.
+              }
+            });
+
+            for (const track of stream.getAudioTracks()) {
+              connection.addTrack(track, stream);
+              realtime.localTrack = track;
+            }
+
+            const offer = await connection.createOffer({
+              offerToReceiveAudio: true
+            });
+            await connection.setLocalDescription(offer);
+
+            const sdpResponse = await fetch(
+              `https://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${token.clientSecret}`,
+                  "Content-Type": "application/sdp"
+                },
+                body: String(offer.sdp || "")
+              }
+            );
+            const answerSdp = await sdpResponse.text();
+            if (!sdpResponse.ok) {
+              throw new Error(
+                `Realtime SDP exchange failed (${sdpResponse.status}): ${answerSdp}`
+              );
+            }
+
+            await connection.setRemoteDescription({
+              type: "answer",
+              sdp: answerSdp
+            });
+            await waitForDataChannelOpen(dataChannel, connectTimeoutMs);
+
+            realtime.model = model;
+            realtime.localStream = stream;
+            realtime.peerConnection = connection;
+            realtime.dataChannel = dataChannel;
+            realtime.active = true;
+
+            sendRealtimeEvent({
+              type: "session.update",
+              event_id: createRealtimeEventId("sess_update"),
+              session: {
+                modalities: ["audio", "text"],
+                instructions: String(options.instructions || ""),
+                voice: String(options.voice || "alloy"),
+                temperature: Number.isFinite(Number(options.temperature))
+                  ? Number(options.temperature)
+                  : 0.8,
+                input_audio_transcription: {
+                  model: String(
+                    options.inputTranscriptionModel || "gpt-4o-mini-transcribe"
+                  ),
+                  language: parseLanguageTag(options.language) || undefined
+                },
+                turn_detection: buildRealtimeTurnDetection(options)
+              }
+            });
+
+            addLog(
+              `realtime started (transport=webrtc, model=${model}, turnDetection=${String(
+                options.turnDetection || "manual"
+              )})`
+            );
+            return true;
+          } catch (err) {
+            await stopRealtime({ reason: "start-failed" }).catch(() => {});
+            const message = String(err?.message || err || "Realtime start failed");
+            addLog(`realtime start failed: ${message}`);
+            emitBridgeEvent({
+              source: "openai-realtime",
+              type: "realtime.error",
+              reason: message
+            });
+            return false;
+          } finally {
+            realtime.starting = false;
+          }
+        }
+
+        async function realtimeCreateTextTurn(payload = {}) {
+          if (!state.realtime.active || !state.realtime.dataChannel) {
+            return false;
+          }
+          const text = String(payload.text || "").trim();
+          if (!text) {
+            return false;
+          }
+          const roleRaw = String(payload.role || "user").trim().toLowerCase();
+          const role = roleRaw === "system" ? "system" : "user";
+          const createResponse = payload.createResponse !== false;
+
+          const created = sendRealtimeEvent({
+            type: "conversation.item.create",
+            event_id: createRealtimeEventId("item_create"),
+            item: {
+              type: "message",
+              role,
+              content: [
+                {
+                  type: "input_text",
+                  text
+                }
+              ]
+            }
+          });
+          if (!created) {
+            return false;
+          }
+
+          if (createResponse) {
+            sendRealtimeEvent({
+              type: "response.create",
+              event_id: createRealtimeEventId("resp_create"),
+              response: {
+                modalities: ["audio", "text"]
+              }
+            });
+          }
+
+          addLog(
+            `realtime text turn created (role=${role}, chars=${text.length}, createResponse=${createResponse})`
+          );
+          return true;
+        }
+
+        async function realtimeAppendSystemContext(note = "") {
+          const text = String(note || "").trim();
+          if (!text) {
+            return false;
+          }
+          return realtimeCreateTextTurn({
+            role: "system",
+            text,
+            createResponse: false
+          });
+        }
+
+        async function realtimeInterrupt(options = {}) {
+          if (!state.realtime.active || !state.realtime.dataChannel) {
+            return false;
+          }
+          sendRealtimeEvent({
+            type: "response.cancel",
+            event_id: createRealtimeEventId("resp_cancel")
+          });
+          sendRealtimeEvent({
+            type: "output_audio_buffer.clear",
+            event_id: createRealtimeEventId("out_clear")
+          });
+          if (options?.clearInputBuffer) {
+            sendRealtimeEvent({
+              type: "input_audio_buffer.clear",
+              event_id: createRealtimeEventId("in_clear")
+            });
+          }
+          emitRealtimePlaybackEnd({ interrupted: true });
+          addLog(
+            `realtime response interrupted (${String(options?.reason || "unknown").trim() || "unknown"}).`
+          );
+          return true;
         }
 
         function stopSpeaking(options = {}) {
@@ -1455,6 +2258,11 @@
           stopOpenAiStt,
           playAudio,
           stopSpeaking,
+          startRealtime,
+          stopRealtime,
+          realtimeCreateTextTurn,
+          realtimeAppendSystemContext,
+          realtimeInterrupt,
           setTtsDucking,
           unlockAudio,
           prepareTtsOutput,

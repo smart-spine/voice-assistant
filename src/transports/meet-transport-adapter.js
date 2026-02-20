@@ -5,6 +5,11 @@ const {
   bridgeSpeakAudio,
   bridgeStopSpeaking,
   bridgeSetTtsDucking,
+  bridgeStartRealtime,
+  bridgeStopRealtime,
+  bridgeRealtimeCreateTextTurn,
+  bridgeRealtimeAppendSystemContext,
+  bridgeRealtimeInterrupt,
   openMeetPage,
   detectMeetJoinState,
   leaveMeetPage
@@ -87,8 +92,49 @@ class MeetTransportAdapter extends BaseTransportAdapter {
     return bridgeSetTtsDucking(this.bridgePage, options);
   }
 
+  async startRealtime(options = {}) {
+    if (!this.bridgePage || this.bridgePage.isClosed()) {
+      throw new Error("Bridge page is unavailable.");
+    }
+    return bridgeStartRealtime(this.bridgePage, options);
+  }
+
+  async stopRealtime() {
+    if (!this.bridgePage || this.bridgePage.isClosed()) {
+      return false;
+    }
+    return bridgeStopRealtime(this.bridgePage);
+  }
+
+  async realtimeCreateTextTurn(payload = {}) {
+    if (!this.bridgePage || this.bridgePage.isClosed()) {
+      throw new Error("Bridge page is unavailable.");
+    }
+    return bridgeRealtimeCreateTextTurn(this.bridgePage, payload);
+  }
+
+  async realtimeAppendSystemContext(note = "") {
+    if (!this.bridgePage || this.bridgePage.isClosed()) {
+      throw new Error("Bridge page is unavailable.");
+    }
+    return bridgeRealtimeAppendSystemContext(this.bridgePage, note);
+  }
+
+  async realtimeInterrupt(options = {}) {
+    if (!this.bridgePage || this.bridgePage.isClosed()) {
+      return false;
+    }
+    return bridgeRealtimeInterrupt(this.bridgePage, options);
+  }
+
   async stop({ leaveMeet = true } = {}) {
     let hasLeftCall = false;
+
+    try {
+      await this.stopRealtime();
+    } catch (_) {
+      // Ignore realtime stop failures during shutdown.
+    }
 
     if (leaveMeet && this.meetPage && !this.meetPage.isClosed()) {
       try {

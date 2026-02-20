@@ -1,16 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { BotSession } = require("../src/runtime/bot-session");
-const { encodeWavFromPcm16 } = require("../src/transports/realtime-transport-adapter");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function createSilentWavBase64({ sampleRate = 24000, durationMs = 120 } = {}) {
-  const frames = Math.max(1, Math.round((sampleRate * durationMs) / 1000));
-  const samples = new Int16Array(frames);
-  const pcmBytes = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
-  const wavBytes = encodeWavFromPcm16(pcmBytes, sampleRate, 1);
-  return wavBytes.toString("base64");
-}
 
 test("inbound dedup keeps transcript expansions for better recognition", () => {
   const session = new BotSession({ config: {} });
@@ -594,66 +585,4 @@ test("runAutoGreeting uses realtime adapter when realtime mode is active", async
 
   assert.equal(called, 1);
   assert.equal(session.autoGreetingCompleted, true);
-});
-
-test("queueRealtimeAudioPlayback coalesces trailing realtime chunks", async () => {
-  const session = new BotSession({ config: {} });
-  session.status = "running";
-  session.activeVoicePipelineMode = "realtime";
-  session.realtimeAdapter = {};
-  session.sessionConfig = {
-    openaiRealtimeOutputChunkMs: 120
-  };
-
-  const played = [];
-  session.playAudioOnBridge = async (payload) => {
-    played.push(payload);
-    return true;
-  };
-
-  const chunkA = createSilentWavBase64({ durationMs: 120 });
-  const chunkB = createSilentWavBase64({ durationMs: 120 });
-  const chunkC = createSilentWavBase64({ durationMs: 120 });
-
-  session.queueRealtimeAudioPlayback({ audioBase64: chunkA, responseId: "resp_1" });
-  session.queueRealtimeAudioPlayback({ audioBase64: chunkB, responseId: "resp_1" });
-  session.queueRealtimeAudioPlayback({ audioBase64: chunkC, responseId: "resp_1" });
-
-  await sleep(80);
-  await session.realtimeAudioPlaybackChain;
-
-  assert.equal(played.length, 2);
-  assert.equal(played[0].durationMs >= 100, true);
-  assert.equal(played[1].durationMs >= 200, true);
-});
-
-test("handleRealtimeResponseDone flushes pending realtime audio buffer", async () => {
-  const session = new BotSession({ config: {} });
-  session.status = "running";
-  session.activeVoicePipelineMode = "realtime";
-  session.realtimeAdapter = {};
-  session.sessionConfig = {
-    openaiRealtimeOutputChunkMs: 120
-  };
-
-  const played = [];
-  session.playAudioOnBridge = async (payload) => {
-    played.push(payload);
-    return true;
-  };
-
-  const chunkA = createSilentWavBase64({ durationMs: 120 });
-  const chunkB = createSilentWavBase64({ durationMs: 120 });
-
-  session.handleRealtimeResponseStarted({ responseId: "resp_2" });
-  session.queueRealtimeAudioPlayback({ audioBase64: chunkA, responseId: "resp_2" });
-  session.queueRealtimeAudioPlayback({ audioBase64: chunkB, responseId: "resp_2" });
-  session.handleRealtimeResponseDone({ responseId: "resp_2", status: "completed" });
-
-  await sleep(30);
-  await session.realtimeAudioPlaybackChain;
-
-  assert.equal(played.length, 2);
-  assert.equal(played[0].durationMs >= 100, true);
-  assert.equal(played[1].durationMs >= 100, true);
 });

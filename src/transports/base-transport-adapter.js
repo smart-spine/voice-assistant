@@ -36,6 +36,28 @@ class BaseTransportAdapter {
     return false;
   }
 
+  async startRealtime() {
+    throw new Error("startRealtime() is not implemented for this transport adapter.");
+  }
+
+  async stopRealtime() {
+    return false;
+  }
+
+  async realtimeCreateTextTurn() {
+    throw new Error(
+      "realtimeCreateTextTurn() is not implemented for this transport adapter."
+    );
+  }
+
+  async realtimeAppendSystemContext() {
+    return false;
+  }
+
+  async realtimeInterrupt() {
+    return false;
+  }
+
   getBridgePage() {
     return null;
   }

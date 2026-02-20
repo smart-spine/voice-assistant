@@ -155,33 +155,6 @@ const config = {
       integer: true
     }
   ),
-  openaiRealtimeInputSampleRateHz: asBoundedNumber(
-    process.env.OPENAI_REALTIME_INPUT_SAMPLE_RATE_HZ,
-    {
-      fallback: 24000,
-      min: 8000,
-      max: 48000,
-      integer: true
-    }
-  ),
-  openaiRealtimeOutputSampleRateHz: asBoundedNumber(
-    process.env.OPENAI_REALTIME_OUTPUT_SAMPLE_RATE_HZ,
-    {
-      fallback: 24000,
-      min: 8000,
-      max: 48000,
-      integer: true
-    }
-  ),
-  openaiRealtimeOutputChunkMs: asBoundedNumber(
-    process.env.OPENAI_REALTIME_OUTPUT_CHUNK_MS,
-    {
-      fallback: 120,
-      min: 40,
-      max: 500,
-      integer: true
-    }
-  ),
   openaiRealtimeInputTranscriptionModel: cleanString(
     process.env.OPENAI_REALTIME_INPUT_TRANSCRIPTION_MODEL,
     "gpt-4o-mini-transcribe"

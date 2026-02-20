@@ -7,10 +7,10 @@ Ultra-low-latency voice bot for Google Meet with OpenAI Realtime pipeline and hy
 The bot now has two execution paths:
 
 1. `realtime` (recommended)
-- Audio from bridge is streamed to OpenAI Realtime WS.
-- User speech transcription and assistant audio come back as realtime events.
-- Assistant audio is played in short chunks for faster first-byte speech.
-- Barge-in cancels active response immediately (`response.cancel` + playback flush).
+- Browser bridge establishes direct WebRTC to OpenAI Realtime.
+- User speech transcription and assistant audio come back over the Realtime data/audio channels.
+- Assistant audio is rendered directly from remote WebRTC track.
+- Barge-in cancels active response immediately (`response.cancel` + output/input buffer clear).
 
 2. `hybrid` (fallback)
 - Bridge VAD segments -> OpenAI STT (`gpt-4o-*-transcribe`) -> OpenAI chat stream -> OpenAI TTS.
@@ -24,7 +24,7 @@ The bot now has two execution paths:
 - `/Users/uladzislaupraskou/voice-assistant/src/api.js` - Control API entrypoint (`npm run start:api`).
 - `/Users/uladzislaupraskou/voice-assistant/src/runtime/bot-session.js` - session lifecycle, turn logic, barge-in.
 - `/Users/uladzislaupraskou/voice-assistant/src/runtime/session-manager.js` - single active session manager.
-- `/Users/uladzislaupraskou/voice-assistant/src/transports/realtime-transport-adapter.js` - OpenAI Realtime WS adapter.
+- `/Users/uladzislaupraskou/voice-assistant/src/transports/bridge-realtime-adapter.js` - bridge-facing realtime controller.
 - `/Users/uladzislaupraskou/voice-assistant/src/openai-stt-service.js` - hybrid STT turn stream.
 - `/Users/uladzislaupraskou/voice-assistant/src/openai-service.js` - OpenAI chat + TTS responder.
 - `/Users/uladzislaupraskou/voice-assistant/src/meet-controller.js` - Puppeteer + bridge wiring.
@@ -108,9 +108,6 @@ The ubuntu startup script prepares virtual PulseAudio devices and exports device
 ### Realtime mode
 - `OPENAI_REALTIME_MODEL`
 - `OPENAI_REALTIME_CONNECT_TIMEOUT_MS`
-- `OPENAI_REALTIME_INPUT_SAMPLE_RATE_HZ`
-- `OPENAI_REALTIME_OUTPUT_SAMPLE_RATE_HZ`
-- `OPENAI_REALTIME_OUTPUT_CHUNK_MS`
 - `OPENAI_REALTIME_INPUT_TRANSCRIPTION_MODEL`
 - `OPENAI_REALTIME_TURN_DETECTION` (`manual`, `server_vad`, `semantic_vad`)
 - `OPENAI_REALTIME_TURN_EAGERNESS`

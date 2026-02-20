@@ -242,6 +242,51 @@ async function bridgeSetTtsDucking(page, options = {}) {
   }, options);
 }
 
+async function bridgeStartRealtime(page, options = {}) {
+  return page.evaluate(async (realtimeOptions) => {
+    if (!window.botBridge?.startRealtime) {
+      return false;
+    }
+    return window.botBridge.startRealtime(realtimeOptions || {});
+  }, options);
+}
+
+async function bridgeStopRealtime(page) {
+  return page.evaluate(async () => {
+    if (!window.botBridge?.stopRealtime) {
+      return false;
+    }
+    return window.botBridge.stopRealtime();
+  });
+}
+
+async function bridgeRealtimeCreateTextTurn(page, payload = {}) {
+  return page.evaluate(async (turnPayload) => {
+    if (!window.botBridge?.realtimeCreateTextTurn) {
+      return false;
+    }
+    return window.botBridge.realtimeCreateTextTurn(turnPayload || {});
+  }, payload);
+}
+
+async function bridgeRealtimeAppendSystemContext(page, note = "") {
+  return page.evaluate(async (text) => {
+    if (!window.botBridge?.realtimeAppendSystemContext) {
+      return false;
+    }
+    return window.botBridge.realtimeAppendSystemContext(String(text || ""));
+  }, note);
+}
+
+async function bridgeRealtimeInterrupt(page, options = {}) {
+  return page.evaluate(async (interruptOptions) => {
+    if (!window.botBridge?.realtimeInterrupt) {
+      return false;
+    }
+    return window.botBridge.realtimeInterrupt(interruptOptions || {});
+  }, options);
+}
+
 async function openMeetPage({ browser, config }) {
   const page = await browser.newPage();
   let meetOrigin;
@@ -616,6 +661,11 @@ module.exports = {
   bridgePrepareTtsOutput,
   bridgeStopSpeaking,
   bridgeSetTtsDucking,
+  bridgeStartRealtime,
+  bridgeStopRealtime,
+  bridgeRealtimeCreateTextTurn,
+  bridgeRealtimeAppendSystemContext,
+  bridgeRealtimeInterrupt,
   openMeetPage,
   detectMeetJoinState,
   leaveMeetPage

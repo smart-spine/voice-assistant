@@ -2,11 +2,7 @@ const { startBridgeServer } = require("../bridge-server");
 const { OpenAIResponder } = require("../openai-service");
 const { launchBrowser } = require("../meet-controller");
 const { createTransportAdapter } = require("../transports/transport-factory");
-const {
-  RealtimeTransportAdapter,
-  extractWavPcm16,
-  encodeWavFromPcm16
-} = require("../transports/realtime-transport-adapter");
+const { BridgeRealtimeAdapter } = require("../transports/bridge-realtime-adapter");
 const { OpenAiSttTurnStream } = require("../openai-stt-service");
 const { SemanticTurnDetector } = require("../semantic-turn-detector");
 const {
@@ -291,26 +287,6 @@ function truncateForLog(text, maxChars = 180) {
   return `${normalized.slice(0, limit)}...`;
 }
 
-const REALTIME_PLAYBACK_IDLE_FLUSH_MS = 24;
-const REALTIME_PLAYBACK_MULTIPLIER = 3.5;
-const REALTIME_PLAYBACK_MAX_MULTIPLIER = 7;
-
-function msToPcm16Bytes(sampleRateHz, durationMs) {
-  const rate = Math.max(8000, Math.trunc(Number(sampleRateHz) || 24000));
-  const ms = Math.max(1, Math.trunc(Number(durationMs) || 1));
-  const raw = Math.max(2, Math.round((rate * 2 * ms) / 1000));
-  return raw % 2 === 0 ? raw : raw + 1;
-}
-
-function pcm16BytesToMs(byteLength, sampleRateHz) {
-  const rate = Math.max(8000, Math.trunc(Number(sampleRateHz) || 24000));
-  const bytes = Math.max(0, Math.trunc(Number(byteLength) || 0));
-  if (!bytes) {
-    return 0;
-  }
-  return Math.max(1, Math.round((bytes / 2 / rate) * 1000));
-}
-
 class BotSession {
   constructor({ config, sessionId } = {}) {
     this.baseConfig = config;
@@ -362,13 +338,6 @@ class BotSession {
     this.realtimePendingUserTurnText = "";
     this.realtimeUserTurnByResponseId = {};
     this.realtimeAssistantTextByResponseId = {};
-    this.realtimeAudioPlaybackChain = Promise.resolve();
-    this.realtimeAudioPlaybackGeneration = 0;
-    this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
-    this.realtimePlaybackSampleRateHz = 0;
-    this.realtimePlaybackCurrentResponseId = "";
-    this.realtimePlaybackFirstChunkSent = false;
-    this.realtimePlaybackIdleFlushTimer = null;
     this.activeSttSource = "";
     this.lastBridgeRecoveryAtMs = 0;
     this.hasProcessedUserTurn = false;
@@ -447,13 +416,6 @@ class BotSession {
     this.realtimePendingUserTurnText = "";
     this.realtimeUserTurnByResponseId = {};
     this.realtimeAssistantTextByResponseId = {};
-    this.realtimeAudioPlaybackChain = Promise.resolve();
-    this.realtimeAudioPlaybackGeneration = 0;
-    this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
-    this.realtimePlaybackSampleRateHz = 0;
-    this.realtimePlaybackCurrentResponseId = "";
-    this.realtimePlaybackFirstChunkSent = false;
-    this.clearRealtimePlaybackIdleFlushTimer();
     this.activeSttSource = "";
     this.lastBridgeRecoveryAtMs = 0;
     this.hasProcessedUserTurn = false;
@@ -491,7 +453,10 @@ class BotSession {
     this.info("Starting bridge server...");
     const { server } = await startBridgeServer(
       this.sessionConfig.bridgePort,
-      this.sessionConfig.bridgeHost
+      this.sessionConfig.bridgeHost,
+      {
+        config: this.sessionConfig
+      }
     );
     this.server = server;
 
@@ -559,11 +524,6 @@ class BotSession {
       if (type === "tts.playback.end") {
         this.isAssistantAudioPlaying = false;
         this.lastAssistantAudioAtMs = Date.now();
-        return;
-      }
-
-      if (isRealtimeSource && type === "assistant.audio.chunk") {
-        this.queueRealtimeAudioPlayback(event);
         return;
       }
 
@@ -755,12 +715,6 @@ class BotSession {
 
       this.bridgeBindings = {
         onAudioChunk: (payload) => {
-          if (this.isRealtimePipelineActive() && this.realtimeAdapter) {
-            void this.realtimeAdapter.appendAudioChunk(payload).catch((err) => {
-              this.warn(`Realtime input audio append failed: ${err?.message || err}`);
-            });
-            return;
-          }
           this.openAiSttStream?.enqueueChunk(payload);
         },
         onBridgeLog: (line) => this.bridge(line),
@@ -828,18 +782,15 @@ class BotSession {
       if (requestedRealtime) {
         try {
           this.info(
-            `Starting realtime voice pipeline (model=${this.sessionConfig.openaiRealtimeModel}, turnDetection=${this.sessionConfig.openaiRealtimeTurnDetection}).`
+            `Starting realtime voice pipeline via bridge WebRTC (model=${this.sessionConfig.openaiRealtimeModel}, turnDetection=${this.sessionConfig.openaiRealtimeTurnDetection}).`
           );
-          this.realtimeAdapter = new RealtimeTransportAdapter({
-            apiKey: this.sessionConfig.openaiApiKey,
+          this.realtimeAdapter = new BridgeRealtimeAdapter({
+            transportAdapter: this.transportAdapter,
             model: this.sessionConfig.openaiRealtimeModel,
             language: this.sessionConfig.openaiSttLanguage,
             instructions: sessionSystemPrompt,
             voice: this.sessionConfig.openaiTtsVoice,
             temperature: this.sessionConfig.openaiTemperature,
-            inputSampleRateHz: this.sessionConfig.openaiRealtimeInputSampleRateHz,
-            outputSampleRateHz: this.sessionConfig.openaiRealtimeOutputSampleRateHz,
-            outputChunkMs: this.sessionConfig.openaiRealtimeOutputChunkMs,
             connectTimeoutMs: this.sessionConfig.openaiRealtimeConnectTimeoutMs,
             inputTranscriptionModel:
               this.sessionConfig.openaiRealtimeInputTranscriptionModel,
@@ -852,25 +803,18 @@ class BotSession {
             interruptResponseOnTurn:
               this.sessionConfig.openaiRealtimeInterruptResponseOnTurn,
             bargeInMinMs: this.sessionConfig.bargeInMinMs,
-            onEvent: handleBridgeEvent,
+            inputDeviceId: this.sessionConfig.openaiSttDeviceId,
+            inputDeviceLabel: this.sessionConfig.openaiSttDeviceLabel,
+            inputPreferLoopback: this.sessionConfig.openaiSttPreferLoopback,
             onLog: (line) => this.bridge(line)
           });
           await this.realtimeAdapter.start();
 
-          const realtimeSttStarted = await this.transportAdapter.startStt(
-            buildBridgeSttOptions({ realtime: true })
-          );
-          if (!realtimeSttStarted) {
-            throw new Error(
-              "Bridge audio capture could not be started for realtime pipeline."
-            );
-          }
-
           this.activeVoicePipelineMode = "realtime";
-          this.activeSttSource = "bridge-input-realtime";
+          this.activeSttSource = "bridge-webrtc-realtime";
           this.openAiSttStream = null;
           this.info(
-            "Realtime voice pipeline is active (WS Realtime API with bridge audio input)."
+            "Realtime voice pipeline is active (browser WebRTC direct track)."
           );
           if (normalizeText(this.sessionConfig?.wakeWord)) {
             this.warn(
@@ -1006,13 +950,6 @@ class BotSession {
         this.realtimePendingUserTurnText = "";
         this.realtimeUserTurnByResponseId = {};
         this.realtimeAssistantTextByResponseId = {};
-        this.realtimeAudioPlaybackChain = Promise.resolve();
-        this.realtimeAudioPlaybackGeneration = 0;
-        this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
-        this.realtimePlaybackSampleRateHz = 0;
-        this.realtimePlaybackCurrentResponseId = "";
-        this.realtimePlaybackFirstChunkSent = false;
-        this.clearRealtimePlaybackIdleFlushTimer();
         this.activeSttSource = "";
         this.lastBridgeRecoveryAtMs = 0;
         this.hasProcessedUserTurn = false;
@@ -1099,13 +1036,6 @@ class BotSession {
         this.realtimePendingUserTurnText = "";
         this.realtimeUserTurnByResponseId = {};
         this.realtimeAssistantTextByResponseId = {};
-        this.realtimeAudioPlaybackChain = Promise.resolve();
-        this.realtimeAudioPlaybackGeneration = 0;
-        this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
-        this.realtimePlaybackSampleRateHz = 0;
-        this.realtimePlaybackCurrentResponseId = "";
-        this.realtimePlaybackFirstChunkSent = false;
-        this.clearRealtimePlaybackIdleFlushTimer();
         this.activeSttSource = "";
         this.responder = null;
         this.lastAcceptedText = "";
@@ -1614,236 +1544,12 @@ class BotSession {
     );
   }
 
-  clearRealtimePlaybackIdleFlushTimer() {
-    if (!this.realtimePlaybackIdleFlushTimer) {
-      return;
-    }
-    clearTimeout(this.realtimePlaybackIdleFlushTimer);
-    this.realtimePlaybackIdleFlushTimer = null;
-  }
-
-  getRealtimePlaybackChunkTargets(sampleRateHz = 24000) {
-    const baseChunkMs = Math.max(
-      60,
-      Math.trunc(Number(this.sessionConfig?.openaiRealtimeOutputChunkMs || 120))
-    );
-    const firstChunkMs = Math.max(80, Math.min(220, baseChunkMs));
-    const steadyChunkMs = Math.max(
-      firstChunkMs + 80,
-      Math.min(900, Math.round(baseChunkMs * REALTIME_PLAYBACK_MULTIPLIER))
-    );
-    const maxBufferMs = Math.max(
-      steadyChunkMs + 120,
-      Math.min(1800, Math.round(baseChunkMs * REALTIME_PLAYBACK_MAX_MULTIPLIER))
-    );
-
-    return {
-      firstChunkBytes: msToPcm16Bytes(sampleRateHz, firstChunkMs),
-      steadyChunkBytes: msToPcm16Bytes(sampleRateHz, steadyChunkMs),
-      maxBufferBytes: msToPcm16Bytes(sampleRateHz, maxBufferMs),
-      idleFlushMs: REALTIME_PLAYBACK_IDLE_FLUSH_MS
-    };
-  }
-
-  enqueueRealtimeAudioPayload(payload = {}, { responseId = "" } = {}) {
-    const generation = this.realtimeAudioPlaybackGeneration;
-    const normalizedResponseId = normalizeText(responseId || "");
-
-    this.realtimeAudioPlaybackChain = this.realtimeAudioPlaybackChain
-      .then(async () => {
-        if (!this.isRealtimePipelineActive()) {
-          return;
-        }
-        if (generation !== this.realtimeAudioPlaybackGeneration) {
-          return;
-        }
-        this.isAssistantAudioPlaying = true;
-        this.lastAssistantAudioAtMs = Date.now();
-        const played = await this.playAudioOnBridge(payload);
-        if (!played) {
-          this.warn(
-            `Realtime audio playback failed${
-              normalizedResponseId ? ` (responseId=${normalizedResponseId})` : ""
-            }.`
-          );
-        }
-      })
-      .catch((err) => {
-        this.warn(`Realtime audio queue failure: ${err?.message || err}`);
-      });
-  }
-
-  flushRealtimePlaybackBuffer({ force = false, responseId = "" } = {}) {
-    if (!this.realtimePlaybackPcmBuffer.length) {
-      this.clearRealtimePlaybackIdleFlushTimer();
-      return 0;
-    }
-
-    const sampleRateHz = Math.max(
-      8000,
-      Math.trunc(
-        Number(
-          this.realtimePlaybackSampleRateHz ||
-            this.sessionConfig?.openaiRealtimeOutputSampleRateHz ||
-            24000
-        )
-      )
-    );
-    const targets = this.getRealtimePlaybackChunkTargets(sampleRateHz);
-    const normalizedResponseId = normalizeText(
-      responseId || this.realtimePlaybackCurrentResponseId || this.realtimeCurrentResponseId
-    );
-    let emittedChunks = 0;
-
-    while (this.realtimePlaybackPcmBuffer.length > 0) {
-      const chunkTargetBytes = this.realtimePlaybackFirstChunkSent
-        ? targets.steadyChunkBytes
-        : targets.firstChunkBytes;
-
-      if (!force && this.realtimePlaybackPcmBuffer.length < chunkTargetBytes) {
-        break;
-      }
-
-      let chunkBytes = force ? this.realtimePlaybackPcmBuffer.length : chunkTargetBytes;
-      if (!force && this.realtimePlaybackPcmBuffer.length > targets.maxBufferBytes) {
-        chunkBytes = Math.min(this.realtimePlaybackPcmBuffer.length, targets.maxBufferBytes);
-      }
-      if (chunkBytes < 2) {
-        break;
-      }
-      if (chunkBytes % 2 !== 0) {
-        chunkBytes -= 1;
-      }
-      if (chunkBytes < 2) {
-        break;
-      }
-
-      const pcmChunk = this.realtimePlaybackPcmBuffer.subarray(0, chunkBytes);
-      this.realtimePlaybackPcmBuffer = this.realtimePlaybackPcmBuffer.subarray(chunkBytes);
-      this.realtimePlaybackFirstChunkSent = true;
-      emittedChunks += 1;
-
-      const wavBytes = encodeWavFromPcm16(pcmChunk, sampleRateHz, 1);
-      this.enqueueRealtimeAudioPayload(
-        {
-          audioBase64: wavBytes.toString("base64"),
-          mimeType: "audio/wav",
-          stream: true,
-          text: "",
-          durationMs: pcm16BytesToMs(pcmChunk.length, sampleRateHz)
-        },
-        { responseId: normalizedResponseId }
-      );
-    }
-
-    if (this.realtimePlaybackPcmBuffer.length === 0) {
-      this.clearRealtimePlaybackIdleFlushTimer();
-    }
-    return emittedChunks;
-  }
-
-  queueRealtimeAudioPlayback(event = {}) {
-    if (!this.isRealtimePipelineActive()) {
-      return;
-    }
-
-    const audioBase64 = normalizeText(event.audioBase64 || "");
-    if (!audioBase64) {
-      return;
-    }
-
-    const responseId = normalizeText(event.responseId || "");
-
-    let decoded;
-    try {
-      decoded = extractWavPcm16(Buffer.from(audioBase64, "base64"));
-    } catch (err) {
-      this.warn(`Realtime audio chunk decode failed: ${err?.message || err}`);
-      return;
-    }
-
-    if (!decoded?.samples?.length) {
-      return;
-    }
-
-    const sampleRateHz = Math.max(8000, Math.trunc(Number(decoded.sampleRate) || 24000));
-    if (
-      this.realtimePlaybackCurrentResponseId &&
-      responseId &&
-      this.realtimePlaybackCurrentResponseId !== responseId
-    ) {
-      this.flushRealtimePlaybackBuffer({
-        force: true,
-        responseId: this.realtimePlaybackCurrentResponseId
-      });
-      this.realtimePlaybackCurrentResponseId = responseId;
-      this.realtimePlaybackFirstChunkSent = false;
-    } else if (responseId && !this.realtimePlaybackCurrentResponseId) {
-      this.realtimePlaybackCurrentResponseId = responseId;
-    }
-
-    if (
-      this.realtimePlaybackSampleRateHz &&
-      this.realtimePlaybackSampleRateHz !== sampleRateHz &&
-      this.realtimePlaybackPcmBuffer.length > 0
-    ) {
-      this.flushRealtimePlaybackBuffer({
-        force: true,
-        responseId:
-          this.realtimePlaybackCurrentResponseId ||
-          responseId ||
-          this.realtimeCurrentResponseId
-      });
-    }
-    this.realtimePlaybackSampleRateHz = sampleRateHz;
-
-    const pcmBytes = Buffer.from(
-      decoded.samples.buffer,
-      decoded.samples.byteOffset,
-      decoded.samples.byteLength
-    );
-    this.realtimePlaybackPcmBuffer = this.realtimePlaybackPcmBuffer.length
-      ? Buffer.concat([this.realtimePlaybackPcmBuffer, pcmBytes])
-      : pcmBytes;
-
-    this.flushRealtimePlaybackBuffer({
-      force: false,
-      responseId: responseId || this.realtimePlaybackCurrentResponseId
-    });
-
-    this.clearRealtimePlaybackIdleFlushTimer();
-    const idleFlushMs = this.getRealtimePlaybackChunkTargets(sampleRateHz).idleFlushMs;
-    this.realtimePlaybackIdleFlushTimer = setTimeout(() => {
-      this.realtimePlaybackIdleFlushTimer = null;
-      this.flushRealtimePlaybackBuffer({
-        force: true,
-        responseId: responseId || this.realtimePlaybackCurrentResponseId
-      });
-    }, idleFlushMs);
-    if (typeof this.realtimePlaybackIdleFlushTimer?.unref === "function") {
-      this.realtimePlaybackIdleFlushTimer.unref();
-    }
-  }
-
   handleRealtimeResponseStarted(event = {}) {
     const responseId = normalizeText(event.responseId || "");
-    if (
-      responseId &&
-      this.realtimePlaybackCurrentResponseId &&
-      this.realtimePlaybackCurrentResponseId !== responseId &&
-      this.realtimePlaybackPcmBuffer.length > 0
-    ) {
-      this.flushRealtimePlaybackBuffer({
-        force: true,
-        responseId: this.realtimePlaybackCurrentResponseId
-      });
-    }
     this.realtimeResponseInProgress = true;
     this.realtimeCurrentResponseId = responseId || this.realtimeCurrentResponseId || "";
-    if (responseId) {
-      this.realtimePlaybackCurrentResponseId = responseId;
-      this.realtimePlaybackFirstChunkSent = false;
-    }
+    this.isAssistantAudioPlaying = true;
+    this.lastAssistantAudioAtMs = Date.now();
     this.setBridgeTtsDucking(false);
     if (responseId && this.realtimePendingUserTurnText) {
       this.realtimeUserTurnByResponseId[responseId] = this.realtimePendingUserTurnText;
@@ -1875,19 +1581,9 @@ class BotSession {
     const responseId = normalizeText(event.responseId || "");
     const status = normalizeText(event.status || "unknown") || "unknown";
     const reason = normalizeText(event.reason || "");
-    this.flushRealtimePlaybackBuffer({
-      force: true,
-      responseId: responseId || this.realtimePlaybackCurrentResponseId
-    });
-    if (
-      !responseId ||
-      !this.realtimePlaybackCurrentResponseId ||
-      this.realtimePlaybackCurrentResponseId === responseId
-    ) {
-      this.realtimePlaybackCurrentResponseId = "";
-      this.realtimePlaybackFirstChunkSent = false;
-    }
     this.realtimeResponseInProgress = false;
+    this.isAssistantAudioPlaying = false;
+    this.lastAssistantAudioAtMs = Date.now();
     if (!responseId || this.realtimeCurrentResponseId === responseId) {
       this.realtimeCurrentResponseId = "";
     }
@@ -2017,12 +1713,6 @@ class BotSession {
 
     this.clearSpeculativePrefetch(`realtime-interrupt:${reason}`);
     this.clearSoftInterrupt({ resumeAudio: false, reason: "realtime hard interrupt" });
-    this.realtimeAudioPlaybackGeneration += 1;
-    this.realtimePlaybackPcmBuffer = Buffer.alloc(0);
-    this.realtimePlaybackSampleRateHz = 0;
-    this.realtimePlaybackCurrentResponseId = "";
-    this.realtimePlaybackFirstChunkSent = false;
-    this.clearRealtimePlaybackIdleFlushTimer();
     this.realtimeResponseInProgress = false;
     this.realtimeCurrentResponseId = "";
     this.isAssistantAudioPlaying = false;
@@ -2079,24 +1769,33 @@ class BotSession {
 
     try {
       this.bridgePage = await this.transportAdapter.reopenBridge();
-      await this.transportAdapter.startStt({
-        chunkMs: this.sessionConfig.openaiSttChunkMs,
-        partialsEnabled: this.isRealtimePipelineActive()
-          ? true
-          : this.sessionConfig.openaiSttPartialsEnabled,
-        partialEmitMs: this.sessionConfig.openaiSttPartialEmitMs,
-        mimeType: this.sessionConfig.openaiSttMimeType,
-        deviceId: this.sessionConfig.openaiSttDeviceId,
-        deviceLabel: this.sessionConfig.openaiSttDeviceLabel,
-        preferLoopback: this.sessionConfig.openaiSttPreferLoopback,
-        audioBitsPerSecond: this.sessionConfig.openaiSttAudioBitsPerSecond,
-        minSignalPeak: this.sessionConfig.openaiSttMinSignalPeak,
-        vadThreshold: this.sessionConfig.openaiSttVadThreshold,
-        hangoverMs: this.sessionConfig.openaiSttHangoverMs,
-        segmentMinMs: this.sessionConfig.openaiSttSegmentMinMs,
-        segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs,
-        bargeInMinMs: this.sessionConfig.bargeInMinMs
-      });
+      if (this.isRealtimePipelineActive()) {
+        if (this.realtimeAdapter) {
+          try {
+            await this.realtimeAdapter.stop();
+          } catch (_) {
+            // Ignore best-effort realtime restart stop errors.
+          }
+          await this.realtimeAdapter.start();
+        }
+      } else {
+        await this.transportAdapter.startStt({
+          chunkMs: this.sessionConfig.openaiSttChunkMs,
+          partialsEnabled: this.sessionConfig.openaiSttPartialsEnabled,
+          partialEmitMs: this.sessionConfig.openaiSttPartialEmitMs,
+          mimeType: this.sessionConfig.openaiSttMimeType,
+          deviceId: this.sessionConfig.openaiSttDeviceId,
+          deviceLabel: this.sessionConfig.openaiSttDeviceLabel,
+          preferLoopback: this.sessionConfig.openaiSttPreferLoopback,
+          audioBitsPerSecond: this.sessionConfig.openaiSttAudioBitsPerSecond,
+          minSignalPeak: this.sessionConfig.openaiSttMinSignalPeak,
+          vadThreshold: this.sessionConfig.openaiSttVadThreshold,
+          hangoverMs: this.sessionConfig.openaiSttHangoverMs,
+          segmentMinMs: this.sessionConfig.openaiSttSegmentMinMs,
+          segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs,
+          bargeInMinMs: this.sessionConfig.bargeInMinMs
+        });
+      }
       this.setBridgeTtsDucking(this.softInterruptActive);
 
       this.info("Bridge page recovered.");
