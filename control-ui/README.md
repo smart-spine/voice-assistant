@@ -39,6 +39,7 @@ UI: `http://127.0.0.1:3300`
 ## Environment
 
 - `CONTROL_API_BASE_URL` - Control API base URL
+- `CONTROL_API_WS_BASE_URL` - public websocket base URL for browser voice sessions (optional override)
 - `CONTROL_API_TOKEN` - bearer token used by server-side proxy routes
 - `MANAGED_API_ENABLED` - allow UI to control local API process
 - `MANAGED_API_COMMAND` - command to launch API
@@ -77,3 +78,12 @@ npm run start
 ```
 
 Default bind: `0.0.0.0:3300`.
+
+## Remote Browser Voice
+
+If UI runs on Ubuntu and browser runs on another machine (e.g. Mac), set:
+
+- `CONTROL_API_BASE_URL=http://127.0.0.1:3200` (server-side proxy calls)
+- `CONTROL_API_WS_BASE_URL=wss://<public-control-api-host>` (browser websocket connect)
+
+Also ensure Control API WS origin allowlist includes your UI origin in `CONTROL_API_CORS_ALLOWLIST`.

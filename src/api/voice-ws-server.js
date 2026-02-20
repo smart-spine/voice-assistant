@@ -262,6 +262,8 @@ class VoiceRealtimeBridgeSession {
         instructions,
         voice,
         temperature,
+        input_audio_format: "pcm16",
+        output_audio_format: "pcm16",
         input_audio_transcription: {
           model: normalizeText(
             payload.inputTranscriptionModel ||
@@ -706,6 +708,12 @@ function attachVoiceWsServer({
       try {
         await session.handleClientMessage(data, isBinary);
       } catch (err) {
+        warn(
+          "VOICE-WS",
+          `bad_request actor=${auth?.actor || "unknown"}: ${redactOpenAiError(
+            err?.message || err
+          )}`
+        );
         session.sendError("bad_request", err?.message || "Invalid voice message.");
       }
     });

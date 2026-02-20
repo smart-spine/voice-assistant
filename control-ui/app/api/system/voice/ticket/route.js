@@ -20,13 +20,15 @@ export async function POST(request) {
   }
 
   const config = getSystemConfig();
-  let wsBaseUrl = "";
-  try {
-    const parsed = new URL(config.controlApiBaseUrl);
-    parsed.protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
-    wsBaseUrl = parsed.toString().replace(/\/$/, "");
-  } catch (_) {
-    wsBaseUrl = "";
+  let wsBaseUrl = String(config.controlApiWsBaseUrl || "").trim();
+  if (!wsBaseUrl) {
+    try {
+      const parsed = new URL(config.controlApiBaseUrl);
+      parsed.protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+      wsBaseUrl = parsed.toString().replace(/\/$/, "");
+    } catch (_) {
+      wsBaseUrl = "";
+    }
   }
 
   return Response.json({

@@ -102,6 +102,55 @@ function base64ToBytes(base64) {
   return bytes;
 }
 
+function downsampleFloat32Buffer(input, inputSampleRate, targetSampleRate) {
+  if (!(input instanceof Float32Array) || input.length === 0) {
+    return new Float32Array(0);
+  }
+
+  const inRate = Number(inputSampleRate) || 0;
+  const outRate = Number(targetSampleRate) || 0;
+  if (!inRate || !outRate || inRate <= outRate) {
+    return input;
+  }
+
+  const ratio = inRate / outRate;
+  const outputLength = Math.max(1, Math.round(input.length / ratio));
+  const output = new Float32Array(outputLength);
+
+  let inputOffset = 0;
+  for (let outputOffset = 0; outputOffset < outputLength; outputOffset += 1) {
+    const nextInputOffset = Math.min(
+      input.length,
+      Math.round((outputOffset + 1) * ratio)
+    );
+
+    let sum = 0;
+    let count = 0;
+    for (let index = inputOffset; index < nextInputOffset; index += 1) {
+      sum += input[index];
+      count += 1;
+    }
+    output[outputOffset] = count > 0 ? sum / count : 0;
+    inputOffset = nextInputOffset;
+  }
+
+  return output;
+}
+
+function float32ToPcm16Bytes(input) {
+  const source = input instanceof Float32Array ? input : new Float32Array(0);
+  const bytes = new Uint8Array(source.length * 2);
+  const view = new DataView(bytes.buffer);
+
+  for (let index = 0; index < source.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, source[index]));
+    const scaled = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    view.setInt16(index * 2, Math.round(scaled), true);
+  }
+
+  return bytes;
+}
+
 function pcm16Base64ToWavBlob(base64, sampleRate = 24000) {
   const pcmBytes = base64ToBytes(base64);
   const pcm16 = new Int16Array(
@@ -235,8 +284,10 @@ export default function HomePage() {
 
   const voiceSocketRef = useRef(null);
   const voiceStreamRef = useRef(null);
-  const voiceMediaRecorderRef = useRef(null);
   const voiceAnalyserRef = useRef(null);
+  const voiceSourceNodeRef = useRef(null);
+  const voiceCaptureProcessorRef = useRef(null);
+  const voiceCaptureSinkRef = useRef(null);
   const voiceAudioContextRef = useRef(null);
   const voiceAnalyserTimerRef = useRef(null);
   const voiceAudioPlaybackChainRef = useRef(Promise.resolve());
@@ -316,15 +367,32 @@ export default function HomePage() {
   const teardownVoiceMedia = useCallback(async () => {
     teardownVoiceAnalyser();
 
-    if (voiceMediaRecorderRef.current) {
+    if (voiceCaptureProcessorRef.current) {
       try {
-        if (voiceMediaRecorderRef.current.state !== "inactive") {
-          voiceMediaRecorderRef.current.stop();
-        }
+        voiceCaptureProcessorRef.current.disconnect();
       } catch (_) {
-        // Ignore stop errors.
+        // Ignore processor disconnect errors.
       }
-      voiceMediaRecorderRef.current = null;
+      voiceCaptureProcessorRef.current.onaudioprocess = null;
+      voiceCaptureProcessorRef.current = null;
+    }
+
+    if (voiceCaptureSinkRef.current) {
+      try {
+        voiceCaptureSinkRef.current.disconnect();
+      } catch (_) {
+        // Ignore sink disconnect errors.
+      }
+      voiceCaptureSinkRef.current = null;
+    }
+
+    if (voiceSourceNodeRef.current) {
+      try {
+        voiceSourceNodeRef.current.disconnect();
+      } catch (_) {
+        // Ignore source disconnect errors.
+      }
+      voiceSourceNodeRef.current = null;
     }
 
     if (voiceStreamRef.current) {
@@ -600,6 +668,7 @@ export default function HomePage() {
 
     voiceAudioContextRef.current = context;
     voiceAnalyserRef.current = analyser;
+    voiceSourceNodeRef.current = source;
 
     if (voiceAnalyserTimerRef.current) {
       clearInterval(voiceAnalyserTimerRef.current);
@@ -622,7 +691,7 @@ export default function HomePage() {
   }, [voiceSelectedInputId]);
 
   const startVoiceRecording = useCallback(async () => {
-    if (voiceMediaRecorderRef.current?.state === "recording") {
+    if (voiceCaptureProcessorRef.current) {
       return true;
     }
 
@@ -633,48 +702,57 @@ export default function HomePage() {
         throw new Error("Voice socket is not connected.");
       }
 
-      const stream = await ensureVoiceMedia();
-      const preferredMime =
-        typeof MediaRecorder !== "undefined" &&
-        MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
-          : "audio/webm";
+      await ensureVoiceMedia();
+      const context = voiceAudioContextRef.current;
+      const source = voiceSourceNodeRef.current;
+      if (!context || !source) {
+        throw new Error("Microphone stream is not initialized.");
+      }
 
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: preferredMime,
-        audioBitsPerSecond: 96000
-      });
+      const processor = context.createScriptProcessor(2048, 1, 1);
+      const silentSink = context.createGain();
+      silentSink.gain.value = 0;
 
-      mediaRecorder.ondataavailable = async (mediaEvent) => {
+      processor.onaudioprocess = (audioEvent) => {
         try {
-          if (!mediaEvent?.data || mediaEvent.data.size <= 0) {
-            return;
-          }
-
           const ws = voiceSocketRef.current;
           if (!ws || ws.readyState !== WebSocket.OPEN) {
             return;
           }
-
-          if (ws.bufferedAmount > 4 * 1024 * 1024) {
+          if (ws.bufferedAmount > 2 * 1024 * 1024) {
             return;
           }
 
-          const arrayBuffer = await mediaEvent.data.arrayBuffer();
-          const bytes = new Uint8Array(arrayBuffer);
-          const audioBase64 = bytesToBase64(bytes);
+          const input = audioEvent?.inputBuffer?.getChannelData(0);
+          if (!input || input.length === 0) {
+            return;
+          }
+
+          const normalized = downsampleFloat32Buffer(input, context.sampleRate, 24000);
+          if (!normalized.length) {
+            return;
+          }
+
+          const pcmBytes = float32ToPcm16Bytes(normalized);
+          if (!pcmBytes.length) {
+            return;
+          }
+
           sendVoiceMessage({
             type: "audio_chunk",
-            audio_base64: audioBase64,
-            mime_type: preferredMime
+            audio_base64: bytesToBase64(pcmBytes)
           });
         } catch (_) {
-          // Ignore chunk processing errors.
+          // Ignore per-chunk audio processing errors.
         }
       };
 
-      mediaRecorder.start(80);
-      voiceMediaRecorderRef.current = mediaRecorder;
+      source.connect(processor);
+      processor.connect(silentSink);
+      silentSink.connect(context.destination);
+
+      voiceCaptureProcessorRef.current = processor;
+      voiceCaptureSinkRef.current = silentSink;
       setVoiceRecording(true);
       pushNotice("success", "Microphone is live.");
       return true;
@@ -690,11 +768,25 @@ export default function HomePage() {
     async ({ commit = true } = {}) => {
       setVoiceBusy((prev) => ({ ...prev, stoppingMic: true }));
       try {
-        const recorder = voiceMediaRecorderRef.current;
-        if (recorder && recorder.state !== "inactive") {
-          recorder.stop();
+        if (voiceCaptureProcessorRef.current) {
+          try {
+            voiceCaptureProcessorRef.current.disconnect();
+          } catch (_) {
+            // Ignore processor disconnect errors.
+          }
+          voiceCaptureProcessorRef.current.onaudioprocess = null;
+          voiceCaptureProcessorRef.current = null;
         }
-        voiceMediaRecorderRef.current = null;
+
+        if (voiceCaptureSinkRef.current) {
+          try {
+            voiceCaptureSinkRef.current.disconnect();
+          } catch (_) {
+            // Ignore sink disconnect errors.
+          }
+          voiceCaptureSinkRef.current = null;
+        }
+
         setVoiceRecording(false);
 
         if (commit) {

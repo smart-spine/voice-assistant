@@ -34,9 +34,34 @@ function normalizeBaseUrl(raw) {
   }
 }
 
+function normalizeWsBaseUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol === "http:") {
+      parsed.protocol = "ws:";
+    } else if (parsed.protocol === "https:") {
+      parsed.protocol = "wss:";
+    }
+
+    if (!["ws:", "wss:"].includes(parsed.protocol)) {
+      return "";
+    }
+
+    return parsed.toString().replace(/\/$/, "");
+  } catch (_) {
+    return "";
+  }
+}
+
 export function getSystemConfig() {
   return {
     controlApiBaseUrl: normalizeBaseUrl(process.env.CONTROL_API_BASE_URL),
+    controlApiWsBaseUrl: normalizeWsBaseUrl(process.env.CONTROL_API_WS_BASE_URL),
     controlApiToken: String(process.env.CONTROL_API_TOKEN || "").trim(),
     controlApiTimeoutMs: asInteger(process.env.CONTROL_API_TIMEOUT_MS, 8000, 1000, 60000),
     controlApiStartTimeoutMs: asInteger(
