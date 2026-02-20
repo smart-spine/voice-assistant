@@ -231,6 +231,7 @@ export default function HomePage() {
     apply: false,
     audit: false
   });
+  const configSearchRef = useRef("");
 
   const voiceSocketRef = useRef(null);
   const voiceStreamRef = useRef(null);
@@ -830,23 +831,26 @@ export default function HomePage() {
     setConfigSchema(payload?.data?.schema || []);
   }, []);
 
-  const loadSettingsSnapshot = useCallback(async () => {
-    const query = configSearch ? `?search=${encodeURIComponent(configSearch)}` : "";
+  const loadSettingsSnapshot = useCallback(async (searchValue = "") => {
+    const normalizedSearch = String(searchValue || "").trim();
+    const query = normalizedSearch
+      ? `?search=${encodeURIComponent(normalizedSearch)}`
+      : "";
     const payload = await fetchJson(`/api/system/config${query}`);
     setConfigEntries(payload?.data?.entries || []);
-  }, [configSearch]);
+  }, []);
 
   const loadSettingsAudit = useCallback(async () => {
     const payload = await fetchJson("/api/system/config/audit?limit=120");
     setConfigAuditEntries(payload?.data?.entries || []);
   }, []);
 
-  const refreshSettings = useCallback(async () => {
+  const refreshSettings = useCallback(async (searchValue = "") => {
     setConfigBusy((prev) => ({ ...prev, loading: true }));
     try {
       await Promise.all([
         loadSettingsSchema(),
-        loadSettingsSnapshot(),
+        loadSettingsSnapshot(searchValue),
         loadSettingsAudit()
       ]);
     } catch (err) {
@@ -928,8 +932,12 @@ export default function HomePage() {
   }, [logs, autoScroll]);
 
   useEffect(() => {
+    configSearchRef.current = configSearch;
+  }, [configSearch]);
+
+  useEffect(() => {
     if (activeTab === TAB_SETTINGS) {
-      void refreshSettings();
+      void refreshSettings(configSearchRef.current);
     }
   }, [activeTab, refreshSettings]);
 
@@ -1121,7 +1129,7 @@ export default function HomePage() {
       setConfigUnsetKeys([]);
       setConfigNewKey("");
       setConfigNewValue("");
-      await refreshSettings();
+      await refreshSettings(configSearchRef.current);
       pushNotice(
         "success",
         "Config applied. If restart-required keys changed, restart the API process."
@@ -1559,7 +1567,7 @@ export default function HomePage() {
               <button
                 className="btn btn-ghost"
                 onClick={() => {
-                  void refreshSettings();
+                  void refreshSettings(configSearch);
                 }}
                 disabled={configBusy.loading}
               >
@@ -1597,7 +1605,7 @@ export default function HomePage() {
             <button
               className="btn btn-ghost"
               onClick={() => {
-                void loadSettingsSnapshot();
+                void loadSettingsSnapshot(configSearch);
               }}
             >
               Search

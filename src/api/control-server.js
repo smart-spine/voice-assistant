@@ -369,7 +369,7 @@ async function startControlServer({
 
   const configRateLimiter = createRateLimiter({
     windowMs: 60_000,
-    limit: 30,
+    limit: 240,
     keyFn: (req) => `cfg:${req.ip || "unknown"}`
   });
 
