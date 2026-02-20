@@ -1183,6 +1183,9 @@
           const requestedDeviceId = String(options.inputDeviceId || "").trim();
           const requestedDeviceLabel = String(options.inputDeviceLabel || "").trim();
           const preferLoopbackOption = options.inputPreferLoopback;
+          const strictRequestedInput = Boolean(
+            requestedDeviceId || requestedDeviceLabel
+          );
 
           const audioConstraints = {
             echoCancellation: false,
@@ -1191,15 +1194,44 @@
             channelCount: 1
           };
 
+          const devices = await ensureInputLabelsAvailable();
+          if (devices.length > 0) {
+            addLog(
+              `realtime audio inputs: ${devices
+                .map((device, index) => formatDeviceLabel(device, index))
+                .join(" | ")}`
+            );
+          } else {
+            addLog("realtime audio inputs: none detected");
+          }
+
           let selectedDeviceId = requestedDeviceId;
           let selectedDeviceLabel = "";
 
+          if (selectedDeviceId) {
+            const byId =
+              devices.find(
+                (device) =>
+                  String(device?.deviceId || "").trim() === selectedDeviceId
+              ) || null;
+            if (byId?.label) {
+              selectedDeviceLabel = byId.label;
+            } else if (strictRequestedInput) {
+              throw new Error(
+                `Realtime input deviceId is not available: ${selectedDeviceId}`
+              );
+            }
+          }
+
           if (!selectedDeviceId && requestedDeviceLabel) {
-            const devices = await ensureInputLabelsAvailable();
             const byLabel = findDeviceByLabel(devices, requestedDeviceLabel);
             if (byLabel?.deviceId) {
               selectedDeviceId = byLabel.deviceId;
               selectedDeviceLabel = byLabel.label || "";
+            } else {
+              throw new Error(
+                `Realtime input device label not found: "${requestedDeviceLabel}"`
+              );
             }
           } else if (!selectedDeviceId) {
             const preferLoopback =
@@ -1207,7 +1239,6 @@
                 ? preferLoopbackOption
                 : Boolean(state.stt.preferLoopback);
             if (preferLoopback) {
-              const devices = await ensureInputLabelsAvailable();
               const loopback = findLoopbackDevice(devices);
               if (loopback?.deviceId) {
                 selectedDeviceId = loopback.deviceId;
@@ -1248,6 +1279,13 @@
               const relaxedOverconstrained =
                 relaxedName === "OverconstrainedError" ||
                 relaxedName === "ConstraintNotSatisfiedError";
+              if (strictRequestedInput) {
+                throw new Error(
+                  `Realtime input device became unavailable: ${
+                    relaxedErr?.message || relaxedErr
+                  }`
+                );
+              }
               if (!selectedDeviceId || !relaxedOverconstrained) {
                 throw relaxedErr;
               }
@@ -1257,11 +1295,11 @@
             }
           }
 
-          if (selectedDeviceLabel) {
-            addLog(
-              `realtime selected input: ${selectedDeviceLabel} [${selectedDeviceId || "default"}]`
-            );
-          }
+          addLog(
+            `realtime selected input: ${
+              selectedDeviceLabel || "default input"
+            } [${selectedDeviceId || "default"}]`
+          );
 
           return {
             stream,
@@ -1401,6 +1439,20 @@
               : 8000;
             const model = String(options.model || "gpt-4o-mini-realtime-preview-2024-12-17")
               .trim();
+            const requestedTurnDetection = String(
+              options.turnDetection || "semantic_vad"
+            )
+              .trim()
+              .toLowerCase();
+            const effectiveTurnDetection =
+              requestedTurnDetection === "manual"
+                ? "semantic_vad"
+                : requestedTurnDetection;
+            if (effectiveTurnDetection !== requestedTurnDetection) {
+              addLog(
+                "realtime turn_detection=manual disables live audio turns; using semantic_vad."
+              );
+            }
 
             const token = await createRealtimeEphemeralSession({
               model,
@@ -1411,7 +1463,7 @@
               inputTranscriptionModel: String(
                 options.inputTranscriptionModel || "gpt-4o-mini-transcribe"
               ),
-              turnDetection: String(options.turnDetection || "manual"),
+              turnDetection: effectiveTurnDetection,
               turnDetectionEagerness: String(options.turnDetectionEagerness || "auto"),
               vadThreshold: Number(options.vadThreshold),
               vadSilenceMs: Number(options.vadSilenceMs),
@@ -1514,13 +1566,16 @@
                   ),
                   language: parseLanguageTag(options.language) || undefined
                 },
-                turn_detection: buildRealtimeTurnDetection(options)
+                turn_detection: buildRealtimeTurnDetection({
+                  ...options,
+                  turnDetection: effectiveTurnDetection
+                })
               }
             });
 
             addLog(
               `realtime started (transport=webrtc, model=${model}, turnDetection=${String(
-                options.turnDetection || "manual"
+                effectiveTurnDetection
               )})`
             );
             return true;

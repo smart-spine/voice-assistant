@@ -48,7 +48,12 @@ class BridgeRealtimeAdapter {
     this.inputTranscriptionModel = String(
       inputTranscriptionModel || "gpt-4o-mini-transcribe"
     ).trim();
-    this.turnDetection = String(turnDetection || "manual").trim().toLowerCase();
+    this.turnDetection = String(turnDetection || "semantic_vad")
+      .trim()
+      .toLowerCase();
+    if (!["manual", "server_vad", "semantic_vad"].includes(this.turnDetection)) {
+      this.turnDetection = "semantic_vad";
+    }
     this.turnDetectionEagerness = String(turnDetectionEagerness || "auto")
       .trim()
       .toLowerCase();
@@ -92,6 +97,14 @@ class BridgeRealtimeAdapter {
       throw new Error("Transport adapter does not support bridge realtime mode.");
     }
 
+    const effectiveTurnDetection =
+      this.turnDetection === "manual" ? "semantic_vad" : this.turnDetection;
+    if (effectiveTurnDetection !== this.turnDetection) {
+      this.log(
+        "turn_detection=manual is not supported for continuous voice input; using semantic_vad."
+      );
+    }
+
     const started = await this.transportAdapter.startRealtime({
       model: this.model,
       language: this.language || undefined,
@@ -100,7 +113,7 @@ class BridgeRealtimeAdapter {
       temperature: this.temperature,
       connectTimeoutMs: this.connectTimeoutMs,
       inputTranscriptionModel: this.inputTranscriptionModel,
-      turnDetection: this.turnDetection,
+      turnDetection: effectiveTurnDetection,
       turnDetectionEagerness: this.turnDetectionEagerness,
       vadThreshold: this.vadThreshold,
       vadSilenceMs: this.vadSilenceMs,
@@ -117,7 +130,7 @@ class BridgeRealtimeAdapter {
     }
     this.started = true;
     this.log(
-      `bridge realtime started (model=${this.model}, turn_detection=${this.turnDetection}).`
+      `bridge realtime started (model=${this.model}, turn_detection=${effectiveTurnDetection}).`
     );
     return true;
   }

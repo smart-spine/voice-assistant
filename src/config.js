@@ -44,13 +44,13 @@ function pickVoicePipelineMode(rawValue) {
 }
 
 function pickRealtimeTurnDetection(rawValue) {
-  const value = String(rawValue || "manual")
+  const value = String(rawValue || "semantic_vad")
     .trim()
     .toLowerCase();
   if (["manual", "server_vad", "semantic_vad"].includes(value)) {
     return value;
   }
-  return "manual";
+  return "semantic_vad";
 }
 
 function pickOpenAiSttSource(rawValue) {

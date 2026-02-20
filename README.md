@@ -110,6 +110,7 @@ The ubuntu startup script prepares virtual PulseAudio devices and exports device
 - `OPENAI_REALTIME_CONNECT_TIMEOUT_MS`
 - `OPENAI_REALTIME_INPUT_TRANSCRIPTION_MODEL`
 - `OPENAI_REALTIME_TURN_DETECTION` (`manual`, `server_vad`, `semantic_vad`)
+- For live voice input, use `server_vad` or `semantic_vad` (not `manual`).
 - `OPENAI_REALTIME_TURN_EAGERNESS`
 - `OPENAI_REALTIME_VAD_THRESHOLD`
 - `OPENAI_REALTIME_VAD_SILENCE_MS`
