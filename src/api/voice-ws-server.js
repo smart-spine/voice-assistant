@@ -202,6 +202,16 @@ class VoiceRealtimeBridgeSession {
   }
 
   sendError(code, message) {
+    const normalizedMessage = String(message || "").toLowerCase();
+    if (
+      normalizedMessage.includes("committing input audio buffer") ||
+      normalizedMessage.includes("buffer too small")
+    ) {
+      this.pendingResponseAfterCommit = false;
+      this.lastCommitAt = 0;
+      this.clearPendingCommitResponseTimer();
+    }
+
     this.send({
       type: "error",
       code: String(code || "voice_error"),
@@ -614,12 +624,6 @@ class VoiceRealtimeBridgeSession {
 
     if (type === "response.done") {
       this.assistantInProgress = false;
-      if (this.pendingResponseAfterCommit) {
-        this.requestResponseFromCommit({
-          reason: "response_done_pending",
-          commitAt: this.lastCommitAt || nowMs()
-        });
-      }
       const responseId = String(event?.response?.id || "").trim();
       const status = String(event?.response?.status || event?.status || "unknown").trim();
       this.send({
@@ -705,16 +709,12 @@ class VoiceRealtimeBridgeSession {
     this.clearPendingCommitResponseTimer();
     this.sendUpstream({ type: "input_audio_buffer.commit" });
 
-    if (this.clientTurnDetection === "manual" || createResponse) {
-      this.requestResponseFromCommit({ reason, commitAt });
-      return;
-    }
-
-    // Safety net: for noisy inputs server_vad may never auto-trigger response on commit.
-    this.requestResponseFromCommit({
-      reason: `${reason}:fallback`,
-      commitAt
-    });
+    // We intentionally do not force response.create here.
+    // It is only requested after commit is accepted (input_audio_buffer.committed)
+    // or after transcription final arrives for this turn.
+    void reason;
+    void createResponse;
+    void commitAt;
   }
 
   interruptAssistant({ reason = "interrupt" } = {}) {

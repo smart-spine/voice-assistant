@@ -386,6 +386,8 @@ export default function HomePage() {
   const voiceLastAssistantPartialLogAtRef = useRef(0);
   const voiceLastChunkLogAtRef = useRef(0);
   const voiceLastTtsChunkAtRef = useRef(0);
+  const voiceHasUncommittedAudioRef = useRef(false);
+  const voiceLastAudioChunkAtRef = useRef(0);
   const voicePlaybackChunkBufferRef = useRef([]);
   const voicePlaybackFlushTimerRef = useRef(null);
   const voicePlaybackContextRef = useRef(null);
@@ -537,6 +539,8 @@ export default function HomePage() {
     voiceEchoDropsRef.current = 0;
     voiceBackpressureDropsRef.current = 0;
     voiceLastTtsChunkAtRef.current = 0;
+    voiceHasUncommittedAudioRef.current = false;
+    voiceLastAudioChunkAtRef.current = 0;
     voiceLocalSpeechActiveRef.current = false;
     voiceLocalSpeechStartedAtRef.current = 0;
     voiceLocalLastSpeechAtRef.current = 0;
@@ -950,14 +954,18 @@ export default function HomePage() {
             voiceRecording &&
             speechMs >= 180 &&
             !assistantPlaybackActive &&
+            voiceHasUncommittedAudioRef.current &&
             now - voiceLastAutoCommitAtRef.current > 700
           ) {
             voiceLastAutoCommitAtRef.current = now;
-            sendVoiceMessage({
+            const committed = sendVoiceMessage({
               type: "commit",
               create_response: true
             });
-            appendVoiceDebugLog("event", "auto-commit on vad stop");
+            if (committed) {
+              voiceHasUncommittedAudioRef.current = false;
+              appendVoiceDebugLog("event", "auto-commit on vad stop");
+            }
           }
         }
         return;
@@ -995,6 +1003,7 @@ export default function HomePage() {
         appendVoiceConversation("user", text, true);
         voiceLastUserFinalAtRef.current = Date.now();
         voiceFirstAudioAfterFinalRef.current = false;
+        voiceHasUncommittedAudioRef.current = false;
 
         if (voiceUserSpeechStartRef.current) {
           setVoiceMetrics((prev) => ({
@@ -1081,6 +1090,7 @@ export default function HomePage() {
       }
 
       if (type === "input_committed") {
+        voiceHasUncommittedAudioRef.current = false;
         appendVoiceDebugLog("event", "upstream input buffer committed");
         return;
       }
@@ -1197,6 +1207,8 @@ export default function HomePage() {
       voiceUserSpeechStartRef.current = 0;
       voiceLastUserFinalAtRef.current = 0;
       voiceFirstAudioAfterFinalRef.current = false;
+      voiceHasUncommittedAudioRef.current = false;
+      voiceLastAudioChunkAtRef.current = 0;
 
       appendVoiceDebugLog(
         "info",
@@ -1276,17 +1288,21 @@ export default function HomePage() {
               if (
                 speechMs >= minSpeechMsForCommit &&
                 !assistantPlaybackActive &&
+                voiceHasUncommittedAudioRef.current &&
                 now - voiceLastAutoCommitAtRef.current > 700
               ) {
                 voiceLastAutoCommitAtRef.current = now;
-                sendVoiceMessage({
+                const committed = sendVoiceMessage({
                   type: "commit",
                   create_response: true
                 });
-                appendVoiceDebugLog(
-                  "event",
-                  `auto-commit on local silence (${speechMs}ms speech)`
-                );
+                if (committed) {
+                  voiceHasUncommittedAudioRef.current = false;
+                  appendVoiceDebugLog(
+                    "event",
+                    `auto-commit on local silence (${speechMs}ms speech)`
+                  );
+                }
               }
             }
           }
@@ -1321,10 +1337,14 @@ export default function HomePage() {
 
           voiceEchoDropsRef.current = 0;
           voiceBackpressureDropsRef.current = 0;
-          sendVoiceMessage({
+          const sent = sendVoiceMessage({
             type: "audio_chunk",
             audio_base64: bytesToBase64(pcmBytes)
           });
+          if (sent) {
+            voiceHasUncommittedAudioRef.current = true;
+            voiceLastAudioChunkAtRef.current = now;
+          }
         } catch (_) {
           // Ignore per-chunk audio processing errors.
         }
@@ -1386,11 +1406,21 @@ export default function HomePage() {
         appendVoiceDebugLog("info", `mic stop (commit=${commit ? "yes" : "no"})`);
 
         if (commit) {
-          sendVoiceMessage({
-            type: "commit",
-            create_response: true
-          });
-          appendVoiceDebugLog("event", "input committed + response requested");
+          const hasPendingAudio =
+            voiceHasUncommittedAudioRef.current &&
+            Date.now() - voiceLastAudioChunkAtRef.current < 20000;
+          if (!hasPendingAudio) {
+            appendVoiceDebugLog("event", "commit skipped: no pending audio");
+          } else {
+            const committed = sendVoiceMessage({
+              type: "commit",
+              create_response: true
+            });
+            if (committed) {
+              voiceHasUncommittedAudioRef.current = false;
+              appendVoiceDebugLog("event", "input committed + response requested");
+            }
+          }
         }
       } finally {
         setVoiceBusy((prev) => ({ ...prev, stoppingMic: false }));
