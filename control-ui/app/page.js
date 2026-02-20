@@ -27,6 +27,19 @@ function formatDate(value) {
   return time.toLocaleString();
 }
 
+function formatTime(value) {
+  if (!value) {
+    return "-";
+  }
+
+  const time = new Date(value);
+  if (Number.isNaN(time.getTime())) {
+    return "-";
+  }
+
+  return time.toLocaleTimeString();
+}
+
 function formatDuration(totalSeconds) {
   const value = Number(totalSeconds) || 0;
   if (value <= 0) {
@@ -151,6 +164,48 @@ function float32ToPcm16Bytes(input) {
   return bytes;
 }
 
+function computeRms(samples) {
+  if (!(samples instanceof Float32Array) || samples.length === 0) {
+    return 0;
+  }
+
+  let sum = 0;
+  for (let index = 0; index < samples.length; index += 1) {
+    sum += samples[index] * samples[index];
+  }
+
+  return Math.sqrt(sum / Math.max(1, samples.length));
+}
+
+function truncateText(value, maxChars = 180) {
+  const text = String(value || "").trim();
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+function estimateAudioChunkDurationMs({ audioBase64 = "", format = "pcm16", sampleRate = 24000 }) {
+  const normalizedFormat = String(format || "pcm16").trim().toLowerCase();
+  if (normalizedFormat !== "pcm16") {
+    return 180;
+  }
+
+  const normalizedAudio = String(audioBase64 || "").trim();
+  if (!normalizedAudio) {
+    return 180;
+  }
+
+  const safeSampleRate = Math.max(8000, Number(sampleRate) || 24000);
+  const bytesLength = Math.floor((normalizedAudio.length * 3) / 4);
+  const samples = Math.floor(bytesLength / 2);
+  if (!samples) {
+    return 180;
+  }
+
+  return Math.max(40, Math.round((samples / safeSampleRate) * 1000));
+}
+
 function pcm16Base64ToWavBlob(base64, sampleRate = 24000) {
   const pcmBytes = base64ToBytes(base64);
   const pcm16 = new Int16Array(
@@ -246,6 +301,10 @@ export default function HomePage() {
   const [voiceConnected, setVoiceConnected] = useState(false);
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [voiceMode, setVoiceMode] = useState("toggle");
+  const [voiceUserSpeaking, setVoiceUserSpeaking] = useState(false);
+  const [voiceAssistantSpeaking, setVoiceAssistantSpeaking] = useState(false);
+  const [voicePlaybackActive, setVoicePlaybackActive] = useState(false);
+  const [voiceOrbLevel, setVoiceOrbLevel] = useState(0);
   const [voiceInputDevices, setVoiceInputDevices] = useState([]);
   const [voiceOutputDevices, setVoiceOutputDevices] = useState([]);
   const [voiceSelectedInputId, setVoiceSelectedInputId] = useState("");
@@ -253,6 +312,9 @@ export default function HomePage() {
   const [voiceUserPartial, setVoiceUserPartial] = useState("");
   const [voiceAssistantPartial, setVoiceAssistantPartial] = useState("");
   const [voiceConversation, setVoiceConversation] = useState([]);
+  const [voiceDebugLogs, setVoiceDebugLogs] = useState([]);
+  const [voiceDebugAutoScroll, setVoiceDebugAutoScroll] = useState(true);
+  const [voiceEchoGuardEnabled, setVoiceEchoGuardEnabled] = useState(true);
   const [voiceMetrics, setVoiceMetrics] = useState({
     sttPartialMs: null,
     sttFinalMs: null,
@@ -283,6 +345,7 @@ export default function HomePage() {
   const configSearchRef = useRef("");
 
   const voiceSocketRef = useRef(null);
+  const voiceDebugViewportRef = useRef(null);
   const voiceStreamRef = useRef(null);
   const voiceAnalyserRef = useRef(null);
   const voiceSourceNodeRef = useRef(null);
@@ -294,6 +357,14 @@ export default function HomePage() {
   const voiceUserSpeechStartRef = useRef(0);
   const voiceLastUserFinalAtRef = useRef(0);
   const voiceFirstAudioAfterFinalRef = useRef(false);
+  const voicePlaybackActiveCountRef = useRef(0);
+  const voiceLastPlaybackEndedAtRef = useRef(0);
+  const voiceEchoDropsRef = useRef(0);
+  const voiceBackpressureDropsRef = useRef(0);
+  const voiceLastPartialLogAtRef = useRef(0);
+  const voiceLastAssistantPartialLogAtRef = useRef(0);
+  const voiceLastChunkLogAtRef = useRef(0);
+  const voiceLastTtsChunkAtRef = useRef(0);
 
   const managedApi = systemState?.managedApi;
   const controlApi = systemState?.controlApi;
@@ -301,6 +372,27 @@ export default function HomePage() {
 
   const pushNotice = useCallback((type, text) => {
     setNotice({ type, text });
+  }, []);
+
+  const appendVoiceDebugLog = useCallback((level, message) => {
+    const normalizedMessage = String(message || "").trim();
+    if (!normalizedMessage) {
+      return;
+    }
+
+    const normalizedLevel = String(level || "info").trim().toLowerCase();
+    setVoiceDebugLogs((prev) => {
+      const next = [
+        ...prev,
+        {
+          id: `voice_log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          ts: new Date().toISOString(),
+          level: normalizedLevel,
+          message: normalizedMessage
+        }
+      ];
+      return next.slice(Math.max(0, next.length - 500));
+    });
   }, []);
 
   const loadState = useCallback(async ({ silent = false } = {}) => {
@@ -415,7 +507,17 @@ export default function HomePage() {
       voiceAudioContextRef.current = null;
     }
 
+    voicePlaybackActiveCountRef.current = 0;
+    voiceLastPlaybackEndedAtRef.current = 0;
+    voiceEchoDropsRef.current = 0;
+    voiceBackpressureDropsRef.current = 0;
+    voiceLastTtsChunkAtRef.current = 0;
+
     setVoiceRecording(false);
+    setVoiceUserSpeaking(false);
+    setVoiceAssistantSpeaking(false);
+    setVoicePlaybackActive(false);
+    setVoiceOrbLevel(0);
   }, [teardownVoiceAnalyser]);
 
   const sendVoiceMessage = useCallback((payload) => {
@@ -449,6 +551,11 @@ export default function HomePage() {
         blob = new Blob([bytes], { type: audioMimeFromFormat(normalizedFormat) });
       }
 
+      voicePlaybackActiveCountRef.current += 1;
+      voiceLastTtsChunkAtRef.current = Date.now();
+      setVoicePlaybackActive(true);
+      setVoiceAssistantSpeaking(true);
+
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audio.preload = "auto";
@@ -463,12 +570,21 @@ export default function HomePage() {
 
       await new Promise((resolve, reject) => {
         let done = false;
+        const finalizePlaybackWindow = () => {
+          const nextActive = Math.max(0, voicePlaybackActiveCountRef.current - 1);
+          voicePlaybackActiveCountRef.current = nextActive;
+          if (nextActive === 0) {
+            voiceLastPlaybackEndedAtRef.current = Date.now();
+            setVoicePlaybackActive(false);
+          }
+        };
 
         const finish = (callback) => {
           if (done) {
             return;
           }
           done = true;
+          finalizePlaybackWindow();
           URL.revokeObjectURL(url);
           callback();
         };
@@ -528,19 +644,43 @@ export default function HomePage() {
 
       if (type === "session_started") {
         setVoiceStatus("ready");
+        appendVoiceDebugLog(
+          "info",
+          `session started (model=${String(event?.model || "unknown")}, turn=${String(
+            event?.turn_detection || "n/a"
+          )})`
+        );
         return;
       }
 
       if (type === "session_state") {
         const state = String(event?.state || "").trim().toLowerCase();
         setVoiceStatus(state || "ready");
+        if (["stopped", "disconnected"].includes(state)) {
+          setVoiceUserSpeaking(false);
+          setVoiceAssistantSpeaking(false);
+          setVoicePlaybackActive(false);
+        }
+        appendVoiceDebugLog(
+          state === "stopped" ? "warn" : "info",
+          `session state: ${state || "ready"}`
+        );
         return;
       }
 
       if (type === "vad") {
-        if (String(event?.state || "").trim().toLowerCase() === "start") {
+        const vadState = String(event?.state || "").trim().toLowerCase();
+        if (vadState === "start") {
           voiceUserSpeechStartRef.current = Date.now();
           voiceFirstAudioAfterFinalRef.current = false;
+          setVoiceUserSpeaking(true);
+          appendVoiceDebugLog("event", "vad:start");
+        } else if (vadState === "stop") {
+          setVoiceUserSpeaking(false);
+          appendVoiceDebugLog(
+            "event",
+            `vad:stop (speechMs=${Number(event?.speech_ms || event?.speechMs || 0) || 0})`
+          );
         }
         return;
       }
@@ -557,6 +697,12 @@ export default function HomePage() {
             ...prev,
             sttPartialMs: Math.max(0, Date.now() - voiceUserSpeechStartRef.current)
           }));
+        }
+
+        const now = Date.now();
+        if (now - voiceLastPartialLogAtRef.current >= 650) {
+          voiceLastPartialLogAtRef.current = now;
+          appendVoiceDebugLog("info", `stt partial: ${truncateText(text, 120)}`);
         }
         return;
       }
@@ -579,6 +725,7 @@ export default function HomePage() {
             firstAudioMs: null
           }));
         }
+        appendVoiceDebugLog("info", `stt final: ${truncateText(text, 180)}`);
         return;
       }
 
@@ -591,13 +738,21 @@ export default function HomePage() {
         if (coerceBoolean(event?.is_final, false)) {
           setVoiceAssistantPartial("");
           appendVoiceConversation("assistant", text, true);
+          appendVoiceDebugLog("info", `assistant final: ${truncateText(text, 180)}`);
         } else {
           setVoiceAssistantPartial(text);
+          const now = Date.now();
+          if (now - voiceLastAssistantPartialLogAtRef.current >= 750) {
+            voiceLastAssistantPartialLogAtRef.current = now;
+            appendVoiceDebugLog("event", `assistant partial: ${truncateText(text, 120)}`);
+          }
         }
         return;
       }
 
       if (type === "tts_audio_chunk") {
+        voiceLastTtsChunkAtRef.current = Date.now();
+        setVoiceAssistantSpeaking(true);
         if (
           !voiceFirstAudioAfterFinalRef.current &&
           voiceLastUserFinalAtRef.current > 0
@@ -607,6 +762,21 @@ export default function HomePage() {
             ...prev,
             firstAudioMs: Math.max(0, Date.now() - voiceLastUserFinalAtRef.current)
           }));
+          appendVoiceDebugLog("info", "assistant audio: first chunk");
+        }
+
+        const now = Date.now();
+        if (now - voiceLastChunkLogAtRef.current >= 1200) {
+          voiceLastChunkLogAtRef.current = now;
+          const chunkMs = estimateAudioChunkDurationMs({
+            audioBase64: event?.audio_base64 || event?.audioBase64 || "",
+            format: event?.format || "pcm16",
+            sampleRate: Number(event?.sample_rate || event?.sampleRate || 24000)
+          });
+          appendVoiceDebugLog(
+            "event",
+            `assistant audio chunk (format=${String(event?.format || "pcm16")}, ~${chunkMs}ms)`
+          );
         }
 
         enqueueVoicePlayback({
@@ -621,16 +791,43 @@ export default function HomePage() {
         const state = String(event?.state || "").trim().toLowerCase();
         if (state) {
           setVoiceStatus(state);
+          if (["speaking"].includes(state)) {
+            setVoiceAssistantSpeaking(true);
+          } else if (["done", "interrupted", "stopped", "idle", "ready"].includes(state)) {
+            setVoiceAssistantSpeaking(false);
+          }
+          appendVoiceDebugLog("info", `assistant state: ${state}`);
         }
+        return;
+      }
+
+      if (type === "input_rejected") {
+        appendVoiceDebugLog(
+          "warn",
+          `input rejected (${String(event?.reason || "unknown")}): ${truncateText(
+            event?.text || "",
+            140
+          )}`
+        );
         return;
       }
 
       if (type === "error") {
         const message = String(event?.message || "Voice session error.").trim();
+        appendVoiceDebugLog("error", `voice error: ${message}`);
         pushNotice("error", message);
+        return;
       }
+
+      appendVoiceDebugLog("event", `event: ${type}`);
     },
-    [appendVoiceConversation, enqueueVoicePlayback, pushNotice, voiceMetrics.sttPartialMs]
+    [
+      appendVoiceConversation,
+      appendVoiceDebugLog,
+      enqueueVoicePlayback,
+      pushNotice,
+      voiceMetrics.sttPartialMs
+    ]
   );
 
   const ensureVoiceMedia = useCallback(async () => {
@@ -640,9 +837,9 @@ export default function HomePage() {
 
     const constraints = {
       audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
         channelCount: 1
       },
       video: false
@@ -679,11 +876,7 @@ export default function HomePage() {
       }
       const buffer = new Float32Array(voiceAnalyserRef.current.fftSize);
       voiceAnalyserRef.current.getFloatTimeDomainData(buffer);
-      let sum = 0;
-      for (let index = 0; index < buffer.length; index += 1) {
-        sum += buffer[index] * buffer[index];
-      }
-      const rms = Math.sqrt(sum / Math.max(1, buffer.length));
+      const rms = computeRms(buffer);
       setVoiceLevel(Math.min(1, rms * 8));
     }, 80);
 
@@ -709,6 +902,13 @@ export default function HomePage() {
         throw new Error("Microphone stream is not initialized.");
       }
 
+      appendVoiceDebugLog(
+        "info",
+        `mic start (sampleRate=${Number(context.sampleRate) || "unknown"}, echoGuard=${
+          voiceEchoGuardEnabled ? "on" : "off"
+        })`
+      );
+
       const processor = context.createScriptProcessor(2048, 1, 1);
       const silentSink = context.createGain();
       silentSink.gain.value = 0;
@@ -720,6 +920,13 @@ export default function HomePage() {
             return;
           }
           if (ws.bufferedAmount > 2 * 1024 * 1024) {
+            voiceBackpressureDropsRef.current += 1;
+            if (voiceBackpressureDropsRef.current % 50 === 0) {
+              appendVoiceDebugLog(
+                "warn",
+                `audio backpressure: dropped ${voiceBackpressureDropsRef.current} chunks`
+              );
+            }
             return;
           }
 
@@ -733,11 +940,41 @@ export default function HomePage() {
             return;
           }
 
+          const rms = computeRms(normalized);
+          if (rms < 0.004) {
+            return;
+          }
+
+          if (voiceEchoGuardEnabled) {
+            const now = Date.now();
+            const isPlaybackActive = voicePlaybackActiveCountRef.current > 0;
+            const isRecentPlayback =
+              !isPlaybackActive &&
+              voiceLastPlaybackEndedAtRef.current > 0 &&
+              now - voiceLastPlaybackEndedAtRef.current < 260;
+
+            if (isPlaybackActive || isRecentPlayback) {
+              const minRms = isPlaybackActive ? 0.03 : 0.022;
+              if (rms < minRms) {
+                voiceEchoDropsRef.current += 1;
+                if (voiceEchoDropsRef.current % 80 === 0) {
+                  appendVoiceDebugLog(
+                    "warn",
+                    `echo guard: filtered ${voiceEchoDropsRef.current} low-level chunks`
+                  );
+                }
+                return;
+              }
+            }
+          }
+
           const pcmBytes = float32ToPcm16Bytes(normalized);
           if (!pcmBytes.length) {
             return;
           }
 
+          voiceEchoDropsRef.current = 0;
+          voiceBackpressureDropsRef.current = 0;
           sendVoiceMessage({
             type: "audio_chunk",
             audio_base64: bytesToBase64(pcmBytes)
@@ -757,12 +994,19 @@ export default function HomePage() {
       pushNotice("success", "Microphone is live.");
       return true;
     } catch (err) {
+      appendVoiceDebugLog("error", `mic start failed: ${err.message || "unknown error"}`);
       pushNotice("error", err.message || "Failed to start microphone.");
       return false;
     } finally {
       setVoiceBusy((prev) => ({ ...prev, startMic: false }));
     }
-  }, [ensureVoiceMedia, pushNotice, sendVoiceMessage]);
+  }, [
+    appendVoiceDebugLog,
+    ensureVoiceMedia,
+    pushNotice,
+    sendVoiceMessage,
+    voiceEchoGuardEnabled
+  ]);
 
   const stopVoiceRecording = useCallback(
     async ({ commit = true } = {}) => {
@@ -788,15 +1032,18 @@ export default function HomePage() {
         }
 
         setVoiceRecording(false);
+        setVoiceUserSpeaking(false);
+        appendVoiceDebugLog("info", `mic stop (commit=${commit ? "yes" : "no"})`);
 
         if (commit) {
           sendVoiceMessage({ type: "commit" });
+          appendVoiceDebugLog("event", "input committed");
         }
       } finally {
         setVoiceBusy((prev) => ({ ...prev, stoppingMic: false }));
       }
     },
-    [sendVoiceMessage]
+    [appendVoiceDebugLog, sendVoiceMessage]
   );
 
   const disconnectVoiceSocket = useCallback(async () => {
@@ -810,13 +1057,18 @@ export default function HomePage() {
       voiceSocketRef.current = null;
     }
 
+    appendVoiceDebugLog("info", "voice websocket disconnected");
+
     setVoiceConnected(false);
     setVoiceStatus("disconnected");
     setVoiceUserPartial("");
     setVoiceAssistantPartial("");
+    setVoiceUserSpeaking(false);
+    setVoiceAssistantSpeaking(false);
+    setVoicePlaybackActive(false);
 
     await teardownVoiceMedia();
-  }, [teardownVoiceMedia]);
+  }, [appendVoiceDebugLog, teardownVoiceMedia]);
 
   const connectVoiceSocket = useCallback(async () => {
     if (voiceSocketRef.current && voiceSocketRef.current.readyState === WebSocket.OPEN) {
@@ -825,6 +1077,7 @@ export default function HomePage() {
 
     setVoiceBusy((prev) => ({ ...prev, connecting: true }));
     setVoiceStatus("connecting");
+    appendVoiceDebugLog("info", "requesting voice websocket ticket...");
 
     try {
       const payload = await fetchJson("/api/system/voice/ticket", {
@@ -841,6 +1094,7 @@ export default function HomePage() {
       }
 
       const wsUrl = `${wsBaseUrl}${wsPath}?ticket=${encodeURIComponent(ticket)}`;
+      appendVoiceDebugLog("info", `connecting websocket: ${wsBaseUrl}${wsPath}`);
       const socket = new WebSocket(wsUrl);
 
       await new Promise((resolve, reject) => {
@@ -871,23 +1125,38 @@ export default function HomePage() {
       voiceSocketRef.current = socket;
       setVoiceConnected(true);
       setVoiceStatus("connected");
+      appendVoiceDebugLog("info", "voice websocket connected");
 
       socket.onmessage = (message) => {
         try {
           const event = JSON.parse(String(message?.data || "{}"));
           handleVoiceWsEvent(event);
-        } catch (_) {
+        } catch (err) {
           // Ignore malformed messages.
+          appendVoiceDebugLog(
+            "warn",
+            `invalid websocket payload: ${err?.message || "json parse failed"}`
+          );
         }
       };
 
-      socket.onclose = () => {
+      socket.onclose = (closeEvent) => {
+        const code = Number(closeEvent?.code || 0);
+        const reason = String(closeEvent?.reason || "").trim();
+        appendVoiceDebugLog(
+          code === 1000 ? "info" : "warn",
+          `voice websocket closed (code=${code}${reason ? `, reason=${reason}` : ""})`
+        );
         setVoiceConnected(false);
         setVoiceStatus("disconnected");
         setVoiceRecording(false);
+        setVoiceUserSpeaking(false);
+        setVoiceAssistantSpeaking(false);
+        setVoicePlaybackActive(false);
       };
 
       socket.onerror = () => {
+        appendVoiceDebugLog("error", "voice websocket transport error");
         pushNotice("error", "Voice websocket connection error.");
       };
 
@@ -901,16 +1170,19 @@ export default function HomePage() {
         vadPrefixPaddingMs: 180,
         interruptResponseOnTurn: true
       });
+      appendVoiceDebugLog("event", "start_session sent");
 
       await loadVoiceDevices();
       pushNotice("success", "Voice bot connected.");
     } catch (err) {
       await disconnectVoiceSocket();
+      appendVoiceDebugLog("error", `voice connect failed: ${err.message || "unknown error"}`);
       pushNotice("error", err.message || "Failed to connect voice bot.");
     } finally {
       setVoiceBusy((prev) => ({ ...prev, connecting: false }));
     }
   }, [
+    appendVoiceDebugLog,
     disconnectVoiceSocket,
     handleVoiceWsEvent,
     loadVoiceDevices,
@@ -1024,6 +1296,43 @@ export default function HomePage() {
   }, [logs, autoScroll]);
 
   useEffect(() => {
+    const viewport = voiceDebugViewportRef.current;
+    if (!viewport || !voiceDebugAutoScroll) {
+      return;
+    }
+    viewport.scrollTop = viewport.scrollHeight;
+  }, [voiceDebugAutoScroll, voiceDebugLogs]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = Date.now();
+      const ttsRecentlyActive = now - voiceLastTtsChunkAtRef.current < 520;
+      const playbackCurrentlyActive = voicePlaybackActiveCountRef.current > 0;
+      const assistantActive =
+        voiceAssistantSpeaking || playbackCurrentlyActive || ttsRecentlyActive;
+      const userActive = voiceUserSpeaking || (voiceRecording && voiceLevel > 0.05);
+
+      const target = !voiceConnected
+        ? 0
+        : assistantActive
+          ? Math.max(0.32, voiceLevel)
+          : userActive
+            ? Math.max(0.2, voiceLevel)
+            : 0.08;
+
+      setVoiceOrbLevel((prev) => prev + (target - prev) * 0.24);
+
+      if (!assistantActive && voiceAssistantSpeaking) {
+        setVoiceAssistantSpeaking(false);
+      }
+    }, 50);
+
+    return () => {
+      clearInterval(timer);
+    };
+  }, [voiceAssistantSpeaking, voiceConnected, voiceLevel, voiceRecording, voiceUserSpeaking]);
+
+  useEffect(() => {
     configSearchRef.current = configSearch;
   }, [configSearch]);
 
@@ -1129,6 +1438,24 @@ export default function HomePage() {
     );
 
   const renderedLogs = useMemo(() => logs.slice(Math.max(logs.length - 800, 0)), [logs]);
+  const voiceLikelyUserActive = voiceUserSpeaking || (voiceRecording && voiceLevel > 0.05);
+  const voiceLikelyAssistantActive =
+    voiceAssistantSpeaking || voicePlaybackActive || voiceStatus === "speaking";
+  const voiceOrbMode = !voiceConnected
+    ? "offline"
+    : voiceLikelyAssistantActive
+      ? "assistant"
+      : voiceLikelyUserActive
+        ? "listening"
+        : "ready";
+  const voiceOrbLabel =
+    voiceOrbMode === "assistant"
+      ? "Assistant speaking"
+      : voiceOrbMode === "listening"
+        ? "Listening"
+        : voiceOrbMode === "ready"
+          ? "Connected"
+          : "Disconnected";
 
   const configEntryByKey = useMemo(() => {
     const map = new Map();
@@ -1543,6 +1870,49 @@ export default function HomePage() {
                 <option value="ptt">Push-to-talk</option>
               </select>
             </label>
+
+            <label className="checkbox voice-inline-check">
+              <input
+                type="checkbox"
+                checked={voiceEchoGuardEnabled}
+                onChange={(event) => {
+                  setVoiceEchoGuardEnabled(event.target.checked);
+                }}
+              />
+              <span>Echo guard</span>
+            </label>
+          </div>
+
+          <p className="help voice-help">
+            Echo guard suppresses weak mic chunks while assistant audio is playing to prevent self-trigger loops.
+          </p>
+
+          <div className="voice-orb-stage">
+            <div
+              className={`voice-orb ${
+                voiceConnected ? "is-live" : "is-off"
+              } ${voiceLikelyUserActive ? "is-user" : ""} ${
+                voiceLikelyAssistantActive ? "is-assistant" : ""
+              }`}
+              style={{
+                "--orb-level": Math.max(0, Math.min(1, voiceOrbLevel)).toFixed(3),
+                "--orb-tilt": `${(voiceOrbLevel * 18 - 9).toFixed(2)}deg`
+              }}
+            >
+              <div className="voice-orb-core">
+                <span className="voice-orb-shine voice-orb-shine-a" />
+                <span className="voice-orb-shine voice-orb-shine-b" />
+                <span className="voice-orb-shell" />
+              </div>
+              <span className="voice-orb-ring ring-a" />
+              <span className="voice-orb-ring ring-b" />
+              <span className="voice-orb-halo" />
+            </div>
+
+            <div className="voice-orb-meta">
+              <span className="voice-orb-label">{voiceOrbLabel}</span>
+              <span className="voice-orb-value">{Math.round(voiceOrbLevel * 100)}%</span>
+            </div>
           </div>
 
           {voiceMode === "ptt" ? (
@@ -1647,6 +2017,43 @@ export default function HomePage() {
                 <span className="voice-text">{voiceAssistantPartial}</span>
               </div>
             ) : null}
+          </div>
+
+          <div className="voice-debug-head">
+            <h3>Voice Session Log</h3>
+            <div className="voice-debug-actions">
+              <label className="checkbox small">
+                <input
+                  type="checkbox"
+                  checked={voiceDebugAutoScroll}
+                  onChange={(event) => {
+                    setVoiceDebugAutoScroll(event.target.checked);
+                  }}
+                />
+                <span>Auto-scroll</span>
+              </label>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => {
+                  setVoiceDebugLogs([]);
+                }}
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+
+          <div className="voice-debug" ref={voiceDebugViewportRef}>
+            {voiceDebugLogs.length === 0 ? (
+              <p className="logs-empty">No voice events yet.</p>
+            ) : (
+              voiceDebugLogs.map((entry) => (
+                <div key={entry.id} className={`voice-debug-line level-${entry.level || "info"}`}>
+                  <span className="voice-debug-ts">[{formatTime(entry.ts)}]</span>
+                  <span className="voice-debug-msg">{entry.message}</span>
+                </div>
+              ))
+            )}
           </div>
         </section>
       ) : null}

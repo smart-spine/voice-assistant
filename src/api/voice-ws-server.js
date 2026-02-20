@@ -45,6 +45,64 @@ function normalizeLanguageTag(rawValue) {
   return primary;
 }
 
+function normalizeForEchoComparison(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function looksLikeEchoTranscript(userText, assistantText) {
+  const normalizedUser = normalizeForEchoComparison(userText);
+  const normalizedAssistant = normalizeForEchoComparison(assistantText);
+  if (!normalizedUser || !normalizedAssistant) {
+    return false;
+  }
+
+  if (normalizedUser.length < 12 || normalizedAssistant.length < 12) {
+    return false;
+  }
+
+  if (normalizedUser === normalizedAssistant) {
+    return true;
+  }
+
+  if (
+    normalizedUser.length >= 18 &&
+    (normalizedAssistant.includes(normalizedUser) || normalizedUser.includes(normalizedAssistant))
+  ) {
+    return true;
+  }
+
+  const userTokens = new Set(
+    normalizedUser
+      .split(" ")
+      .map((token) => token.trim())
+      .filter((token) => token.length > 2)
+  );
+  const assistantTokens = new Set(
+    normalizedAssistant
+      .split(" ")
+      .map((token) => token.trim())
+      .filter((token) => token.length > 2)
+  );
+
+  if (!userTokens.size || !assistantTokens.size) {
+    return false;
+  }
+
+  let overlap = 0;
+  for (const token of userTokens) {
+    if (assistantTokens.has(token)) {
+      overlap += 1;
+    }
+  }
+
+  const recall = overlap / userTokens.size;
+  return userTokens.size >= 4 && recall >= 0.82;
+}
+
 function buildRealtimeTurnDetection(options = {}) {
   const type = String(options.turnDetection || "server_vad")
     .trim()
@@ -115,6 +173,8 @@ class VoiceRealtimeBridgeSession {
     this.partialBufferByItem = new Map();
     this.assistantTextByResponse = new Map();
     this.lastUserSpeechStartedAt = 0;
+    this.lastAssistantAudioAt = 0;
+    this.lastAssistantTranscript = "";
   }
 
   send(event = {}) {
@@ -234,6 +294,8 @@ class VoiceRealtimeBridgeSession {
     this.ttsSeq = 0;
     this.partialBufferByItem.clear();
     this.assistantTextByResponse.clear();
+    this.lastAssistantAudioAt = 0;
+    this.lastAssistantTranscript = "";
 
     upstream.on("message", (raw) => {
       const event = safeJsonParse(String(raw || ""), {});
@@ -367,11 +429,38 @@ class VoiceRealtimeBridgeSession {
       if (!transcript) {
         return;
       }
+
+      const now = nowMs();
+      const echoWindowMs = 2800;
+      const likelyEcho =
+        this.lastAssistantAudioAt > 0 &&
+        now - this.lastAssistantAudioAt <= echoWindowMs &&
+        looksLikeEchoTranscript(transcript, this.lastAssistantTranscript);
+
+      if (likelyEcho) {
+        this.send({
+          type: "input_rejected",
+          reason: "echo",
+          text: transcript,
+          t_ms: now
+        });
+        this.sendUpstream({ type: "response.cancel" });
+        this.sendUpstream({ type: "output_audio_buffer.clear" });
+        this.assistantInProgress = false;
+        warn(
+          "VOICE-WS",
+          `dropped probable echo transcript (session=${this.sessionId}): ${normalizeText(
+            transcript
+          )}`
+        );
+        return;
+      }
+
       this.send({
         type: "stt_final",
         text: transcript,
         turn_id: itemId || undefined,
-        t_ms: nowMs()
+        t_ms: now
       });
       return;
     }
@@ -396,6 +485,7 @@ class VoiceRealtimeBridgeSession {
       const prev = this.assistantTextByResponse.get(responseId) || "";
       const text = normalizeText(`${prev} ${delta}`);
       this.assistantTextByResponse.set(responseId, text);
+      this.lastAssistantTranscript = text;
       this.send({
         type: "assistant_text",
         response_id: responseId,
@@ -412,6 +502,7 @@ class VoiceRealtimeBridgeSession {
       if (!responseId || !text) {
         return;
       }
+      this.lastAssistantTranscript = text;
       this.assistantTextByResponse.set(responseId, text);
       this.send({
         type: "assistant_text",
@@ -432,6 +523,7 @@ class VoiceRealtimeBridgeSession {
       const prev = this.assistantTextByResponse.get(responseId) || "";
       const text = normalizeText(`${prev} ${delta}`);
       this.assistantTextByResponse.set(responseId, text);
+      this.lastAssistantTranscript = text;
       this.send({
         type: "assistant_text",
         response_id: responseId,
@@ -448,6 +540,7 @@ class VoiceRealtimeBridgeSession {
       if (!responseId || !text) {
         return;
       }
+      this.lastAssistantTranscript = text;
       this.assistantTextByResponse.set(responseId, text);
       this.send({
         type: "assistant_text",
@@ -465,6 +558,7 @@ class VoiceRealtimeBridgeSession {
       if (!audioBase64) {
         return;
       }
+      this.lastAssistantAudioAt = nowMs();
       this.ttsSeq += 1;
       this.send({
         type: "tts_audio_chunk",
@@ -561,6 +655,8 @@ class VoiceRealtimeBridgeSession {
     this.assistantInProgress = false;
     this.partialBufferByItem.clear();
     this.assistantTextByResponse.clear();
+    this.lastAssistantAudioAt = 0;
+    this.lastAssistantTranscript = "";
     this.send({
       type: "session_state",
       state: "stopped",

@@ -221,6 +221,11 @@ h2 {
   background: rgba(8, 35, 24, 0.6);
 }
 
+.btn-sm {
+  padding: 7px 10px;
+  font-size: 0.8rem;
+}
+
 .help {
   margin: 14px 0 0;
   font-size: 0.88rem;
@@ -431,6 +436,187 @@ textarea {
   gap: 8px;
 }
 
+.voice-inline-check {
+  margin-top: 0;
+}
+
+.voice-help {
+  margin-top: 8px;
+}
+
+.voice-orb-stage {
+  margin-top: 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(111, 201, 151, 0.26);
+  background: radial-gradient(circle at 20% 15%, rgba(105, 243, 223, 0.08), transparent 52%),
+    radial-gradient(circle at 86% 76%, rgba(117, 145, 255, 0.09), transparent 46%),
+    rgba(4, 22, 15, 0.86);
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.voice-orb {
+  --orb-level: 0;
+  --orb-tilt: 0deg;
+  position: relative;
+  width: 122px;
+  height: 122px;
+  border-radius: 50%;
+  transform: scale(calc(0.94 + (var(--orb-level) * 0.3)));
+  transition: transform 120ms linear, filter 140ms linear, opacity 200ms ease;
+  filter: saturate(calc(0.85 + (var(--orb-level) * 1.1)));
+  opacity: 0.9;
+}
+
+.voice-orb.is-live {
+  opacity: 1;
+}
+
+.voice-orb.is-off {
+  filter: grayscale(0.45);
+  opacity: 0.58;
+}
+
+.voice-orb-core {
+  position: absolute;
+  inset: 7px;
+  border-radius: 50%;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 32% 28%, rgba(220, 255, 255, 0.85), rgba(220, 255, 255, 0) 34%),
+    conic-gradient(
+      from 0deg,
+      rgba(78, 246, 222, 0.86),
+      rgba(94, 162, 255, 0.93),
+      rgba(236, 140, 229, 0.88),
+      rgba(78, 246, 222, 0.86)
+    );
+  animation: orb-rotate 8s linear infinite;
+}
+
+.voice-orb-core::before {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 72% 24%, rgba(255, 255, 255, 0.52), rgba(255, 255, 255, 0) 34%),
+    radial-gradient(circle at 28% 80%, rgba(111, 255, 243, 0.44), rgba(111, 255, 243, 0) 42%);
+  mix-blend-mode: screen;
+  animation: orb-breathe 2.8s ease-in-out infinite;
+}
+
+.voice-orb-core::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: linear-gradient(
+    122deg,
+    rgba(255, 255, 255, 0.28) 0%,
+    rgba(255, 255, 255, 0.02) 34%,
+    rgba(255, 255, 255, 0.18) 72%,
+    rgba(255, 255, 255, 0.06) 100%
+  );
+  opacity: calc(0.5 + (var(--orb-level) * 0.45));
+}
+
+.voice-orb-shine {
+  position: absolute;
+  border-radius: 50%;
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+
+.voice-orb-shine-a {
+  width: 64%;
+  height: 30%;
+  top: 10%;
+  left: 18%;
+  background: linear-gradient(150deg, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0));
+  filter: blur(3px);
+  transform: rotate(-22deg);
+}
+
+.voice-orb-shine-b {
+  width: 56%;
+  height: 26%;
+  bottom: 14%;
+  right: 12%;
+  background: linear-gradient(150deg, rgba(138, 251, 255, 0.42), rgba(138, 251, 255, 0));
+  filter: blur(4px);
+  transform: rotate(18deg);
+}
+
+.voice-orb-shell {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(226, 251, 255, 0.55);
+  box-shadow:
+    inset 0 0 22px rgba(255, 255, 255, 0.2),
+    0 0 calc(12px + (var(--orb-level) * 26px)) rgba(125, 223, 255, 0.42);
+}
+
+.voice-orb-ring {
+  position: absolute;
+  inset: 1px;
+  border-radius: 50%;
+  border: 1px solid rgba(142, 224, 255, 0.55);
+  opacity: 0;
+  transform: scale(0.86);
+  pointer-events: none;
+}
+
+.voice-orb.is-live .voice-orb-ring {
+  animation: orb-ring 2.35s ease-out infinite;
+}
+
+.voice-orb.is-live .voice-orb-ring.ring-b {
+  animation-delay: 0.95s;
+}
+
+.voice-orb.is-assistant .voice-orb-ring {
+  animation-duration: 1.25s;
+}
+
+.voice-orb.is-user .voice-orb-ring {
+  animation-duration: 1.65s;
+}
+
+.voice-orb-halo {
+  position: absolute;
+  inset: -16px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgba(103, 234, 230, calc(0.2 + (var(--orb-level) * 0.25))) 0%,
+    rgba(103, 234, 230, 0) 70%
+  );
+  filter: blur(calc(6px + (var(--orb-level) * 12px)));
+  pointer-events: none;
+}
+
+.voice-orb-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.voice-orb-label {
+  font-size: 0.94rem;
+  font-weight: 700;
+  color: #d7f9ff;
+}
+
+.voice-orb-value {
+  font-family: "Chakra Petch", "Consolas", monospace;
+  font-size: 0.86rem;
+  color: #91d7ea;
+}
+
 select {
   border: 1px solid rgba(110, 199, 150, 0.35);
   border-radius: 12px;
@@ -548,6 +734,56 @@ select:focus {
 .voice-text {
   font-size: 0.95rem;
   line-height: 1.4;
+}
+
+.voice-debug-head {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.voice-debug-head h3 {
+  margin: 0;
+  font-family: "Chakra Petch", "Trebuchet MS", sans-serif;
+  font-size: 1rem;
+}
+
+.voice-debug-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.voice-debug {
+  margin-top: 8px;
+  border-radius: 14px;
+  border: 1px solid rgba(111, 201, 151, 0.24);
+  background: rgba(2, 16, 11, 0.86);
+  min-height: 140px;
+  max-height: 240px;
+  overflow: auto;
+  padding: 10px;
+}
+
+.voice-debug-line {
+  display: grid;
+  grid-template-columns: 116px 1fr;
+  gap: 8px;
+  font-family: "Chakra Petch", "Consolas", monospace;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  padding: 2px 0;
+}
+
+.voice-debug-ts {
+  color: #80b89a;
+}
+
+.voice-debug-msg {
+  word-break: break-word;
 }
 
 .settings-search-row {
@@ -708,12 +944,55 @@ select:focus {
   }
 }
 
+@keyframes orb-rotate {
+  from {
+    transform: rotate(calc(var(--orb-tilt) + 0deg)) rotateX(8deg);
+  }
+  to {
+    transform: rotate(calc(var(--orb-tilt) + 360deg)) rotateX(8deg);
+  }
+}
+
+@keyframes orb-breathe {
+  0% {
+    transform: scale(0.95);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scale(1.06);
+    opacity: 0.95;
+  }
+  100% {
+    transform: scale(0.95);
+    opacity: 0.6;
+  }
+}
+
+@keyframes orb-ring {
+  0% {
+    opacity: 0.42;
+    transform: scale(0.86);
+  }
+  70% {
+    opacity: 0.16;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.22);
+  }
+}
+
 @media (max-width: 980px) {
   .grid,
   .form-grid,
   .voice-devices,
   .settings-add-grid {
     grid-template-columns: 1fr;
+  }
+
+  .voice-orb-stage {
+    flex-direction: column;
+    align-items: flex-start;
   }
 
   .notes {
@@ -729,6 +1008,12 @@ select:focus {
     grid-template-columns: 1fr;
     gap: 2px;
     margin-bottom: 6px;
+  }
+
+  .voice-debug-line {
+    grid-template-columns: 1fr;
+    gap: 2px;
+    margin-bottom: 4px;
   }
 
   .settings-table-head,
@@ -767,5 +1052,15 @@ select:focus {
 
   .settings-search-row {
     grid-template-columns: 1fr;
+  }
+
+  .voice-orb {
+    width: 104px;
+    height: 104px;
+  }
+
+  .voice-orb-stage {
+    padding: 10px 12px;
+    gap: 10px;
   }
 }
