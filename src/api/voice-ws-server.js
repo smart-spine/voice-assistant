@@ -177,6 +177,8 @@ class VoiceRealtimeBridgeSession {
     this.lastAssistantTranscript = "";
     this.lastResponseCreatedAt = 0;
     this.pendingCommitResponseTimer = null;
+    this.pendingResponseAfterCommit = false;
+    this.lastCommitAt = 0;
   }
 
   clearPendingCommitResponseTimer() {
@@ -306,6 +308,8 @@ class VoiceRealtimeBridgeSession {
     this.assistantTextByResponse.clear();
     this.lastResponseCreatedAt = 0;
     this.clearPendingCommitResponseTimer();
+    this.pendingResponseAfterCommit = false;
+    this.lastCommitAt = 0;
     this.lastAssistantAudioAt = 0;
     this.lastAssistantTranscript = "";
 
@@ -412,10 +416,17 @@ class VoiceRealtimeBridgeSession {
     }
 
     if (type === "input_audio_buffer.committed") {
+      const committedAt = nowMs();
       this.send({
         type: "input_committed",
-        t_ms: nowMs()
+        t_ms: committedAt
       });
+      if (this.pendingResponseAfterCommit && !this.assistantInProgress) {
+        this.requestResponseFromCommit({
+          reason: "upstream_committed",
+          commitAt: this.lastCommitAt || committedAt
+        });
+      }
       return;
     }
 
@@ -482,6 +493,13 @@ class VoiceRealtimeBridgeSession {
         turn_id: itemId || undefined,
         t_ms: now
       });
+
+      if (this.pendingResponseAfterCommit && !this.assistantInProgress) {
+        this.requestResponseFromCommit({
+          reason: "stt_final",
+          commitAt: this.lastCommitAt || now
+        });
+      }
       return;
     }
 
@@ -489,6 +507,7 @@ class VoiceRealtimeBridgeSession {
       this.assistantInProgress = true;
       this.lastResponseCreatedAt = nowMs();
       this.clearPendingCommitResponseTimer();
+      this.pendingResponseAfterCommit = false;
       this.send({
         type: "assistant_state",
         state: "speaking",
@@ -595,6 +614,12 @@ class VoiceRealtimeBridgeSession {
 
     if (type === "response.done") {
       this.assistantInProgress = false;
+      if (this.pendingResponseAfterCommit) {
+        this.requestResponseFromCommit({
+          reason: "response_done_pending",
+          commitAt: this.lastCommitAt || nowMs()
+        });
+      }
       const responseId = String(event?.response?.id || "").trim();
       const status = String(event?.response?.status || event?.status || "unknown").trim();
       this.send({
@@ -659,6 +684,7 @@ class VoiceRealtimeBridgeSession {
           modalities: ["audio", "text"]
         }
       });
+      this.pendingResponseAfterCommit = false;
 
       this.send({
         type: "assistant_state",
@@ -674,6 +700,8 @@ class VoiceRealtimeBridgeSession {
       return;
     }
     const commitAt = nowMs();
+    this.lastCommitAt = commitAt;
+    this.pendingResponseAfterCommit = true;
     this.clearPendingCommitResponseTimer();
     this.sendUpstream({ type: "input_audio_buffer.commit" });
 
@@ -722,6 +750,8 @@ class VoiceRealtimeBridgeSession {
     this.lastAssistantAudioAt = 0;
     this.lastAssistantTranscript = "";
     this.lastResponseCreatedAt = 0;
+    this.pendingResponseAfterCommit = false;
+    this.lastCommitAt = 0;
     this.send({
       type: "session_state",
       state: "stopped",

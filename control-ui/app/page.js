@@ -164,6 +164,22 @@ function float32ToPcm16Bytes(input) {
   return bytes;
 }
 
+function pcm16BytesToFloat32(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 2) {
+    return new Float32Array(0);
+  }
+
+  const sampleCount = Math.floor(bytes.byteLength / 2);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, sampleCount * 2);
+  const samples = new Float32Array(sampleCount);
+
+  for (let index = 0; index < sampleCount; index += 1) {
+    samples[index] = view.getInt16(index * 2, true) / 0x8000;
+  }
+
+  return samples;
+}
+
 function computeRms(samples) {
   if (!(samples instanceof Float32Array) || samples.length === 0) {
     return 0;
@@ -358,6 +374,10 @@ export default function HomePage() {
   const voiceUserSpeechStartRef = useRef(0);
   const voiceLastUserFinalAtRef = useRef(0);
   const voiceFirstAudioAfterFinalRef = useRef(false);
+  const voiceLastAutoCommitAtRef = useRef(0);
+  const voiceLocalSpeechActiveRef = useRef(false);
+  const voiceLocalSpeechStartedAtRef = useRef(0);
+  const voiceLocalLastSpeechAtRef = useRef(0);
   const voicePlaybackActiveCountRef = useRef(0);
   const voiceLastPlaybackEndedAtRef = useRef(0);
   const voiceEchoDropsRef = useRef(0);
@@ -366,6 +386,10 @@ export default function HomePage() {
   const voiceLastAssistantPartialLogAtRef = useRef(0);
   const voiceLastChunkLogAtRef = useRef(0);
   const voiceLastTtsChunkAtRef = useRef(0);
+  const voicePlaybackChunkBufferRef = useRef([]);
+  const voicePlaybackFlushTimerRef = useRef(null);
+  const voicePlaybackContextRef = useRef(null);
+  const voicePlaybackScheduledAtRef = useRef(0);
 
   const managedApi = systemState?.managedApi;
   const controlApi = systemState?.controlApi;
@@ -513,6 +537,26 @@ export default function HomePage() {
     voiceEchoDropsRef.current = 0;
     voiceBackpressureDropsRef.current = 0;
     voiceLastTtsChunkAtRef.current = 0;
+    voiceLocalSpeechActiveRef.current = false;
+    voiceLocalSpeechStartedAtRef.current = 0;
+    voiceLocalLastSpeechAtRef.current = 0;
+    voiceLastAutoCommitAtRef.current = 0;
+
+    if (voicePlaybackFlushTimerRef.current) {
+      clearTimeout(voicePlaybackFlushTimerRef.current);
+      voicePlaybackFlushTimerRef.current = null;
+    }
+    voicePlaybackChunkBufferRef.current = [];
+
+    if (voicePlaybackContextRef.current) {
+      try {
+        await voicePlaybackContextRef.current.close();
+      } catch (_) {
+        // Ignore close failures.
+      }
+      voicePlaybackContextRef.current = null;
+    }
+    voicePlaybackScheduledAtRef.current = 0;
 
     setVoiceRecording(false);
     setVoiceUserSpeaking(false);
@@ -535,6 +579,33 @@ export default function HomePage() {
     }
   }, []);
 
+  const ensureVoicePlaybackContext = useCallback(async () => {
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) {
+      return null;
+    }
+
+    if (
+      !voicePlaybackContextRef.current ||
+      voicePlaybackContextRef.current.state === "closed"
+    ) {
+      voicePlaybackContextRef.current = new AudioContextCtor({
+        latencyHint: "interactive"
+      });
+      voicePlaybackScheduledAtRef.current = 0;
+    }
+
+    if (voicePlaybackContextRef.current.state !== "running") {
+      try {
+        await voicePlaybackContextRef.current.resume();
+      } catch (_) {
+        // Ignore resume failures; caller will fallback to HTMLAudio.
+      }
+    }
+
+    return voicePlaybackContextRef.current;
+  }, []);
+
   const playVoiceAudioChunk = useCallback(
     async ({ audioBase64, format, sampleRate = 24000 }) => {
       const normalizedAudio = String(audioBase64 || "").trim();
@@ -543,8 +614,75 @@ export default function HomePage() {
       }
 
       const normalizedFormat = String(format || "pcm16").trim().toLowerCase();
-      let blob = null;
+      const markPlaybackStart = () => {
+        voicePlaybackActiveCountRef.current += 1;
+        voiceLastTtsChunkAtRef.current = Date.now();
+        setVoicePlaybackActive(true);
+        setVoiceAssistantSpeaking(true);
+      };
 
+      const markPlaybackEnd = () => {
+        const nextActive = Math.max(0, voicePlaybackActiveCountRef.current - 1);
+        voicePlaybackActiveCountRef.current = nextActive;
+        if (nextActive === 0) {
+          voiceLastPlaybackEndedAtRef.current = Date.now();
+          setVoicePlaybackActive(false);
+        }
+      };
+
+      if (normalizedFormat === "pcm16") {
+        const pcmBytes = base64ToBytes(normalizedAudio);
+        const samples = pcm16BytesToFloat32(pcmBytes);
+        const resolvedSampleRate = Math.max(8000, Number(sampleRate) || 24000);
+        if (samples.length > 0) {
+          const playbackContext = await ensureVoicePlaybackContext();
+          if (playbackContext) {
+            markPlaybackStart();
+            await new Promise((resolve) => {
+              let done = false;
+              const finish = () => {
+                if (done) {
+                  return;
+                }
+                done = true;
+                markPlaybackEnd();
+                resolve();
+              };
+
+              try {
+                const audioBuffer = playbackContext.createBuffer(
+                  1,
+                  samples.length,
+                  resolvedSampleRate
+                );
+                audioBuffer.copyToChannel(samples, 0, 0);
+                const sourceNode = playbackContext.createBufferSource();
+                sourceNode.buffer = audioBuffer;
+                sourceNode.connect(playbackContext.destination);
+                sourceNode.onended = finish;
+
+                const currentTime = playbackContext.currentTime;
+                const startAt = Math.max(
+                  currentTime + 0.012,
+                  voicePlaybackScheduledAtRef.current || currentTime
+                );
+                voicePlaybackScheduledAtRef.current = startAt + audioBuffer.duration;
+                sourceNode.start(startAt);
+
+                const fallbackMs =
+                  Math.ceil((Math.max(0, startAt - currentTime) + audioBuffer.duration) * 1000) +
+                  200;
+                setTimeout(finish, fallbackMs);
+              } catch (_) {
+                finish();
+              }
+            });
+            return;
+          }
+        }
+      }
+
+      let blob = null;
       if (normalizedFormat === "pcm16") {
         blob = pcm16Base64ToWavBlob(normalizedAudio, sampleRate);
       } else {
@@ -552,10 +690,7 @@ export default function HomePage() {
         blob = new Blob([bytes], { type: audioMimeFromFormat(normalizedFormat) });
       }
 
-      voicePlaybackActiveCountRef.current += 1;
-      voiceLastTtsChunkAtRef.current = Date.now();
-      setVoicePlaybackActive(true);
-      setVoiceAssistantSpeaking(true);
+      markPlaybackStart();
 
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
@@ -571,21 +706,13 @@ export default function HomePage() {
 
       await new Promise((resolve, reject) => {
         let done = false;
-        const finalizePlaybackWindow = () => {
-          const nextActive = Math.max(0, voicePlaybackActiveCountRef.current - 1);
-          voicePlaybackActiveCountRef.current = nextActive;
-          if (nextActive === 0) {
-            voiceLastPlaybackEndedAtRef.current = Date.now();
-            setVoicePlaybackActive(false);
-          }
-        };
 
         const finish = (callback) => {
           if (done) {
             return;
           }
           done = true;
-          finalizePlaybackWindow();
+          markPlaybackEnd();
           URL.revokeObjectURL(url);
           callback();
         };
@@ -601,7 +728,7 @@ export default function HomePage() {
         }
       });
     },
-    [voiceSelectedOutputId]
+    [ensureVoicePlaybackContext, voiceSelectedOutputId]
   );
 
   const enqueueVoicePlayback = useCallback(
@@ -613,6 +740,133 @@ export default function HomePage() {
         });
     },
     [playVoiceAudioChunk]
+  );
+
+  const clearVoicePlaybackFlushTimer = useCallback(() => {
+    if (!voicePlaybackFlushTimerRef.current) {
+      return;
+    }
+    clearTimeout(voicePlaybackFlushTimerRef.current);
+    voicePlaybackFlushTimerRef.current = null;
+  }, []);
+
+  const flushVoicePlaybackBuffer = useCallback(
+    ({ force = false } = {}) => {
+      const buffered = voicePlaybackChunkBufferRef.current;
+      if (!buffered.length) {
+        clearVoicePlaybackFlushTimer();
+        return;
+      }
+
+      const totalMs = buffered.reduce(
+        (sum, item) => sum + Math.max(1, Number(item?.durationMs) || 0),
+        0
+      );
+      const first = buffered[0] || {};
+      const format = String(first?.format || "pcm16").trim().toLowerCase();
+
+      if (!force && format === "pcm16" && totalMs < 260) {
+        return;
+      }
+
+      clearVoicePlaybackFlushTimer();
+      voicePlaybackChunkBufferRef.current = [];
+
+      if (format !== "pcm16") {
+        for (const chunk of buffered) {
+          enqueueVoicePlayback({
+            audioBase64: chunk?.audioBase64 || "",
+            format: chunk?.format || "pcm16",
+            sampleRate: Number(chunk?.sampleRate || 24000)
+          });
+        }
+        return;
+      }
+
+      const totalBytes = buffered.reduce(
+        (sum, item) => sum + (item?.bytes?.byteLength || 0),
+        0
+      );
+      if (!totalBytes) {
+        return;
+      }
+
+      const merged = new Uint8Array(totalBytes);
+      let offset = 0;
+      for (const item of buffered) {
+        const bytes = item?.bytes;
+        if (!(bytes instanceof Uint8Array) || !bytes.byteLength) {
+          continue;
+        }
+        merged.set(bytes, offset);
+        offset += bytes.byteLength;
+      }
+      if (!offset) {
+        return;
+      }
+
+      const sampleRate = Math.max(
+        8000,
+        Number(
+          buffered.find((item) => Number(item?.sampleRate) > 0)?.sampleRate || 24000
+        )
+      );
+      enqueueVoicePlayback({
+        audioBase64: bytesToBase64(merged.subarray(0, offset)),
+        format: "pcm16",
+        sampleRate
+      });
+    },
+    [clearVoicePlaybackFlushTimer, enqueueVoicePlayback]
+  );
+
+  const bufferVoicePlaybackChunk = useCallback(
+    ({ audioBase64, format, sampleRate = 24000 }) => {
+      const normalizedAudio = String(audioBase64 || "").trim();
+      if (!normalizedAudio) {
+        return;
+      }
+
+      const normalizedFormat = String(format || "pcm16").trim().toLowerCase();
+      const durationMs = estimateAudioChunkDurationMs({
+        audioBase64: normalizedAudio,
+        format: normalizedFormat,
+        sampleRate
+      });
+
+      if (normalizedFormat === "pcm16") {
+        voicePlaybackChunkBufferRef.current.push({
+          format: "pcm16",
+          sampleRate: Number(sampleRate) || 24000,
+          durationMs,
+          bytes: base64ToBytes(normalizedAudio)
+        });
+      } else {
+        voicePlaybackChunkBufferRef.current.push({
+          format: normalizedFormat,
+          sampleRate: Number(sampleRate) || 24000,
+          durationMs,
+          audioBase64: normalizedAudio
+        });
+      }
+
+      const totalMs = voicePlaybackChunkBufferRef.current.reduce(
+        (sum, item) => sum + Math.max(1, Number(item?.durationMs) || 0),
+        0
+      );
+      if (totalMs >= 420) {
+        flushVoicePlaybackBuffer({ force: true });
+        return;
+      }
+
+      if (!voicePlaybackFlushTimerRef.current) {
+        voicePlaybackFlushTimerRef.current = setTimeout(() => {
+          voicePlaybackFlushTimerRef.current = null;
+          flushVoicePlaybackBuffer({ force: true });
+        }, 130);
+      }
+    },
+    [flushVoicePlaybackBuffer]
   );
 
   const appendVoiceConversation = useCallback((role, text, isFinal = true) => {
@@ -675,13 +929,36 @@ export default function HomePage() {
           voiceUserSpeechStartRef.current = Date.now();
           voiceFirstAudioAfterFinalRef.current = false;
           setVoiceUserSpeaking(true);
+          voiceLocalSpeechActiveRef.current = true;
+          voiceLocalSpeechStartedAtRef.current = Date.now();
+          voiceLocalLastSpeechAtRef.current = Date.now();
           appendVoiceDebugLog("event", "vad:start");
         } else if (vadState === "stop") {
           setVoiceUserSpeaking(false);
+          voiceLocalSpeechActiveRef.current = false;
           appendVoiceDebugLog(
             "event",
             `vad:stop (speechMs=${Number(event?.speech_ms || event?.speechMs || 0) || 0})`
           );
+
+          const speechMs = Number(event?.speech_ms || event?.speechMs || 0) || 0;
+          const now = Date.now();
+          const assistantPlaybackActive =
+            voicePlaybackActiveCountRef.current > 0 ||
+            now - voiceLastTtsChunkAtRef.current < 520;
+          if (
+            voiceRecording &&
+            speechMs >= 180 &&
+            !assistantPlaybackActive &&
+            now - voiceLastAutoCommitAtRef.current > 700
+          ) {
+            voiceLastAutoCommitAtRef.current = now;
+            sendVoiceMessage({
+              type: "commit",
+              create_response: true
+            });
+            appendVoiceDebugLog("event", "auto-commit on vad stop");
+          }
         }
         return;
       }
@@ -780,7 +1057,7 @@ export default function HomePage() {
           );
         }
 
-        enqueueVoicePlayback({
+        bufferVoicePlaybackChunk({
           audioBase64: event?.audio_base64 || event?.audioBase64 || "",
           format: event?.format || "pcm16",
           sampleRate: Number(event?.sample_rate || event?.sampleRate || 24000)
@@ -796,6 +1073,7 @@ export default function HomePage() {
             setVoiceAssistantSpeaking(true);
           } else if (["done", "interrupted", "stopped", "idle", "ready"].includes(state)) {
             setVoiceAssistantSpeaking(false);
+            flushVoicePlaybackBuffer({ force: true });
           }
           appendVoiceDebugLog("info", `assistant state: ${state}`);
         }
@@ -830,8 +1108,11 @@ export default function HomePage() {
     [
       appendVoiceConversation,
       appendVoiceDebugLog,
-      enqueueVoicePlayback,
+      bufferVoicePlaybackChunk,
+      flushVoicePlaybackBuffer,
       pushNotice,
+      sendVoiceMessage,
+      voiceRecording,
       voiceMetrics.sttPartialMs
     ]
   );
@@ -960,26 +1241,76 @@ export default function HomePage() {
             return;
           }
 
-          if (voiceEchoGuardEnabled) {
-            const now = Date.now();
-            const isPlaybackActive = voicePlaybackActiveCountRef.current > 0;
-            const isRecentPlayback =
-              !isPlaybackActive &&
-              voiceLastPlaybackEndedAtRef.current > 0 &&
-              now - voiceLastPlaybackEndedAtRef.current < 260;
+          const now = Date.now();
+          const isPlaybackActive = voicePlaybackActiveCountRef.current > 0;
+          const isRecentPlayback =
+            !isPlaybackActive &&
+            voiceLastPlaybackEndedAtRef.current > 0 &&
+            now - voiceLastPlaybackEndedAtRef.current < 260;
+          const assistantPlaybackActive =
+            isPlaybackActive || now - voiceLastTtsChunkAtRef.current < 420;
 
-            if (isPlaybackActive || isRecentPlayback) {
-              const minRms = isPlaybackActive ? 0.03 : 0.022;
-              if (rms < minRms) {
-                voiceEchoDropsRef.current += 1;
-                if (voiceEchoDropsRef.current % 80 === 0) {
-                  appendVoiceDebugLog(
-                    "warn",
-                    `echo guard: filtered ${voiceEchoDropsRef.current} low-level chunks`
-                  );
-                }
-                return;
+          const speechGateRms = voiceEchoGuardEnabled ? 0.011 : 0.009;
+          const localHangoverMs = 240;
+          const minSpeechMsForCommit = 180;
+          const allowBargeInRms = 0.075;
+
+          const speechFrameDetected =
+            rms >= speechGateRms &&
+            (!assistantPlaybackActive || !voiceEchoGuardEnabled || rms >= allowBargeInRms);
+
+          if (speechFrameDetected) {
+            if (!voiceLocalSpeechActiveRef.current) {
+              voiceLocalSpeechActiveRef.current = true;
+              voiceLocalSpeechStartedAtRef.current = now;
+            }
+            voiceLocalLastSpeechAtRef.current = now;
+          } else if (voiceLocalSpeechActiveRef.current) {
+            const sinceLastSpeech = now - voiceLocalLastSpeechAtRef.current;
+            if (sinceLastSpeech > localHangoverMs) {
+              const speechMs = voiceLocalSpeechStartedAtRef.current
+                ? Math.max(0, now - voiceLocalSpeechStartedAtRef.current)
+                : 0;
+              voiceLocalSpeechActiveRef.current = false;
+              voiceLocalSpeechStartedAtRef.current = 0;
+              if (
+                speechMs >= minSpeechMsForCommit &&
+                !assistantPlaybackActive &&
+                now - voiceLastAutoCommitAtRef.current > 700
+              ) {
+                voiceLastAutoCommitAtRef.current = now;
+                sendVoiceMessage({
+                  type: "commit",
+                  create_response: true
+                });
+                appendVoiceDebugLog(
+                  "event",
+                  `auto-commit on local silence (${speechMs}ms speech)`
+                );
               }
+            }
+          }
+
+          const withinSpeechHangover =
+            voiceLocalSpeechActiveRef.current &&
+            now - voiceLocalLastSpeechAtRef.current <= localHangoverMs;
+          if (!speechFrameDetected && !withinSpeechHangover) {
+            return;
+          }
+
+          if (voiceEchoGuardEnabled) {
+            if (assistantPlaybackActive && rms < allowBargeInRms) {
+              voiceEchoDropsRef.current += 1;
+              if (voiceEchoDropsRef.current % 80 === 0) {
+                appendVoiceDebugLog(
+                  "warn",
+                  `echo guard: filtered ${voiceEchoDropsRef.current} low-level chunks`
+                );
+              }
+              return;
+            }
+            if (isRecentPlayback && rms < 0.022) {
+              return;
             }
           }
 
@@ -1048,6 +1379,10 @@ export default function HomePage() {
 
         setVoiceRecording(false);
         setVoiceUserSpeaking(false);
+        voiceLocalSpeechActiveRef.current = false;
+        voiceLocalSpeechStartedAtRef.current = 0;
+        voiceLocalLastSpeechAtRef.current = 0;
+        setVoiceLevel(0);
         appendVoiceDebugLog("info", `mic stop (commit=${commit ? "yes" : "no"})`);
 
         if (commit) {
@@ -1183,12 +1518,12 @@ export default function HomePage() {
       sendVoiceMessage({
         type: "start_session",
         language: "en-US",
-        turnDetection: "server_vad",
+        turnDetection: "semantic_vad",
         turnDetectionEagerness: "auto",
         vadThreshold: 0.45,
         vadSilenceMs: 280,
         vadPrefixPaddingMs: 180,
-        interruptResponseOnTurn: true
+        interruptResponseOnTurn: false
       });
       appendVoiceDebugLog("event", "start_session sent");
 
@@ -1993,7 +2328,6 @@ export default function HomePage() {
 
             <div className="voice-orb-meta">
               <span className="voice-orb-label">{voiceOrbLabel}</span>
-              <span className="voice-orb-value">{Math.round(voiceOrbLevel * 100)}%</span>
             </div>
           </div>
 
