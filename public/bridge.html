@@ -94,6 +94,7 @@
             current: null,
             queue: [],
             queueDurationMs: 0,
+            playedMs: 0,
             waiters: [],
             loopPromise: null,
             bufferChunks: [],
@@ -686,9 +687,19 @@
           return Math.max(0, Number(state.playback.queueDurationMs || 0));
         }
 
+        function getPlaybackPlayedMs() {
+          const baseMs = Math.max(0, Number(state.playback.playedMs || 0));
+          const audio = state.currentAudioElement;
+          if (!audio || !Number.isFinite(Number(audio.currentTime))) {
+            return Math.trunc(baseMs);
+          }
+          return Math.max(baseMs, Math.trunc(Number(audio.currentTime) * 1000));
+        }
+
         async function playAudioChunkWithPlayback({
           audioBase64,
           mimeType = "audio/wav",
+          plannedDurationMs = 0,
           playback
         } = {}) {
           const source = `data:${mimeType};base64,${audioBase64}`;
@@ -700,17 +711,30 @@
 
           return new Promise((resolve) => {
             let resolved = false;
+            const startedAt = Date.now();
             const done = (ok, errorMessage = "") => {
               if (resolved) {
                 return;
               }
               resolved = true;
+              const elapsedMs = Math.max(0, Date.now() - startedAt);
+              const playedMs = ok
+                ? Math.max(0, Math.trunc(Number(plannedDurationMs || elapsedMs)))
+                : Math.max(
+                    0,
+                    Math.trunc(
+                      Number.isFinite(Number(audio.currentTime))
+                        ? Number(audio.currentTime) * 1000
+                        : Math.min(elapsedMs, Number(plannedDurationMs || elapsedMs))
+                    )
+                  );
               if (state.currentAudioElement === audio) {
                 state.currentAudioElement = null;
               }
               resolve({
                 ok: Boolean(ok),
-                errorMessage
+                errorMessage,
+                playedMs
               });
             };
 
@@ -750,6 +774,7 @@
           };
 
           state.speaking = true;
+          state.playback.playedMs = 0;
           const startGateMs = Math.min(120, Math.max(0, Number(state.silenceMs || 0)));
           state.captureGateUntilMs = Date.now() + startGateMs;
           setSpeechState("speaking");
@@ -838,9 +863,15 @@
               const result = await playAudioChunkWithPlayback({
                 audioBase64: nextItem.audioBase64,
                 mimeType: nextItem.mimeType,
+                plannedDurationMs: nextItem.durationMs,
                 playback
               });
               playback.startedChunks += 1;
+              state.playback.playedMs = Math.max(
+                0,
+                Number(state.playback.playedMs || 0) +
+                  Math.max(0, Number(result?.playedMs || 0))
+              );
               nextItem.resolve(result.ok);
 
               if (!result.ok && result.errorMessage && result.errorMessage !== "playback interrupted") {
@@ -1013,6 +1044,9 @@
               addLog(`stopSpeaking cleared queued playback (${queuedCount} chunks)`);
             }
             state.playback.queueDurationMs = 0;
+            if (!state.speaking) {
+              state.playback.playedMs = 0;
+            }
             if (flush) {
               state.captureGateUntilMs = Date.now() + resumeGateMs;
             }
@@ -1176,6 +1210,7 @@
             }
             const responseId = String(payload?.response_id || "").trim() || undefined;
             if (assistantState === "speaking") {
+              state.playback.playedMs = 0;
               emitBridgeEvent({
                 source: "openai-realtime",
                 type: "assistant.response.started",
@@ -1807,14 +1842,19 @@
             return false;
           }
           const reason = String(options?.reason || "bridge_interrupt").trim() || "bridge_interrupt";
+          const playedMs = Math.max(
+            0,
+            Math.trunc(Number(options?.playedMs || getPlaybackPlayedMs()) || 0)
+          );
           const sent = sendCoreControlEvent("assistant.interrupt", {
-            reason
+            reason,
+            played_ms: playedMs
           });
           stopSpeaking({
             flush: true,
             resumeGateMs: 0
           });
-          addLog(`core interrupt sent (${reason})`);
+          addLog(`core interrupt sent (${reason}, playedMs=${playedMs})`);
           return Boolean(sent);
         }
 

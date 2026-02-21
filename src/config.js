@@ -197,6 +197,24 @@ const config = {
   openaiTtsStreamFormat: pickTtsStreamFormat(process.env.OPENAI_TTS_STREAM_FORMAT),
   voiceCoreMode: pickVoiceCoreMode(process.env.VOICE_CORE_MODE),
   voiceCoreVerboseLogs: asBoolean(process.env.VOICE_CORE_VERBOSE_LOGS, false),
+  voiceCoreMinUserAudioMs: asBoundedNumber(
+    process.env.VOICE_CORE_MIN_USER_AUDIO_MS,
+    {
+      fallback: 400,
+      min: 120,
+      max: 12000,
+      integer: true
+    }
+  ),
+  voiceCoreMinTranscriptChars: asBoundedNumber(
+    process.env.VOICE_CORE_MIN_TRANSCRIPT_CHARS,
+    {
+      fallback: 3,
+      min: 1,
+      max: 64,
+      integer: true
+    }
+  ),
   openaiRealtimeModel: cleanString(
     process.env.OPENAI_REALTIME_MODEL,
     "gpt-4o-mini-realtime-preview-2024-12-17"

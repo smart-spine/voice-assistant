@@ -76,6 +76,21 @@ class AudioPipeline {
     return normalized;
   }
 
+  clearInputFrames({ reason = "clear_input" } = {}) {
+    const clearedFrames = this.inputFrames.length;
+    const clearedMs = this.inputBufferedMs;
+    const clearedBytes = this.inputBufferedBytes;
+    this.inputFrames = [];
+    this.inputBufferedMs = 0;
+    this.inputBufferedBytes = 0;
+    return {
+      reason: String(reason || "clear_input"),
+      cleared_frames: clearedFrames,
+      cleared_ms: clearedMs,
+      cleared_bytes: clearedBytes
+    };
+  }
+
   popOutputFrame() {
     if (this.outputFrames.length === 0) {
       return null;

@@ -11,7 +11,21 @@ const {
   estimatePcm16DurationMs
 } = require("../protocol/audio-frame");
 const { nowMs } = require("../protocol/envelope");
-const { warn } = require("../../logger");
+const { log, warn } = require("../../logger");
+
+const OPENAI_CLIENT_EVENT_TYPES = new Set([
+  "session.update",
+  "transcription_session.update",
+  "input_audio_buffer.append",
+  "input_audio_buffer.commit",
+  "input_audio_buffer.clear",
+  "conversation.item.create",
+  "conversation.item.truncate",
+  "conversation.item.delete",
+  "conversation.item.retrieve",
+  "response.create",
+  "response.cancel"
+]);
 
 function safeJsonParse(raw, fallback = null) {
   try {
@@ -71,6 +85,19 @@ function redactOpenAiError(message) {
   return text
     .replace(/sk-[A-Za-z0-9_-]+/g, "sk-***")
     .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer ***");
+}
+
+function toLogMeta(raw = {}) {
+  const event = raw && typeof raw === "object" ? raw : {};
+  return {
+    event_id: String(event?.event_id || "").trim() || undefined,
+    type: String(event?.type || "").trim().toLowerCase() || undefined,
+    session_id:
+      String(event?.session_id || event?.session?.id || "").trim() || undefined,
+    response_id:
+      String(event?.response_id || event?.response?.id || "").trim() || undefined,
+    item_id: String(event?.item_id || event?.item?.id || "").trim() || undefined
+  };
 }
 
 function buildRealtimeTurnDetection({
@@ -149,6 +176,10 @@ class BaseAIProvider extends EventEmitter {
     throw new Error("commitInput() is not implemented.");
   }
 
+  async clearInputBuffer() {
+    throw new Error("clearInputBuffer() is not implemented.");
+  }
+
   async interrupt() {
     throw new Error("interrupt() is not implemented.");
   }
@@ -164,6 +195,35 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
 
     this.runtimeConfig = runtimeConfig || {};
     this.now = typeof now === "function" ? now : () => Date.now();
+    this.debugScope = "VOICE-CORE:AI-PROVIDER";
+    this.voiceCoreVerboseLogs = Boolean(this.runtimeConfig.voiceCoreVerboseLogs);
+    this.voiceCoreMinUserAudioMs = clampNumber(
+      this.runtimeConfig.voiceCoreMinUserAudioMs,
+      {
+        fallback: 400,
+        min: 120,
+        max: 12000,
+        integer: true
+      }
+    );
+    this.voiceCoreMinTranscriptChars = clampNumber(
+      this.runtimeConfig.voiceCoreMinTranscriptChars,
+      {
+        fallback: 3,
+        min: 1,
+        max: 64,
+        integer: true
+      }
+    );
+    this.shortCommitTranscriptWaitMs = clampNumber(
+      this.runtimeConfig.voiceCoreShortCommitTranscriptWaitMs,
+      {
+        fallback: 1200,
+        min: 120,
+        max: 5000,
+        integer: true
+      }
+    );
 
     this.sessionId = "";
     this.upstream = null;
@@ -184,8 +244,12 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     this.currentAssistantItemId = "";
     this.currentAssistantContentIndex = 0;
     this.currentResponseAudioMs = 0;
+    this.lastTruncateForItemId = "";
+    this.lastTruncateAudioEndMs = 0;
 
     this.outputCarryBytes = new Uint8Array(0);
+    this.pendingShortCommit = null;
+    this.pendingShortCommitTimer = null;
     this.outputChunkTargetMs = clampNumber(
       this.runtimeConfig.voiceCoreOutputChunkMs,
       {
@@ -273,15 +337,77 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
   }
 
   sendUpstream(event = {}) {
+    const normalizedType = String(event?.type || "")
+      .trim()
+      .toLowerCase();
+    if (!OPENAI_CLIENT_EVENT_TYPES.has(normalizedType)) {
+      this.emit("warning", {
+        code: "unsupported_client_event",
+        message: `Blocked unsupported realtime client event: ${normalizedType || "unknown"}`,
+        t_ms: this.now()
+      });
+      return false;
+    }
+
     if (!this.upstream || this.upstream.readyState !== WebSocket.OPEN) {
       return false;
     }
     try {
+      this.protocolLog("server->openai", {
+        ...toLogMeta(event),
+        type: normalizedType
+      });
       this.upstream.send(JSON.stringify(event));
       return true;
     } catch (_) {
       return false;
     }
+  }
+
+  protocolLog(direction, payload = {}) {
+    const normalizedDirection = String(direction || "").trim().toLowerCase();
+    if (!normalizedDirection) {
+      return;
+    }
+    const type = String(payload?.type || "").trim().toLowerCase();
+    if (!this.shouldProtocolLog(normalizedDirection, type)) {
+      return;
+    }
+    const safePayload = {
+      ...(payload && typeof payload === "object" ? payload : {})
+    };
+    if (safePayload.audio) {
+      safePayload.audio = `[base64:${String(safePayload.audio).length}]`;
+    }
+    log(this.debugScope, `${normalizedDirection} ${JSON.stringify(safePayload)}`);
+  }
+
+  shouldProtocolLog(direction, type) {
+    if (this.voiceCoreVerboseLogs) {
+      return true;
+    }
+    if (direction === "server->openai") {
+      return [
+        "session.update",
+        "input_audio_buffer.commit",
+        "input_audio_buffer.clear",
+        "conversation.item.create",
+        "conversation.item.truncate",
+        "response.create",
+        "response.cancel"
+      ].includes(type);
+    }
+    if (direction === "openai->server") {
+      return [
+        "error",
+        "response.created",
+        "response.done",
+        "response.audio.done",
+        "conversation.item.input_audio_transcription.completed",
+        "input_audio_buffer.committed"
+      ].includes(type);
+    }
+    return false;
   }
 
   outputChunkTargetBytes({ sampleRateHz = 24000, channels = 1 } = {}) {
@@ -416,6 +542,68 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     return true;
   }
 
+  clearPendingShortCommit() {
+    if (this.pendingShortCommitTimer) {
+      clearTimeout(this.pendingShortCommitTimer);
+      this.pendingShortCommitTimer = null;
+    }
+    this.pendingShortCommit = null;
+  }
+
+  deferShortCommitResponse({
+    commitId = "",
+    bufferedMs = 0,
+    reason = "commit_force_response",
+    source = "input_audio_buffer.committed"
+  } = {}) {
+    this.clearPendingShortCommit();
+    this.pendingShortCommit = {
+      commit_id: String(commitId || "").trim() || undefined,
+      buffered_ms: Math.max(0, Number(bufferedMs) || 0),
+      reason: String(reason || "commit_force_response").trim() || "commit_force_response",
+      source: String(source || "input_audio_buffer.committed").trim() || "input_audio_buffer.committed",
+      committed_at_ms: this.now()
+    };
+    this.pendingShortCommitTimer = setTimeout(() => {
+      if (!this.started || !this.pendingShortCommit) {
+        return;
+      }
+      const pending = this.pendingShortCommit;
+      this.clearPendingShortCommit();
+      this.emit("warning", {
+        code: "empty_turn_skipped",
+        message:
+          "Skipped short committed turn: no transcript detected before timeout.",
+        commit_id: pending.commit_id,
+        buffered_ms: pending.buffered_ms,
+        t_ms: this.now()
+      });
+    }, this.shortCommitTranscriptWaitMs);
+  }
+
+  maybeDispatchDeferredShortCommit({
+    transcriptText = "",
+    transcriptAtMs = this.now()
+  } = {}) {
+    if (!this.pendingShortCommit) {
+      return false;
+    }
+    const normalizedText = normalizeText(transcriptText);
+    if (normalizedText.length < this.voiceCoreMinTranscriptChars) {
+      return false;
+    }
+    if (Number(transcriptAtMs || 0) + 80 < Number(this.pendingShortCommit.committed_at_ms || 0)) {
+      return false;
+    }
+    const pending = this.pendingShortCommit;
+    this.clearPendingShortCommit();
+    this.enqueueResponseCreate({
+      reason: pending.reason || "commit_force_response",
+      source: "short_commit_transcript"
+    });
+    return true;
+  }
+
   async startSession({ sessionId = "", sessionConfig = {} } = {}) {
     if (this.started) {
       await this.stopSession({ reason: "restart" });
@@ -479,7 +667,10 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     this.currentAssistantItemId = "";
     this.currentAssistantContentIndex = 0;
     this.currentResponseAudioMs = 0;
+    this.lastTruncateForItemId = "";
+    this.lastTruncateAudioEndMs = 0;
     this.outputCarryBytes = new Uint8Array(0);
+    this.clearPendingShortCommit();
 
     upstream.on("message", (rawValue) => {
       const event = safeJsonParse(String(rawValue || ""), null);
@@ -548,6 +739,11 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
       return;
     }
 
+    this.protocolLog("openai->server", {
+      ...toLogMeta(event),
+      type
+    });
+
     if (type === "session.created" || type === "session.updated") {
       this.emit("session.state", {
         state: "ready",
@@ -586,10 +782,20 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
       });
 
       if (forceResponse) {
-        this.enqueueResponseCreate({
-          reason: "commit_force_response",
-          source: "input_audio_buffer.committed"
-        });
+        const bufferedMs = Math.max(0, Number(pending?.buffered_ms || 0));
+        if (bufferedMs < this.voiceCoreMinUserAudioMs) {
+          this.deferShortCommitResponse({
+            commitId,
+            bufferedMs,
+            reason: "commit_force_response",
+            source: "input_audio_buffer.committed"
+          });
+        } else {
+          this.enqueueResponseCreate({
+            reason: "commit_force_response",
+            source: "input_audio_buffer.committed"
+          });
+        }
       }
       return;
     }
@@ -604,6 +810,10 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
       const prev = this.partialBufferByItem.get(itemId) || "";
       const text = normalizeText(`${prev} ${delta}`);
       this.partialBufferByItem.set(itemId, text);
+      this.maybeDispatchDeferredShortCommit({
+        transcriptText: text,
+        transcriptAtMs: this.now()
+      });
 
       this.emit("stt.partial", {
         turn_id: itemId,
@@ -628,6 +838,10 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
         text: transcript,
         t_ms: this.now()
       });
+      this.maybeDispatchDeferredShortCommit({
+        transcriptText: transcript,
+        transcriptAtMs: this.now()
+      });
       return;
     }
 
@@ -640,6 +854,9 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
       this.currentAssistantItemId = "";
       this.currentAssistantContentIndex = 0;
       this.currentResponseAudioMs = 0;
+      this.lastTruncateForItemId = "";
+      this.lastTruncateAudioEndMs = 0;
+      this.clearPendingShortCommit();
       this.outputCarryBytes = new Uint8Array(0);
       this.emit("assistant.state", {
         state: "speaking",
@@ -804,6 +1021,8 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
       this.currentAssistantItemId = "";
       this.currentAssistantContentIndex = 0;
       this.currentResponseAudioMs = 0;
+      this.lastTruncateForItemId = "";
+      this.lastTruncateAudioEndMs = 0;
       this.lastInterruptReason = "";
       this.maybeDispatchPendingResponseCreate();
       return;
@@ -833,6 +1052,22 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
           this.interruptInFlight = false;
           this.maybeDispatchPendingResponseCreate();
         }, 380);
+        return;
+      }
+
+      if (
+        errorCode === "invalid_value" ||
+        errorCode === "unknown_parameter" ||
+        errorCode === "invalid_request_error"
+      ) {
+        this.interruptInFlight = false;
+        this.interruptRequestedAtMs = 0;
+        this.emit("warning", {
+          code: errorCode,
+          message: errorMessage,
+          t_ms: this.now()
+        });
+        this.maybeDispatchPendingResponseCreate();
         return;
       }
 
@@ -899,6 +1134,15 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     });
   }
 
+  async clearInputBuffer() {
+    if (!this.started) {
+      return false;
+    }
+    return this.sendUpstream({
+      type: "input_audio_buffer.clear"
+    });
+  }
+
   async interrupt({ reason = "interrupt", truncateAudioMs = null } = {}) {
     if (!this.started) {
       return;
@@ -914,17 +1158,31 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
         ) || 0
       )
     );
-    if (truncateItemId && resolvedTruncateAudioMs > 0) {
-      this.sendUpstream({
+    const shouldTruncate =
+      truncateItemId &&
+      resolvedTruncateAudioMs > 0 &&
+      (this.lastTruncateForItemId !== truncateItemId ||
+        resolvedTruncateAudioMs > Number(this.lastTruncateAudioEndMs || 0));
+    if (shouldTruncate) {
+      const contentIndex = Math.max(
+        0,
+        Math.trunc(Number(this.currentAssistantContentIndex || 0))
+      );
+      const truncated = this.sendUpstream({
         type: "conversation.item.truncate",
         item_id: truncateItemId,
-        content_index: Math.max(0, Math.trunc(Number(this.currentAssistantContentIndex || 0))),
+        content_index: contentIndex,
         audio_end_ms: resolvedTruncateAudioMs
       });
+      if (truncated) {
+        this.lastTruncateForItemId = truncateItemId;
+        this.lastTruncateAudioEndMs = resolvedTruncateAudioMs;
+      }
     }
 
-    this.sendUpstream({ type: "response.cancel" });
-    this.sendUpstream({ type: "output_audio_buffer.clear" });
+    if (this.assistantInProgress || this.currentResponseId) {
+      this.sendUpstream({ type: "response.cancel" });
+    }
 
     this.interruptInFlight = this.assistantInProgress;
     this.interruptRequestedAtMs = this.now();
@@ -1052,7 +1310,10 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     this.currentAssistantItemId = "";
     this.currentAssistantContentIndex = 0;
     this.currentResponseAudioMs = 0;
+    this.lastTruncateForItemId = "";
+    this.lastTruncateAudioEndMs = 0;
     this.outputCarryBytes = new Uint8Array(0);
+    this.clearPendingShortCommit();
 
     if (this.upstream) {
       try {

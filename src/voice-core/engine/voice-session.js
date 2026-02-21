@@ -97,6 +97,18 @@ class VoiceSession extends EventEmitter {
     this.sessionConfig = {};
     this.lastInputAt = 0;
     this.metrics = this.createEmptyMetrics();
+    this.hasSpeechSinceLastCommit = false;
+    this.userAudioSinceLastCommitMs = 0;
+    this.lastFinalTranscriptCharsSinceCommit = 0;
+    this.skippedEmptyTurnCount = 0;
+    this.voiceCoreMinUserAudioMs = Math.max(
+      120,
+      Number(this.runtimeConfig.voiceCoreMinUserAudioMs || 400)
+    );
+    this.voiceCoreMinTranscriptChars = Math.max(
+      1,
+      Number(this.runtimeConfig.voiceCoreMinTranscriptChars || 3)
+    );
 
     this.debugScope = `VOICE-CORE:${this.sessionId}`;
     this.voiceCoreVerboseLogs = Boolean(this.runtimeConfig.voiceCoreVerboseLogs);
@@ -217,6 +229,7 @@ class VoiceSession extends EventEmitter {
 
   bindTurnManagerEvents() {
     this.turnManager.on("vad.start", (event) => {
+      this.hasSpeechSinceLastCommit = true;
       this.protocolLog("event", "turn.vad.start", event);
     });
 
@@ -322,6 +335,7 @@ class VoiceSession extends EventEmitter {
         return;
       }
       this.markSttFinal(event?.t_ms || this.now());
+      this.lastFinalTranscriptCharsSinceCommit = text.length;
       log(
         this.debugScope,
         `stt.final "${this.truncateForLog(text, 220)}"`
@@ -443,11 +457,33 @@ class VoiceSession extends EventEmitter {
 
     this.aiProvider.on("error", async (event) => {
       this.protocolLog("error", "error", event);
+      const code = String(event?.code || "provider_error").trim().toLowerCase();
+      const message = String(event?.message || "Voice provider error.").trim();
+      const recoverable =
+        code === "invalid_value" ||
+        code === "unknown_parameter" ||
+        code === "invalid_request_error" ||
+        code === "conversation_already_has_active_response";
+      if (recoverable) {
+        await this.sendControlEvent("warning", {
+          code,
+          message,
+          recoverable: true,
+          t_ms: Number(event?.t_ms || this.now())
+        });
+        const state =
+          this.audioPipeline.getStats()?.input?.buffered_ms > 0
+            ? SESSION_STATES.LISTENING
+            : SESSION_STATES.READY;
+        await this.setState(state, `recoverable_error:${code}`);
+        await this.sendSessionState(state, `recoverable_error:${code}`);
+        return;
+      }
       await this.setState(SESSION_STATES.ERROR, String(event?.code || "provider_error"));
       this.metrics = this.createEmptyMetrics();
       await this.sendControlEvent("error", {
         code: String(event?.code || "provider_error").trim() || "provider_error",
-        message: String(event?.message || "Voice provider error.").trim(),
+        message,
         fatal: Boolean(event?.fatal),
         t_ms: Number(event?.t_ms || this.now())
       });
@@ -485,6 +521,11 @@ class VoiceSession extends EventEmitter {
       "session.started",
       "session.state",
       "session.stop",
+      "session.start",
+      "session.update",
+      "audio.commit",
+      "assistant.interrupt",
+      "text.input",
       "turn.eot",
       "stt.final",
       "assistant.state",
@@ -545,7 +586,12 @@ class VoiceSession extends EventEmitter {
       msgId: createId("core")
     });
 
-    this.protocolLog("tx", type, payload);
+    this.protocolLog("server->client", type, {
+      event_id: envelope.msg_id,
+      session_id: envelope.session_id,
+      reply_to: envelope.reply_to,
+      ...payload
+    });
     await this.transport.sendControl(envelope);
     return envelope;
   }
@@ -628,7 +674,12 @@ class VoiceSession extends EventEmitter {
     }
 
     const event = validation.value;
-    this.protocolLog("rx", event.type, event.payload);
+    this.protocolLog("client->server", event.type, {
+      event_id: event.msg_id,
+      session_id: event.session_id,
+      reply_to: event.reply_to,
+      ...(event.payload || {})
+    });
 
     switch (event.type) {
       case "ping": {
@@ -657,8 +708,12 @@ class VoiceSession extends EventEmitter {
       }
 
       case "assistant.interrupt": {
+        const playedMs = Number(event?.payload?.played_ms);
         await this.handleInterrupt({
-          reason: String(event.payload?.reason || "client_interrupt").trim() || "client_interrupt"
+          reason: String(event.payload?.reason || "client_interrupt").trim() || "client_interrupt",
+          playedMs: Number.isFinite(playedMs)
+            ? Math.max(0, Math.trunc(playedMs))
+            : null
         });
         return;
       }
@@ -770,6 +825,10 @@ class VoiceSession extends EventEmitter {
     this.lastInputAt = this.now();
 
     this.audioPipeline.appendInputFrame(normalizedFrame);
+    this.userAudioSinceLastCommitMs += Math.max(
+      0,
+      Number(normalizedFrame?.duration_ms || 0)
+    );
     this.markInputStarted(this.now());
     this.turnManager.onInputFrame(normalizedFrame);
 
@@ -790,6 +849,84 @@ class VoiceSession extends EventEmitter {
       return {
         ok: false,
         code: "session_not_started"
+      };
+    }
+
+    const currentState = normalizeState(this.state);
+    if (
+      currentState === SESSION_STATES.SPEAKING ||
+      currentState === SESSION_STATES.THINKING ||
+      currentState === SESSION_STATES.ERROR ||
+      currentState === SESSION_STATES.STOPPED
+    ) {
+      this.protocolLog("event", "commit.skipped.state", {
+        source,
+        reason,
+        state: currentState
+      });
+      return {
+        ok: false,
+        code: "commit_blocked_state",
+        reason: `Commit is blocked while state=${currentState}.`
+      };
+    }
+
+    const stats = this.audioPipeline.getStats()?.input || {};
+    const bufferedMs = Math.max(
+      0,
+      Number(stats?.buffered_ms || 0),
+      Number(this.userAudioSinceLastCommitMs || 0)
+    );
+    const transcriptChars = Math.max(
+      0,
+      Number(this.lastFinalTranscriptCharsSinceCommit || 0)
+    );
+    const hasSpeech = Boolean(this.hasSpeechSinceLastCommit);
+    const shouldAllowTurn =
+      !forceResponse ||
+      hasSpeech ||
+      bufferedMs >= this.voiceCoreMinUserAudioMs ||
+      transcriptChars >= this.voiceCoreMinTranscriptChars;
+    if (!shouldAllowTurn) {
+      this.audioPipeline.clearInputFrames({
+        reason: "empty_turn_gate"
+      });
+      this.turnManager.onTurnCommitted();
+      this.hasSpeechSinceLastCommit = false;
+      this.userAudioSinceLastCommitMs = 0;
+      this.lastFinalTranscriptCharsSinceCommit = 0;
+      this.skippedEmptyTurnCount += 1;
+      if (typeof this.aiProvider.clearInputBuffer === "function") {
+        try {
+          await this.aiProvider.clearInputBuffer();
+        } catch (_) {
+          // Ignore input clear failures for empty turns.
+        }
+      }
+      this.protocolLog("event", "turn.skipped.empty", {
+        source,
+        reason,
+        buffered_ms: bufferedMs,
+        transcript_chars: transcriptChars,
+        has_speech: hasSpeech,
+        skipped_count: this.skippedEmptyTurnCount
+      });
+      await this.sendControlEvent("warning", {
+        code: "empty_turn_skipped",
+        message: "Skipped empty turn: no meaningful user speech detected.",
+        source,
+        buffered_ms: bufferedMs,
+        transcript_chars: transcriptChars,
+        has_speech: hasSpeech,
+        skipped_count: this.skippedEmptyTurnCount,
+        t_ms: this.now()
+      });
+      await this.setState(SESSION_STATES.LISTENING, "empty_turn_skipped");
+      await this.sendSessionState("listening", "empty_turn_skipped");
+      return {
+        ok: false,
+        code: "empty_turn_skipped",
+        buffered_ms: bufferedMs
       };
     }
 
@@ -814,11 +951,37 @@ class VoiceSession extends EventEmitter {
     const snapshot = commitResult.snapshot;
     this.markCommitted(snapshot);
     this.turnManager.onTurnCommitted();
+    this.hasSpeechSinceLastCommit = false;
+    this.userAudioSinceLastCommitMs = 0;
+    this.lastFinalTranscriptCharsSinceCommit = 0;
 
     const transitioned = await this.setState(SESSION_STATES.THINKING, `commit:${source}`);
-    if (transitioned && normalizeState(this.state) === SESSION_STATES.THINKING) {
-      await this.sendSessionState("thinking", `commit:${source}`);
+    if (!transitioned || normalizeState(this.state) !== SESSION_STATES.THINKING) {
+      this.audioPipeline.dropPendingCommits({
+        reason: "commit_blocked_state"
+      });
+      if (typeof this.aiProvider.clearInputBuffer === "function") {
+        try {
+          await this.aiProvider.clearInputBuffer();
+        } catch (_) {
+          // Ignore input clear failures for dropped commits.
+        }
+      }
+      this.protocolLog("event", "commit.skipped.state", {
+        source,
+        reason,
+        state: normalizeState(this.state),
+        commit_id: snapshot.commit_id
+      });
+      return {
+        ok: false,
+        code: "commit_blocked_state",
+        reason: `Commit dropped because state changed before dispatch (state=${normalizeState(
+          this.state
+        )}).`
+      };
     }
+    await this.sendSessionState("thinking", `commit:${source}`);
 
     await this.aiProvider.commitInput({
       commitId: snapshot.commit_id,
@@ -836,16 +999,14 @@ class VoiceSession extends EventEmitter {
     };
   }
 
-  async handleInterrupt({ reason = "interrupt" } = {}) {
+  async handleInterrupt({ reason = "interrupt", playedMs = null } = {}) {
     if (!this.started) {
       return;
     }
 
-    const outputStats = this.audioPipeline.getStats()?.output || {};
-    const truncateAudioMs = Math.max(
-      0,
-      Math.trunc(Number(outputStats.buffered_ms || 0))
-    );
+    const truncateAudioMs = Number.isFinite(Number(playedMs))
+      ? Math.max(0, Math.trunc(Number(playedMs)))
+      : null;
     this.audioPipeline.clearOutputFrames();
     this.turnManager.setAssistantSpeaking(false);
 

@@ -30,6 +30,7 @@ class FakeAIProvider extends EventEmitter {
     super();
     this.started = false;
     this.commitCalls = [];
+    this.clearCalls = 0;
   }
 
   async startSession() {
@@ -103,6 +104,11 @@ class FakeAIProvider extends EventEmitter {
     });
   }
 
+  async clearInputBuffer() {
+    this.clearCalls += 1;
+    return true;
+  }
+
   async stopSession() {
     this.started = false;
     this.emit("session.state", {
@@ -122,6 +128,7 @@ test("VoiceSession commits audio and streams assistant output", async () => {
     runtimeConfig: {
       voiceCoreMinCommitMs: 100,
       voiceCoreMinCommitBytes: 2400,
+      voiceCoreMinUserAudioMs: 100,
       semanticEotEnabled: false
     },
     transport,
@@ -231,6 +238,160 @@ test("VoiceSession rejects too-small commit payload", async () => {
   assert.equal(provider.commitCalls.length, 0);
   const warning = transport.controls.find((item) => item.type === "warning");
   assert.ok(Boolean(warning));
+
+  await session.stop({ reason: "test_done" });
+});
+
+test("VoiceSession skips empty turn without forcing model response", async () => {
+  const transport = new FakeTransport();
+  const provider = new FakeAIProvider();
+
+  const session = new VoiceSession({
+    sessionId: "vs_test_empty_turn",
+    runtimeConfig: {
+      voiceCoreMinCommitMs: 100,
+      voiceCoreMinCommitBytes: 2400,
+      voiceCoreMinUserAudioMs: 400,
+      voiceCoreMinTranscriptChars: 3,
+      semanticEotEnabled: false
+    },
+    transport,
+    aiProvider: provider
+  });
+
+  await session.start(
+    buildEnvelope({
+      type: "session.start",
+      msgId: createId("client"),
+      payload: {
+        client: { kind: "ui", name: "test", version: "1.0.0" }
+      }
+    })
+  );
+
+  // 180ms of silence-like PCM (zeros) should not pass empty-turn gate.
+  await session.onAudio({
+    kind: "input_audio",
+    codec: "pcm16",
+    seq: 1,
+    sample_rate_hz: 24000,
+    channels: 1,
+    duration_ms: 180,
+    bytes: new Uint8Array(9000)
+  });
+
+  await session.onControl(
+    buildEnvelope({
+      type: "audio.commit",
+      sessionId: "vs_test_empty_turn",
+      msgId: createId("client"),
+      payload: {
+        reason: "manual",
+        force_response: true
+      }
+    })
+  );
+
+  assert.equal(provider.commitCalls.length, 0);
+  assert.equal(provider.clearCalls, 1);
+  const skippedWarning = transport.controls.find(
+    (item) =>
+      item.type === "warning" && String(item?.payload?.code || "") === "empty_turn_skipped"
+  );
+  assert.ok(Boolean(skippedWarning));
+  assert.equal(session.getStatus().state, "listening");
+
+  await session.stop({ reason: "test_done" });
+});
+
+test("VoiceSession treats invalid_value provider errors as recoverable", async () => {
+  const transport = new FakeTransport();
+  const provider = new FakeAIProvider();
+
+  const session = new VoiceSession({
+    sessionId: "vs_test_recoverable_error",
+    runtimeConfig: {
+      semanticEotEnabled: false
+    },
+    transport,
+    aiProvider: provider
+  });
+
+  await session.start(
+    buildEnvelope({
+      type: "session.start",
+      msgId: createId("client"),
+      payload: {
+        client: { kind: "ui", name: "test", version: "1.0.0" }
+      }
+    })
+  );
+
+  provider.emit("error", {
+    code: "invalid_value",
+    message: "Unsupported event type",
+    fatal: false,
+    t_ms: Date.now()
+  });
+
+  // allow async listeners to flush
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const warning = transport.controls.find(
+    (item) =>
+      item.type === "warning" &&
+      String(item?.payload?.code || "").toLowerCase() === "invalid_value"
+  );
+  assert.ok(Boolean(warning));
+  assert.notEqual(session.getStatus().state, "error");
+
+  await session.stop({ reason: "test_done" });
+});
+
+test("VoiceSession handles interrupt during speaking without entering error", async () => {
+  const transport = new FakeTransport();
+  const provider = new FakeAIProvider();
+
+  const session = new VoiceSession({
+    sessionId: "vs_test_interrupt_recovery",
+    runtimeConfig: {
+      semanticEotEnabled: false
+    },
+    transport,
+    aiProvider: provider
+  });
+
+  await session.start(
+    buildEnvelope({
+      type: "session.start",
+      msgId: createId("client"),
+      payload: {
+        client: { kind: "ui", name: "test", version: "1.0.0" }
+      }
+    })
+  );
+
+  provider.emit("assistant.state", {
+    state: "speaking",
+    response_id: "rsp_interrupt",
+    t_ms: Date.now()
+  });
+
+  await session.onControl(
+    buildEnvelope({
+      type: "assistant.interrupt",
+      sessionId: "vs_test_interrupt_recovery",
+      msgId: createId("client"),
+      payload: {
+        reason: "barge_in",
+        played_ms: 220
+      }
+    })
+  );
+
+  const clearEvent = transport.controls.find((item) => item.type === "audio.clear");
+  assert.ok(Boolean(clearEvent));
+  assert.notEqual(session.getStatus().state, "error");
 
   await session.stop({ reason: "test_done" });
 });
