@@ -337,10 +337,12 @@ class VoiceSession extends EventEmitter {
         reportedSessionState = SESSION_STATES.SPEAKING;
       } else if (state === "done") {
         this.turnManager.setAssistantSpeaking(false);
+        this.audioPipeline.clearOutputFrames();
         await this.setState(SESSION_STATES.READY, state);
         reportedSessionState = SESSION_STATES.READY;
       } else if (state === "interrupted") {
         this.turnManager.setAssistantSpeaking(false);
+        this.audioPipeline.clearOutputFrames();
         await this.setState(SESSION_STATES.INTERRUPTED, state);
         reportedSessionState = SESSION_STATES.INTERRUPTED;
         await this.sendControlEvent("audio.clear", {
@@ -821,8 +823,13 @@ class VoiceSession extends EventEmitter {
       return;
     }
 
-    await this.aiProvider.interrupt({ reason });
+    const outputStats = this.audioPipeline.getStats()?.output || {};
+    const truncateAudioMs = Math.max(
+      0,
+      Math.trunc(Number(outputStats.buffered_ms || 0))
+    );
     this.audioPipeline.clearOutputFrames();
+    this.turnManager.setAssistantSpeaking(false);
 
     await this.sendControlEvent("audio.clear", {
       reason,
@@ -831,6 +838,18 @@ class VoiceSession extends EventEmitter {
 
     await this.setState(SESSION_STATES.INTERRUPTED, reason);
     await this.sendSessionState("interrupted", reason);
+
+    try {
+      await this.aiProvider.interrupt({
+        reason,
+        truncateAudioMs
+      });
+    } catch (interruptError) {
+      warn(
+        this.debugScope,
+        `provider interrupt failed: ${interruptError?.message || interruptError}`
+      );
+    }
   }
 
   async handleBargeIn(event = {}) {

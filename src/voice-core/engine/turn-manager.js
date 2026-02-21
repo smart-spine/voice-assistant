@@ -197,7 +197,10 @@ class TurnManager extends EventEmitter {
     const now = this.now();
     const frameDurationMs = Math.max(1, Number(frame?.duration_ms || 0) || 20);
     const rms = computePcm16Rms(frame?.bytes);
-    const speechDetected = rms >= this.vadThreshold;
+    const effectiveVadThreshold = this.assistantSpeaking
+      ? Math.max(0.003, this.vadThreshold * 0.55)
+      : this.vadThreshold;
+    const speechDetected = rms >= effectiveVadThreshold;
 
     if (speechDetected) {
       if (!this.speechActive) {
@@ -216,12 +219,13 @@ class TurnManager extends EventEmitter {
           this.pendingBargeIn = true;
           this.bargeInStartedAt = now;
           this.bargeInConfirmed = false;
-          this.emit("barge_in.start", {
-            reason: "assistant_speaking",
-            rms,
-            t_ms: now
-          });
-        }
+        this.emit("barge_in.start", {
+          reason: "assistant_speaking",
+          rms,
+          threshold: effectiveVadThreshold,
+          t_ms: now
+        });
+      }
 
         const bargeInMs = Math.max(0, now - this.bargeInStartedAt + frameDurationMs);
         if (!this.bargeInConfirmed && bargeInMs >= this.bargeInMinMs) {
@@ -229,6 +233,7 @@ class TurnManager extends EventEmitter {
           this.emit("barge_in.confirmed", {
             reason: "speech_while_assistant",
             rms,
+            threshold: effectiveVadThreshold,
             speech_ms: bargeInMs,
             t_ms: now
           });

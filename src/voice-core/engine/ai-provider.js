@@ -36,6 +36,21 @@ function normalizeText(value) {
     .trim();
 }
 
+function concatUint8Arrays(left, right) {
+  const a = left instanceof Uint8Array ? left : new Uint8Array(0);
+  const b = right instanceof Uint8Array ? right : new Uint8Array(0);
+  if (!a.byteLength) {
+    return b;
+  }
+  if (!b.byteLength) {
+    return a;
+  }
+  const merged = new Uint8Array(a.byteLength + b.byteLength);
+  merged.set(a, 0);
+  merged.set(b, a.byteLength);
+  return merged;
+}
+
 function normalizeLanguageTag(rawValue) {
   const value = String(rawValue || "").trim().toLowerCase();
   if (!value) {
@@ -160,6 +175,26 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     this.pendingCommitQueue = [];
 
     this.assistantInProgress = false;
+    this.pendingResponseCreate = null;
+    this.interruptInFlight = false;
+    this.interruptRequestedAtMs = 0;
+    this.lastInterruptReason = "";
+
+    this.currentResponseId = "";
+    this.currentAssistantItemId = "";
+    this.currentAssistantContentIndex = 0;
+    this.currentResponseAudioMs = 0;
+
+    this.outputCarryBytes = new Uint8Array(0);
+    this.outputChunkTargetMs = clampNumber(
+      this.runtimeConfig.voiceCoreOutputChunkMs,
+      {
+        fallback: 90,
+        min: 40,
+        max: 320,
+        integer: true
+      }
+    );
   }
 
   resolveConfig(sessionConfig = {}) {
@@ -249,6 +284,138 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     }
   }
 
+  outputChunkTargetBytes({ sampleRateHz = 24000, channels = 1 } = {}) {
+    const sampleRate = Math.max(8000, Number(sampleRateHz) || 24000);
+    const channelCount = Math.max(1, Number(channels) || 1);
+    const ms = Math.max(40, Number(this.outputChunkTargetMs) || 90);
+    const bytesPerMs = (sampleRate * channelCount * 2) / 1000;
+    const target = Math.floor(bytesPerMs * ms);
+    return Math.max(channelCount * 2 * 80, target);
+  }
+
+  emitOutputPcmChunk(bytes, { responseId = "", itemId = "", contentIndex = 0 } = {}) {
+    if (!(bytes instanceof Uint8Array) || !bytes.byteLength) {
+      return;
+    }
+    if (bytes.byteLength % 2 !== 0) {
+      return;
+    }
+
+    this.outputSeq += 1;
+    const frame = normalizeAudioFrame({
+      kind: AUDIO_KIND_OUTPUT,
+      codec: AUDIO_CODEC_PCM16,
+      seq: this.outputSeq,
+      sample_rate_hz: 24000,
+      channels: 1,
+      duration_ms: estimatePcm16DurationMs({
+        byteLength: bytes.byteLength,
+        sampleRateHz: 24000,
+        channels: 1
+      }),
+      bytes
+    });
+    this.currentResponseAudioMs += Number(frame.duration_ms || 0);
+
+    this.emit("assistant.audio.chunk", {
+      response_id: responseId || undefined,
+      item_id: itemId || undefined,
+      content_index: Number.isFinite(Number(contentIndex))
+        ? Math.max(0, Math.trunc(Number(contentIndex)))
+        : 0,
+      frame,
+      t_ms: this.now()
+    });
+  }
+
+  flushOutputCarry({
+    responseId = "",
+    itemId = "",
+    contentIndex = 0,
+    force = false
+  } = {}) {
+    if (!(this.outputCarryBytes instanceof Uint8Array) || !this.outputCarryBytes.byteLength) {
+      return;
+    }
+
+    let carry = this.outputCarryBytes;
+    if (!force) {
+      const targetBytes = this.outputChunkTargetBytes({
+        sampleRateHz: 24000,
+        channels: 1
+      });
+      if (carry.byteLength < targetBytes) {
+        return;
+      }
+    }
+
+    if (carry.byteLength % 2 !== 0) {
+      carry = carry.subarray(0, carry.byteLength - 1);
+    }
+    this.outputCarryBytes = new Uint8Array(0);
+    if (!carry.byteLength) {
+      return;
+    }
+    this.emitOutputPcmChunk(carry, {
+      responseId,
+      itemId,
+      contentIndex
+    });
+  }
+
+  enqueueResponseCreate({
+    reason = "response_create",
+    source = "upstream_commit"
+  } = {}) {
+    this.pendingResponseCreate = {
+      reason: String(reason || "response_create").trim() || "response_create",
+      source: String(source || "upstream_commit").trim() || "upstream_commit",
+      t_ms: this.now()
+    };
+    this.maybeDispatchPendingResponseCreate();
+  }
+
+  maybeDispatchPendingResponseCreate() {
+    if (!this.pendingResponseCreate || !this.started) {
+      return false;
+    }
+
+    // Hold off while cancel is still in flight, otherwise OpenAI may reject
+    // response.create with "active response in progress".
+    if (this.interruptInFlight) {
+      const waitMs = this.now() - Number(this.interruptRequestedAtMs || 0);
+      if (waitMs < 1500) {
+        return false;
+      }
+      this.interruptInFlight = false;
+      this.interruptRequestedAtMs = 0;
+    }
+
+    if (this.assistantInProgress) {
+      return false;
+    }
+
+    const pending = this.pendingResponseCreate;
+    const dispatched = this.sendUpstream({
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"]
+      }
+    });
+    if (!dispatched) {
+      return false;
+    }
+
+    this.pendingResponseCreate = null;
+    this.emit("assistant.state", {
+      state: "requested",
+      reason: pending.reason,
+      source: pending.source,
+      t_ms: this.now()
+    });
+    return true;
+  }
+
   async startSession({ sessionId = "", sessionConfig = {} } = {}) {
     if (this.started) {
       await this.stopSession({ reason: "restart" });
@@ -304,6 +471,15 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     this.pendingCommitQueue = [];
     this.partialBufferByItem.clear();
     this.assistantTextByResponse.clear();
+    this.pendingResponseCreate = null;
+    this.interruptInFlight = false;
+    this.interruptRequestedAtMs = 0;
+    this.lastInterruptReason = "";
+    this.currentResponseId = "";
+    this.currentAssistantItemId = "";
+    this.currentAssistantContentIndex = 0;
+    this.currentResponseAudioMs = 0;
+    this.outputCarryBytes = new Uint8Array(0);
 
     upstream.on("message", (rawValue) => {
       const event = safeJsonParse(String(rawValue || ""), null);
@@ -410,16 +586,9 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
       });
 
       if (forceResponse) {
-        this.sendUpstream({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"]
-          }
-        });
-        this.emit("assistant.state", {
-          state: "requested",
+        this.enqueueResponseCreate({
           reason: "commit_force_response",
-          t_ms: this.now()
+          source: "input_audio_buffer.committed"
         });
       }
       return;
@@ -464,11 +633,45 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
 
     if (type === "response.created") {
       this.assistantInProgress = true;
+      this.interruptInFlight = false;
+      this.interruptRequestedAtMs = 0;
+      this.currentResponseId = String(event?.response?.id || event?.response_id || "")
+        .trim();
+      this.currentAssistantItemId = "";
+      this.currentAssistantContentIndex = 0;
+      this.currentResponseAudioMs = 0;
+      this.outputCarryBytes = new Uint8Array(0);
       this.emit("assistant.state", {
         state: "speaking",
-        response_id: String(event?.response?.id || "").trim() || undefined,
+        response_id: this.currentResponseId || undefined,
         t_ms: this.now()
       });
+      return;
+    }
+
+    if (type === "response.output_item.added") {
+      const outputItem = event?.item && typeof event.item === "object" ? event.item : {};
+      const role = String(outputItem?.role || "").trim().toLowerCase();
+      const itemId = String(outputItem?.id || event?.item_id || "").trim();
+      if (role === "assistant" && itemId) {
+        this.currentAssistantItemId = itemId;
+      }
+      const contentIndex = Number(event?.content_index);
+      if (Number.isFinite(contentIndex) && contentIndex >= 0) {
+        this.currentAssistantContentIndex = Math.trunc(contentIndex);
+      }
+      return;
+    }
+
+    if (type === "response.content_part.added") {
+      const itemId = String(event?.item_id || "").trim();
+      if (itemId) {
+        this.currentAssistantItemId = itemId;
+      }
+      const contentIndex = Number(event?.content_index);
+      if (Number.isFinite(contentIndex) && contentIndex >= 0) {
+        this.currentAssistantContentIndex = Math.trunc(contentIndex);
+      }
       return;
     }
 
@@ -512,55 +715,146 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
         return;
       }
 
-      const bytes = base64ToBytes(audioBase64);
+      const responseId = String(event.response_id || this.currentResponseId || "").trim();
+      const itemId = String(event.item_id || this.currentAssistantItemId || "").trim();
+      const contentIndex = Number.isFinite(Number(event.content_index))
+        ? Math.max(0, Math.trunc(Number(event.content_index)))
+        : this.currentAssistantContentIndex;
+      if (itemId) {
+        this.currentAssistantItemId = itemId;
+      }
+      this.currentAssistantContentIndex = contentIndex;
+
+      let bytes = base64ToBytes(audioBase64);
       if (!bytes.byteLength) {
         return;
       }
 
-      this.outputSeq += 1;
-      const frame = normalizeAudioFrame({
-        kind: AUDIO_KIND_OUTPUT,
-        codec: AUDIO_CODEC_PCM16,
-        seq: this.outputSeq,
-        sample_rate_hz: 24000,
-        channels: 1,
-        duration_ms: estimatePcm16DurationMs({
-          byteLength: bytes.byteLength,
-          sampleRateHz: 24000,
-          channels: 1
-        }),
-        bytes
-      });
+      bytes = concatUint8Arrays(this.outputCarryBytes, bytes);
+      this.outputCarryBytes = new Uint8Array(0);
 
-      this.emit("assistant.audio.chunk", {
-        response_id: String(event.response_id || "").trim() || undefined,
-        frame,
-        t_ms: this.now()
+      const targetBytes = this.outputChunkTargetBytes({
+        sampleRateHz: 24000,
+        channels: 1
+      });
+      const evenLength = bytes.byteLength - (bytes.byteLength % 2);
+      let offset = 0;
+      while (evenLength - offset >= targetBytes) {
+        this.emitOutputPcmChunk(bytes.subarray(offset, offset + targetBytes), {
+          responseId,
+          itemId,
+          contentIndex
+        });
+        offset += targetBytes;
+      }
+
+      let remainder = bytes.subarray(offset);
+      if (remainder.byteLength % 2 !== 0) {
+        const odd = remainder.subarray(remainder.byteLength - 1);
+        remainder = remainder.subarray(0, remainder.byteLength - 1);
+        this.outputCarryBytes = concatUint8Arrays(remainder, odd);
+      } else {
+        this.outputCarryBytes = remainder;
+      }
+      return;
+    }
+
+    if (type === "response.audio.done") {
+      this.flushOutputCarry({
+        responseId: String(event.response_id || this.currentResponseId || "").trim(),
+        itemId: String(event.item_id || this.currentAssistantItemId || "").trim(),
+        contentIndex: this.currentAssistantContentIndex,
+        force: true
       });
       return;
     }
 
     if (type === "response.done") {
+      this.flushOutputCarry({
+        responseId: String(event?.response?.id || this.currentResponseId || "").trim(),
+        itemId: String(this.currentAssistantItemId || "").trim(),
+        contentIndex: this.currentAssistantContentIndex,
+        force: true
+      });
       this.assistantInProgress = false;
-      const status = String(event?.response?.status || event?.status || "unknown").trim();
+      this.interruptInFlight = false;
+      this.interruptRequestedAtMs = 0;
+
+      const status = String(event?.response?.status || event?.status || "unknown")
+        .trim()
+        .toLowerCase();
+      const responseId = String(event?.response?.id || this.currentResponseId || "")
+        .trim();
+      const wasCancelled =
+        status === "cancelled" ||
+        status === "canceled" ||
+        status === "interrupted" ||
+        status === "incomplete";
+
       this.emit("assistant.state", {
-        state: "done",
+        state: wasCancelled ? "interrupted" : "done",
         status,
-        response_id: String(event?.response?.id || "").trim() || undefined,
+        reason: wasCancelled
+          ? this.lastInterruptReason || "response_cancelled"
+          : undefined,
+        response_id: responseId || undefined,
         t_ms: this.now()
       });
+      this.currentResponseId = "";
+      this.currentAssistantItemId = "";
+      this.currentAssistantContentIndex = 0;
+      this.currentResponseAudioMs = 0;
+      this.lastInterruptReason = "";
+      this.maybeDispatchPendingResponseCreate();
       return;
     }
 
     if (type === "error") {
+      const errorCode = String(event?.error?.code || "upstream_error")
+        .trim()
+        .toLowerCase();
+      const errorMessage = redactOpenAiError(
+        event?.error?.message || event?.message || "Realtime upstream error."
+      );
+
+      if (errorCode === "conversation_already_has_active_response") {
+        this.assistantInProgress = true;
+        this.interruptInFlight = true;
+        this.interruptRequestedAtMs = this.now();
+        this.emit("warning", {
+          code: errorCode,
+          message: errorMessage,
+          t_ms: this.now()
+        });
+        setTimeout(() => {
+          if (!this.started) {
+            return;
+          }
+          this.interruptInFlight = false;
+          this.maybeDispatchPendingResponseCreate();
+        }, 380);
+        return;
+      }
+
+      this.interruptInFlight = false;
+      this.interruptRequestedAtMs = 0;
       this.emit("error", {
-        code: String(event?.error?.code || "upstream_error"),
-        message: redactOpenAiError(
-          event?.error?.message || event?.message || "Realtime upstream error."
-        ),
+        code: errorCode || "upstream_error",
+        message: errorMessage,
         fatal: false,
         t_ms: this.now()
       });
+      this.maybeDispatchPendingResponseCreate();
+      return;
+    }
+
+    if (
+      type === "rate_limits.updated" ||
+      type === "conversation.item.created" ||
+      type === "conversation.item.truncated" ||
+      type === "response.output_item.done" ||
+      type === "response.content_part.done"
+    ) {
       return;
     }
 
@@ -605,20 +899,63 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     });
   }
 
-  async interrupt({ reason = "interrupt" } = {}) {
+  async interrupt({ reason = "interrupt", truncateAudioMs = null } = {}) {
     if (!this.started) {
       return;
+    }
+
+    const normalizedReason = String(reason || "interrupt").trim() || "interrupt";
+    const truncateItemId = String(this.currentAssistantItemId || "").trim();
+    const resolvedTruncateAudioMs = Math.max(
+      0,
+      Math.trunc(
+        Number(
+          truncateAudioMs == null ? this.currentResponseAudioMs : truncateAudioMs
+        ) || 0
+      )
+    );
+    if (truncateItemId && resolvedTruncateAudioMs > 0) {
+      this.sendUpstream({
+        type: "conversation.item.truncate",
+        item_id: truncateItemId,
+        content_index: Math.max(0, Math.trunc(Number(this.currentAssistantContentIndex || 0))),
+        audio_end_ms: resolvedTruncateAudioMs
+      });
     }
 
     this.sendUpstream({ type: "response.cancel" });
     this.sendUpstream({ type: "output_audio_buffer.clear" });
 
-    this.assistantInProgress = false;
+    this.interruptInFlight = this.assistantInProgress;
+    this.interruptRequestedAtMs = this.now();
+    this.lastInterruptReason = normalizedReason;
+    this.outputCarryBytes = new Uint8Array(0);
+
+    if (!this.assistantInProgress) {
+      this.interruptInFlight = false;
+    }
     this.emit("assistant.state", {
       state: "interrupted",
-      reason: String(reason || "interrupt"),
+      reason: normalizedReason,
       t_ms: this.now()
     });
+
+    if (this.interruptInFlight) {
+      setTimeout(() => {
+        if (!this.started || !this.interruptInFlight) {
+          return;
+        }
+        const elapsed = this.now() - Number(this.interruptRequestedAtMs || 0);
+        if (elapsed < 1400) {
+          return;
+        }
+        this.interruptInFlight = false;
+        this.interruptRequestedAtMs = 0;
+        this.maybeDispatchPendingResponseCreate();
+      }, 1500);
+    } else {
+      this.maybeDispatchPendingResponseCreate();
+    }
   }
 
   async appendSystemContext(note = "") {
@@ -686,16 +1023,9 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     }
 
     if (createResponse) {
-      this.sendUpstream({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"]
-        }
-      });
-      this.emit("assistant.state", {
-        state: "requested",
+      this.enqueueResponseCreate({
         reason: "text_input",
-        t_ms: this.now()
+        source: "text.input"
       });
     }
 
@@ -714,6 +1044,15 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     this.partialBufferByItem.clear();
     this.assistantTextByResponse.clear();
     this.assistantInProgress = false;
+    this.pendingResponseCreate = null;
+    this.interruptInFlight = false;
+    this.interruptRequestedAtMs = 0;
+    this.lastInterruptReason = "";
+    this.currentResponseId = "";
+    this.currentAssistantItemId = "";
+    this.currentAssistantContentIndex = 0;
+    this.currentResponseAudioMs = 0;
+    this.outputCarryBytes = new Uint8Array(0);
 
     if (this.upstream) {
       try {

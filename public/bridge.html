@@ -93,6 +93,7 @@
           playback: {
             current: null,
             queue: [],
+            queueDurationMs: 0,
             waiters: [],
             loopPromise: null,
             bufferChunks: [],
@@ -656,9 +657,11 @@
 
         function resolveAndClearPlaybackQueue(result = false) {
           if (!Array.isArray(state.playback.queue) || state.playback.queue.length === 0) {
+            state.playback.queueDurationMs = 0;
             return;
           }
           const pending = state.playback.queue.splice(0);
+          state.playback.queueDurationMs = 0;
           for (const item of pending) {
             try {
               item?.resolve?.(Boolean(result));
@@ -677,6 +680,10 @@
           state.playback.bufferBytes = 0;
           state.playback.bufferSampleRate = 24000;
           state.playback.bufferChannels = 1;
+        }
+
+        function getPlaybackQueuedDurationMs() {
+          return Math.max(0, Number(state.playback.queueDurationMs || 0));
         }
 
         async function playAudioChunkWithPlayback({
@@ -738,7 +745,8 @@
         async function withSpeechLock(runPlayback) {
           const playback = {
             stopped: false,
-            stopHandlers: []
+            stopHandlers: [],
+            startedChunks: 0
           };
 
           state.speaking = true;
@@ -785,8 +793,33 @@
 
           state.playback.loopPromise = withSpeechLock(async (playback) => {
             while (!playback.stopped) {
+              if (
+                playback.startedChunks === 0 &&
+                Array.isArray(state.playback.queue) &&
+                state.playback.queue.length > 0
+              ) {
+                const minJitterMs = 90;
+                const minJitterChunks = 3;
+                const startedWaitAt = Date.now();
+                while (!playback.stopped) {
+                  const queuedChunks = state.playback.queue.length;
+                  const queuedMs = getPlaybackQueuedDurationMs();
+                  if (queuedChunks >= minJitterChunks || queuedMs >= minJitterMs) {
+                    break;
+                  }
+                  const elapsed = Date.now() - startedWaitAt;
+                  if (elapsed >= 180) {
+                    break;
+                  }
+                  const hasMore = await waitForPlaybackQueueSignal(60);
+                  if (!hasMore) {
+                    break;
+                  }
+                }
+              }
+
               if (!Array.isArray(state.playback.queue) || state.playback.queue.length === 0) {
-                const hasMore = await waitForPlaybackQueueSignal(320);
+                const hasMore = await waitForPlaybackQueueSignal(650);
                 if (!hasMore || playback.stopped) {
                   break;
                 }
@@ -796,12 +829,18 @@
               if (!nextItem) {
                 continue;
               }
+              state.playback.queueDurationMs = Math.max(
+                0,
+                getPlaybackQueuedDurationMs() -
+                  Math.max(1, Number(nextItem.durationMs || 0))
+              );
 
               const result = await playAudioChunkWithPlayback({
                 audioBase64: nextItem.audioBase64,
                 mimeType: nextItem.mimeType,
                 playback
               });
+              playback.startedChunks += 1;
               nextItem.resolve(result.ok);
 
               if (!result.ok && result.errorMessage && result.errorMessage !== "playback interrupted") {
@@ -825,18 +864,34 @@
           return state.playback.loopPromise;
         }
 
-        function enqueuePlaybackChunk({ audioBase64, mimeType = "audio/wav" } = {}) {
+        function enqueuePlaybackChunk({
+          audioBase64,
+          mimeType = "audio/wav",
+          durationMs = 0
+        } = {}) {
           const normalizedAudio = String(audioBase64 || "").trim();
           if (!normalizedAudio) {
             return false;
           }
 
+          const normalizedDurationMs = Math.max(
+            1,
+            Number(durationMs) ||
+              estimateChunkDurationMs({
+                bytesLength: Math.max(0, Math.floor((normalizedAudio.length * 3) / 4)),
+                sampleRateHz: state.playback.bufferSampleRate,
+                channels: state.playback.bufferChannels
+              })
+          );
+
           return new Promise((resolve) => {
             state.playback.queue.push({
               audioBase64: normalizedAudio,
               mimeType,
+              durationMs: normalizedDurationMs,
               resolve
             });
+            state.playback.queueDurationMs = getPlaybackQueuedDurationMs() + normalizedDurationMs;
             notifyPlaybackQueueWaiters();
             void ensureStreamingPlaybackLoop();
           });
@@ -898,7 +953,12 @@
 
           await enqueuePlaybackChunk({
             audioBase64: wavBase64,
-            mimeType: "audio/wav"
+            mimeType: "audio/wav",
+            durationMs: estimateChunkDurationMs({
+              bytesLength: offset,
+              sampleRateHz: sampleRate,
+              channels
+            })
           });
         }
 
@@ -952,6 +1012,7 @@
             if (queuedCount > 0) {
               addLog(`stopSpeaking cleared queued playback (${queuedCount} chunks)`);
             }
+            state.playback.queueDurationMs = 0;
             if (flush) {
               state.captureGateUntilMs = Date.now() + resumeGateMs;
             }
@@ -971,6 +1032,7 @@
           if (flush) {
             state.captureGateUntilMs = Date.now() + resumeGateMs;
           }
+          state.playback.queueDurationMs = 0;
 
           addLog("stopSpeaking applied: active playback interrupted");
           return true;
