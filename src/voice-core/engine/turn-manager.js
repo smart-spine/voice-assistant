@@ -226,13 +226,13 @@ class TurnManager extends EventEmitter {
           this.pendingBargeIn = true;
           this.bargeInStartedAt = now;
           this.bargeInConfirmed = false;
-        this.emit("barge_in.start", {
-          reason: "assistant_speaking",
-          rms,
-          threshold: effectiveVadThreshold,
-          t_ms: now
-        });
-      }
+          this.emit("barge_in.start", {
+            reason: "assistant_speaking",
+            rms,
+            threshold: effectiveVadThreshold,
+            t_ms: now
+          });
+        }
 
         const bargeInMs = Math.max(0, now - this.bargeInStartedAt + frameDurationMs);
         if (!this.bargeInConfirmed && bargeInMs >= this.bargeInMinMs) {
@@ -300,14 +300,11 @@ class TurnManager extends EventEmitter {
       return;
     }
 
-    if (this.lastFinalText) {
-      this.scheduleEot({
-        reason: "vad_silence_after_final",
-        confidence: 0.72,
-        delayMs: this.vadHangoverMs
-      });
-      return;
-    }
+    this.emit("speech.confirmed", {
+      reason: "vad_speech_confirmed",
+      speech_ms: speechMs,
+      t_ms: now
+    });
 
     this.scheduleEot({
       reason: "vad_silence",

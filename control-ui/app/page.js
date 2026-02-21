@@ -478,9 +478,16 @@ export default function HomePage() {
   const voiceLastAssistantPartialLogAtRef = useRef(0);
   const voiceLastChunkLogAtRef = useRef(0);
   const voicePlaybackChunkBufferRef = useRef([]);
+  const voicePlaybackBufferStartedAtRef = useRef(0);
   const voicePlaybackFlushTimerRef = useRef(null);
   const voicePlaybackContextRef = useRef(null);
   const voicePlaybackScheduledAtRef = useRef(0);
+  const voiceStatusRef = useRef("disconnected");
+  const voiceRecordingRef = useRef(false);
+  const voiceAssistantSpeakingRef = useRef(false);
+  const voiceInterruptSpeechMsRef = useRef(0);
+  const voiceLastInterruptAtRef = useRef(0);
+  const voiceBargeInCaptureRef = useRef(false);
 
   const managedApi = systemState?.managedApi;
   const controlApi = systemState?.controlApi;
@@ -637,6 +644,7 @@ export default function HomePage() {
       voicePlaybackFlushTimerRef.current = null;
     }
     voicePlaybackChunkBufferRef.current = [];
+    voicePlaybackBufferStartedAtRef.current = 0;
 
     if (voicePlaybackContextRef.current) {
       try {
@@ -653,6 +661,9 @@ export default function HomePage() {
     setVoiceAssistantSpeaking(false);
     setVoicePlaybackActive(false);
     setVoiceOrbLevel(0);
+    voiceInterruptSpeechMsRef.current = 0;
+    voiceLastInterruptAtRef.current = 0;
+    voiceBargeInCaptureRef.current = false;
   }, [teardownVoiceAnalyser]);
 
   const sendVoiceEnvelope = useCallback((type, payload = {}, { replyTo = null } = {}) => {
@@ -882,6 +893,7 @@ export default function HomePage() {
       clearVoicePlaybackFlushTimer();
       voicePlaybackGenerationRef.current += 1;
       voicePlaybackChunkBufferRef.current = [];
+      voicePlaybackBufferStartedAtRef.current = 0;
       voicePlaybackScheduledAtRef.current = 0;
       voiceAudioPlaybackChainRef.current = Promise.resolve();
 
@@ -912,6 +924,7 @@ export default function HomePage() {
       voicePlaybackActiveCountRef.current = 0;
       setVoicePlaybackActive(false);
       setVoiceAssistantSpeaking(false);
+      voiceBargeInCaptureRef.current = false;
       appendVoiceDebugLog("event", `playback cleared (${String(reason || "unknown")})`);
     },
     [appendVoiceDebugLog, clearVoicePlaybackFlushTimer]
@@ -922,7 +935,8 @@ export default function HomePage() {
       const buffered = voicePlaybackChunkBufferRef.current;
       if (!buffered.length) {
         clearVoicePlaybackFlushTimer();
-        return;
+        voicePlaybackBufferStartedAtRef.current = 0;
+        return false;
       }
 
       const totalMs = buffered.reduce(
@@ -931,13 +945,23 @@ export default function HomePage() {
       );
       const first = buffered[0] || {};
       const format = String(first?.format || "pcm16").trim().toLowerCase();
+      const bufferedSince = Number(voicePlaybackBufferStartedAtRef.current || 0);
+      const waitedMs = bufferedSince > 0 ? Math.max(0, Date.now() - bufferedSince) : 0;
+      const minBufferedMs = 220;
+      const maxBufferedWaitMs = 340;
 
-      if (!force && format === "pcm16" && totalMs < 260) {
-        return;
+      if (
+        !force &&
+        format === "pcm16" &&
+        totalMs < minBufferedMs &&
+        waitedMs < maxBufferedWaitMs
+      ) {
+        return false;
       }
 
       clearVoicePlaybackFlushTimer();
       voicePlaybackChunkBufferRef.current = [];
+      voicePlaybackBufferStartedAtRef.current = 0;
 
       if (format !== "pcm16") {
         for (const chunk of buffered) {
@@ -947,7 +971,7 @@ export default function HomePage() {
             sampleRate: Number(chunk?.sampleRate || 24000)
           });
         }
-        return;
+        return true;
       }
 
       const totalBytes = buffered.reduce(
@@ -955,7 +979,7 @@ export default function HomePage() {
         0
       );
       if (!totalBytes) {
-        return;
+        return false;
       }
 
       const merged = new Uint8Array(totalBytes);
@@ -969,7 +993,7 @@ export default function HomePage() {
         offset += bytes.byteLength;
       }
       if (!offset) {
-        return;
+        return false;
       }
 
       const sampleRate = Math.max(
@@ -983,6 +1007,7 @@ export default function HomePage() {
         format: "pcm16",
         sampleRate
       });
+      return true;
     },
     [clearVoicePlaybackFlushTimer, enqueueVoicePlayback]
   );
@@ -992,6 +1017,9 @@ export default function HomePage() {
       const normalizedAudio = String(audioBase64 || "").trim();
       if (!normalizedAudio) {
         return;
+      }
+      if (!voicePlaybackChunkBufferRef.current.length) {
+        voicePlaybackBufferStartedAtRef.current = Date.now();
       }
 
       const normalizedFormat = String(format || "pcm16").trim().toLowerCase();
@@ -1021,7 +1049,7 @@ export default function HomePage() {
         (sum, item) => sum + Math.max(1, Number(item?.durationMs) || 0),
         0
       );
-      if (totalMs >= 420) {
+      if (totalMs >= 320) {
         flushVoicePlaybackBuffer({ force: true });
         return;
       }
@@ -1029,8 +1057,18 @@ export default function HomePage() {
       if (!voicePlaybackFlushTimerRef.current) {
         voicePlaybackFlushTimerRef.current = setTimeout(() => {
           voicePlaybackFlushTimerRef.current = null;
-          flushVoicePlaybackBuffer({ force: true });
-        }, 130);
+          const bufferedSince = Number(voicePlaybackBufferStartedAtRef.current || 0);
+          const waitedMs = bufferedSince > 0 ? Math.max(0, Date.now() - bufferedSince) : 0;
+          const flushed = flushVoicePlaybackBuffer({
+            force: waitedMs >= 340
+          });
+          if (!flushed && voicePlaybackChunkBufferRef.current.length && !voicePlaybackFlushTimerRef.current) {
+            voicePlaybackFlushTimerRef.current = setTimeout(() => {
+              voicePlaybackFlushTimerRef.current = null;
+              flushVoicePlaybackBuffer({ force: true });
+            }, 70);
+          }
+        }, 70);
       }
     },
     [flushVoicePlaybackBuffer]
@@ -1313,6 +1351,20 @@ export default function HomePage() {
     return stream;
   }, [voiceSelectedInputId]);
 
+  useEffect(() => {
+    voiceStatusRef.current = String(voiceStatus || "disconnected")
+      .trim()
+      .toLowerCase();
+  }, [voiceStatus]);
+
+  useEffect(() => {
+    voiceRecordingRef.current = Boolean(voiceRecording);
+  }, [voiceRecording]);
+
+  useEffect(() => {
+    voiceAssistantSpeakingRef.current = Boolean(voiceAssistantSpeaking);
+  }, [voiceAssistantSpeaking]);
+
   const startVoiceRecording = useCallback(async () => {
     if (voiceCaptureProcessorRef.current) {
       return true;
@@ -1339,6 +1391,8 @@ export default function HomePage() {
         turnId: ""
       });
       voiceHasPendingInputRef.current = false;
+      voiceInterruptSpeechMsRef.current = 0;
+      voiceBargeInCaptureRef.current = false;
 
       appendVoiceDebugLog(
         "info",
@@ -1368,6 +1422,50 @@ export default function HomePage() {
           const normalized = downsampleFloat32Buffer(input, context.sampleRate, 24000);
           if (!normalized.length) {
             return;
+          }
+          const frameDurationMs = Math.max(
+            1,
+            Math.round((normalized.length / 24000) * 1000)
+          );
+          const rms = computeRms(normalized);
+
+          const assistantActive =
+            voiceAssistantSpeakingRef.current ||
+            voiceStatusRef.current === "speaking" ||
+            voicePlaybackActiveCountRef.current > 0;
+          if (assistantActive && voiceRecordingRef.current) {
+            if (rms >= 0.02) {
+              voiceInterruptSpeechMsRef.current += frameDurationMs;
+            } else {
+              voiceInterruptSpeechMsRef.current = Math.max(
+                0,
+                voiceInterruptSpeechMsRef.current - frameDurationMs * 2
+              );
+            }
+
+            const now = Date.now();
+            if (
+              voiceInterruptSpeechMsRef.current >= 220 &&
+              now - Number(voiceLastInterruptAtRef.current || 0) >= 900
+            ) {
+              const sent = sendVoiceEnvelope("assistant.interrupt", {
+                reason: "client_vad_barge_in"
+              });
+              if (sent) {
+                voiceLastInterruptAtRef.current = now;
+                voiceInterruptSpeechMsRef.current = 0;
+                voiceBargeInCaptureRef.current = true;
+                appendVoiceDebugLog("event", "assistant.interrupt sent (client_vad_barge_in)");
+                stopAllVoicePlayback("client_vad_barge_in");
+              }
+            }
+
+            if (!voiceBargeInCaptureRef.current) {
+              return;
+            }
+          } else {
+            voiceInterruptSpeechMsRef.current = 0;
+            voiceBargeInCaptureRef.current = false;
           }
 
           const pcmBytes = float32ToPcm16Bytes(normalized);
@@ -1414,7 +1512,9 @@ export default function HomePage() {
     appendVoiceDebugLog,
     ensureVoiceMedia,
     pushNotice,
-    sendVoiceBinaryFrame
+    sendVoiceBinaryFrame,
+    sendVoiceEnvelope,
+    stopAllVoicePlayback
   ]);
 
   const stopVoiceRecording = useCallback(
@@ -1443,6 +1543,8 @@ export default function HomePage() {
         setVoiceRecording(false);
         setVoiceUserSpeaking(false);
         setVoiceLevel(0);
+        voiceInterruptSpeechMsRef.current = 0;
+        voiceBargeInCaptureRef.current = false;
         appendVoiceDebugLog("info", `mic stop (commit=${commit ? "yes" : "no"})`);
 
         if (commit) {
@@ -1482,6 +1584,8 @@ export default function HomePage() {
 
     voiceSessionIdRef.current = "";
     voiceHasPendingInputRef.current = false;
+    voiceInterruptSpeechMsRef.current = 0;
+    voiceBargeInCaptureRef.current = false;
     setVoiceConnected(false);
     setVoiceStatus("disconnected");
     setVoiceUserPartial("");
@@ -1638,6 +1742,8 @@ export default function HomePage() {
         setVoiceSettingsOpen(false);
         voiceSessionIdRef.current = "";
         voiceHasPendingInputRef.current = false;
+        voiceInterruptSpeechMsRef.current = 0;
+        voiceBargeInCaptureRef.current = false;
         stopAllVoicePlayback("ws_close");
       };
 

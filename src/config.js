@@ -215,6 +215,15 @@ const config = {
       integer: true
     }
   ),
+  voiceCoreMinAudioMsWithoutTranscript: asBoundedNumber(
+    process.env.VOICE_CORE_MIN_AUDIO_MS_WITHOUT_TRANSCRIPT,
+    {
+      fallback: 1200,
+      min: 240,
+      max: 16000,
+      integer: true
+    }
+  ),
   openaiRealtimeModel: cleanString(
     process.env.OPENAI_REALTIME_MODEL,
     "gpt-4o-mini-realtime-preview-2024-12-17"

@@ -215,6 +215,15 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
         integer: true
       }
     );
+    this.voiceCoreMinAudioMsWithoutTranscript = clampNumber(
+      this.runtimeConfig.voiceCoreMinAudioMsWithoutTranscript,
+      {
+        fallback: 1200,
+        min: 240,
+        max: 16000,
+        integer: true
+      }
+    );
     this.shortCommitTranscriptWaitMs = clampNumber(
       this.runtimeConfig.voiceCoreShortCommitTranscriptWaitMs,
       {
@@ -253,7 +262,7 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
     this.outputChunkTargetMs = clampNumber(
       this.runtimeConfig.voiceCoreOutputChunkMs,
       {
-        fallback: 90,
+        fallback: 120,
         min: 40,
         max: 320,
         integer: true
@@ -413,7 +422,7 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
   outputChunkTargetBytes({ sampleRateHz = 24000, channels = 1 } = {}) {
     const sampleRate = Math.max(8000, Number(sampleRateHz) || 24000);
     const channelCount = Math.max(1, Number(channels) || 1);
-    const ms = Math.max(40, Number(this.outputChunkTargetMs) || 90);
+    const ms = Math.max(40, Number(this.outputChunkTargetMs) || 120);
     const bytesPerMs = (sampleRate * channelCount * 2) / 1000;
     const target = Math.floor(bytesPerMs * ms);
     return Math.max(channelCount * 2 * 80, target);
@@ -783,7 +792,7 @@ class OpenAIRealtimeAIProvider extends BaseAIProvider {
 
       if (forceResponse) {
         const bufferedMs = Math.max(0, Number(pending?.buffered_ms || 0));
-        if (bufferedMs < this.voiceCoreMinUserAudioMs) {
+        if (bufferedMs < this.voiceCoreMinAudioMsWithoutTranscript) {
           this.deferShortCommitResponse({
             commitId,
             bufferedMs,

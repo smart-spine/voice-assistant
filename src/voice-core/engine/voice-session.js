@@ -100,6 +100,7 @@ class VoiceSession extends EventEmitter {
     this.hasSpeechSinceLastCommit = false;
     this.userAudioSinceLastCommitMs = 0;
     this.lastFinalTranscriptCharsSinceCommit = 0;
+    this.lastSpeechConfirmedMs = 0;
     this.skippedEmptyTurnCount = 0;
     this.voiceCoreMinUserAudioMs = Math.max(
       120,
@@ -230,11 +231,20 @@ class VoiceSession extends EventEmitter {
   bindTurnManagerEvents() {
     this.turnManager.on("vad.start", (event) => {
       this.hasSpeechSinceLastCommit = true;
+      if (!this.lastSpeechConfirmedMs) {
+        this.lastSpeechConfirmedMs = Number(event?.t_ms || this.now());
+      }
       this.protocolLog("event", "turn.vad.start", event);
     });
 
     this.turnManager.on("vad.stop", (event) => {
       this.protocolLog("event", "turn.vad.stop", event);
+    });
+
+    this.turnManager.on("speech.confirmed", (event) => {
+      this.hasSpeechSinceLastCommit = true;
+      this.lastSpeechConfirmedMs = Number(event?.t_ms || this.now());
+      this.protocolLog("event", "turn.speech.confirmed", event);
     });
 
     this.turnManager.on("turn.eot", async (event) => {
@@ -350,6 +360,17 @@ class VoiceSession extends EventEmitter {
         text,
         t_ms: Number(event?.t_ms || this.now())
       });
+
+      const currentState = normalizeState(this.state);
+      if (
+        currentState === SESSION_STATES.SPEAKING ||
+        currentState === SESSION_STATES.THINKING
+      ) {
+        await this.handleBargeIn({
+          reason: "stt_final_during_assistant",
+          transcript: text
+        });
+      }
     });
 
     this.aiProvider.on("assistant.state", async (event) => {
@@ -367,11 +388,17 @@ class VoiceSession extends EventEmitter {
       } else if (state === "done") {
         this.turnManager.setAssistantSpeaking(false);
         this.audioPipeline.clearOutputFrames();
+        this.hasSpeechSinceLastCommit = false;
+        this.userAudioSinceLastCommitMs = 0;
+        this.lastFinalTranscriptCharsSinceCommit = 0;
         await this.setState(SESSION_STATES.READY, state);
         reportedSessionState = SESSION_STATES.READY;
       } else if (state === "interrupted") {
         this.turnManager.setAssistantSpeaking(false);
         this.audioPipeline.clearOutputFrames();
+        this.hasSpeechSinceLastCommit = false;
+        this.userAudioSinceLastCommitMs = 0;
+        this.lastFinalTranscriptCharsSinceCommit = 0;
         await this.setState(SESSION_STATES.INTERRUPTED, state);
         reportedSessionState = SESSION_STATES.INTERRUPTED;
         await this.sendControlEvent("audio.clear", {
@@ -881,12 +908,21 @@ class VoiceSession extends EventEmitter {
       0,
       Number(this.lastFinalTranscriptCharsSinceCommit || 0)
     );
-    const hasSpeech = Boolean(this.hasSpeechSinceLastCommit);
+    const minSpeechBufferedMs = Math.max(
+      180,
+      Number(this.runtimeConfig.bargeInMinMs || 220)
+    );
+    const hasSpeech =
+      Boolean(this.hasSpeechSinceLastCommit) &&
+      bufferedMs >= minSpeechBufferedMs;
+    const manualBufferedFallback =
+      String(source || "").trim().toLowerCase() === "manual" &&
+      bufferedMs >= Math.max(80, Number(this.voiceCoreMinUserAudioMs || 400));
     const shouldAllowTurn =
       !forceResponse ||
       hasSpeech ||
-      bufferedMs >= this.voiceCoreMinUserAudioMs ||
-      transcriptChars >= this.voiceCoreMinTranscriptChars;
+      transcriptChars >= this.voiceCoreMinTranscriptChars ||
+      manualBufferedFallback;
     if (!shouldAllowTurn) {
       this.audioPipeline.clearInputFrames({
         reason: "empty_turn_gate"
@@ -909,6 +945,7 @@ class VoiceSession extends EventEmitter {
         buffered_ms: bufferedMs,
         transcript_chars: transcriptChars,
         has_speech: hasSpeech,
+        manual_buffered_fallback: manualBufferedFallback,
         skipped_count: this.skippedEmptyTurnCount
       });
       await this.sendControlEvent("warning", {
@@ -918,6 +955,7 @@ class VoiceSession extends EventEmitter {
         buffered_ms: bufferedMs,
         transcript_chars: transcriptChars,
         has_speech: hasSpeech,
+        manual_buffered_fallback: manualBufferedFallback,
         skipped_count: this.skippedEmptyTurnCount,
         t_ms: this.now()
       });
