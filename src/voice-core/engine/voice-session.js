@@ -226,6 +226,21 @@ class VoiceSession extends EventEmitter {
 
     this.turnManager.on("turn.eot", async (event) => {
       this.protocolLog("event", "turn.eot", event);
+
+      const currentState = normalizeState(this.state);
+      if (
+        currentState === SESSION_STATES.SPEAKING ||
+        currentState === SESSION_STATES.THINKING ||
+        currentState === SESSION_STATES.ERROR ||
+        currentState === SESSION_STATES.STOPPED
+      ) {
+        this.protocolLog("event", "turn.eot.skipped", {
+          reason: String(event?.reason || "unknown"),
+          state: currentState
+        });
+        return;
+      }
+
       await this.sendControlEvent("turn.eot", {
         reason: String(event?.reason || "vad_silence"),
         confidence: Number(event?.confidence || 0.5),
@@ -496,7 +511,7 @@ class VoiceSession extends EventEmitter {
   async setState(nextState, reason = "") {
     const normalizedNext = normalizeState(nextState);
     if (!normalizedNext) {
-      return;
+      return false;
     }
 
     const normalizedCurrent = normalizeState(this.state);
@@ -505,7 +520,7 @@ class VoiceSession extends EventEmitter {
         this.debugScope,
         `invalid state transition ${normalizedCurrent} -> ${normalizedNext} (reason=${reason})`
       );
-      return;
+      return false;
     }
 
     if (normalizedCurrent !== normalizedNext) {
@@ -516,6 +531,7 @@ class VoiceSession extends EventEmitter {
         reason
       });
     }
+    return true;
   }
 
   async sendControlEvent(type, payload = {}, { replyTo = null } = {}) {
@@ -799,8 +815,10 @@ class VoiceSession extends EventEmitter {
     this.markCommitted(snapshot);
     this.turnManager.onTurnCommitted();
 
-    await this.setState(SESSION_STATES.THINKING, `commit:${source}`);
-    await this.sendSessionState("thinking", `commit:${source}`);
+    const transitioned = await this.setState(SESSION_STATES.THINKING, `commit:${source}`);
+    if (transitioned && normalizeState(this.state) === SESSION_STATES.THINKING) {
+      await this.sendSessionState("thinking", `commit:${source}`);
+    }
 
     await this.aiProvider.commitInput({
       commitId: snapshot.commit_id,

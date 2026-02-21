@@ -145,6 +145,13 @@ class TurnManager extends EventEmitter {
       return semantic || null;
     }
 
+    // Do not auto-close turns while assistant is speaking.
+    // During full-duplex this is usually echo/overlap and must be handled
+    // through barge-in interrupt flow, not regular EoT commit.
+    if (this.assistantSpeaking) {
+      return semantic;
+    }
+
     if (semantic.status === "complete") {
       this.scheduleEot({
         reason: "semantic_complete",
@@ -282,6 +289,12 @@ class TurnManager extends EventEmitter {
       speech_ms: speechMs,
       t_ms: now
     });
+
+    // While assistant is speaking, VAD stop should not create a regular EoT.
+    // If user truly interrupts, barge_in.confirmed path handles it.
+    if (this.assistantSpeaking) {
+      return;
+    }
 
     if (speechMs < this.minSpeechMsForTurn) {
       return;
