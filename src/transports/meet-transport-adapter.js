@@ -1,15 +1,12 @@
 const {
   setupBridgePage,
-  bridgeStartOpenAiStt,
-  bridgeStopOpenAiStt,
-  bridgeSpeakAudio,
   bridgeStopSpeaking,
   bridgeSetTtsDucking,
-  bridgeStartRealtime,
-  bridgeStopRealtime,
-  bridgeRealtimeCreateTextTurn,
-  bridgeRealtimeAppendSystemContext,
-  bridgeRealtimeInterrupt,
+  bridgeStartCoreWs,
+  bridgeStopCoreWs,
+  bridgeCoreInterrupt,
+  bridgeCoreCreateTextTurn,
+  bridgeCoreAppendSystemContext,
   openMeetPage,
   detectMeetJoinState,
   leaveMeetPage
@@ -57,27 +54,6 @@ class MeetTransportAdapter extends BaseTransportAdapter {
     return this.bridgePage;
   }
 
-  async startStt(options = {}) {
-    if (!this.bridgePage || this.bridgePage.isClosed()) {
-      throw new Error("Bridge page is unavailable.");
-    }
-    return bridgeStartOpenAiStt(this.bridgePage, options);
-  }
-
-  async stopStt() {
-    if (!this.bridgePage || this.bridgePage.isClosed()) {
-      return false;
-    }
-    return bridgeStopOpenAiStt(this.bridgePage);
-  }
-
-  async playAudio(payload = {}) {
-    if (!this.bridgePage || this.bridgePage.isClosed()) {
-      throw new Error("Bridge page is unavailable.");
-    }
-    return bridgeSpeakAudio(this.bridgePage, payload);
-  }
-
   async stopSpeaking(options = {}) {
     if (!this.bridgePage || this.bridgePage.isClosed()) {
       return false;
@@ -92,48 +68,48 @@ class MeetTransportAdapter extends BaseTransportAdapter {
     return bridgeSetTtsDucking(this.bridgePage, options);
   }
 
-  async startRealtime(options = {}) {
+  async startCoreWs(options = {}) {
     if (!this.bridgePage || this.bridgePage.isClosed()) {
       throw new Error("Bridge page is unavailable.");
     }
-    return bridgeStartRealtime(this.bridgePage, options);
+    return bridgeStartCoreWs(this.bridgePage, options);
   }
 
-  async stopRealtime() {
+  async stopCoreWs(options = {}) {
     if (!this.bridgePage || this.bridgePage.isClosed()) {
       return false;
     }
-    return bridgeStopRealtime(this.bridgePage);
+    return bridgeStopCoreWs(this.bridgePage, options);
   }
 
-  async realtimeCreateTextTurn(payload = {}) {
-    if (!this.bridgePage || this.bridgePage.isClosed()) {
-      throw new Error("Bridge page is unavailable.");
-    }
-    return bridgeRealtimeCreateTextTurn(this.bridgePage, payload);
-  }
-
-  async realtimeAppendSystemContext(note = "") {
-    if (!this.bridgePage || this.bridgePage.isClosed()) {
-      throw new Error("Bridge page is unavailable.");
-    }
-    return bridgeRealtimeAppendSystemContext(this.bridgePage, note);
-  }
-
-  async realtimeInterrupt(options = {}) {
+  async coreInterrupt(options = {}) {
     if (!this.bridgePage || this.bridgePage.isClosed()) {
       return false;
     }
-    return bridgeRealtimeInterrupt(this.bridgePage, options);
+    return bridgeCoreInterrupt(this.bridgePage, options);
+  }
+
+  async coreCreateTextTurn(payload = {}) {
+    if (!this.bridgePage || this.bridgePage.isClosed()) {
+      return false;
+    }
+    return bridgeCoreCreateTextTurn(this.bridgePage, payload);
+  }
+
+  async coreAppendSystemContext(note = "") {
+    if (!this.bridgePage || this.bridgePage.isClosed()) {
+      return false;
+    }
+    return bridgeCoreAppendSystemContext(this.bridgePage, note);
   }
 
   async stop({ leaveMeet = true } = {}) {
     let hasLeftCall = false;
 
     try {
-      await this.stopRealtime();
+      await this.stopCoreWs({ reason: "adapter-stop" });
     } catch (_) {
-      // Ignore realtime stop failures during shutdown.
+      // Ignore core ws stop failures during shutdown.
     }
 
     if (leaveMeet && this.meetPage && !this.meetPage.isClosed()) {
@@ -158,9 +134,9 @@ class MeetTransportAdapter extends BaseTransportAdapter {
       return;
     }
     try {
-      await bridgeStopOpenAiStt(this.bridgePage);
+      await bridgeStopCoreWs(this.bridgePage, { reason: "close-bridge-page" });
     } catch (_) {
-      // Ignore bridge stop errors.
+      // Ignore bridge core stop errors.
     }
     try {
       await this.bridgePage.close({ runBeforeUnload: true });

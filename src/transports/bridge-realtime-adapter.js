@@ -29,6 +29,9 @@ class BridgeRealtimeAdapter {
     vadPrefixPaddingMs = 180,
     interruptResponseOnTurn = true,
     bargeInMinMs = 220,
+    controlApiHost = "127.0.0.1",
+    controlApiPort = 3200,
+    controlApiToken = "",
     inputDeviceId = "",
     inputDeviceLabel = "",
     inputPreferLoopback = true,
@@ -70,6 +73,11 @@ class BridgeRealtimeAdapter {
     this.bargeInMinMs = Number.isFinite(Number(bargeInMinMs))
       ? Math.min(5000, Math.max(80, Math.trunc(Number(bargeInMinMs))))
       : 220;
+    this.controlApiHost = String(controlApiHost || "127.0.0.1").trim() || "127.0.0.1";
+    this.controlApiPort = Number.isFinite(Number(controlApiPort))
+      ? Math.max(1, Math.min(65535, Math.trunc(Number(controlApiPort))))
+      : 3200;
+    this.controlApiToken = String(controlApiToken || "").trim();
     this.inputDeviceId = String(inputDeviceId || "").trim();
     this.inputDeviceLabel = String(inputDeviceLabel || "").trim();
     this.inputPreferLoopback = Boolean(inputPreferLoopback);
@@ -92,9 +100,9 @@ class BridgeRealtimeAdapter {
     }
     if (
       !this.transportAdapter ||
-      typeof this.transportAdapter.startRealtime !== "function"
+      typeof this.transportAdapter.startCoreWs !== "function"
     ) {
-      throw new Error("Transport adapter does not support bridge realtime mode.");
+      throw new Error("Transport adapter does not support bridge core-ws mode.");
     }
 
     const effectiveTurnDetection =
@@ -105,14 +113,12 @@ class BridgeRealtimeAdapter {
       );
     }
 
-    const started = await this.transportAdapter.startRealtime({
+    const started = await this.transportAdapter.startCoreWs({
       model: this.model,
       language: this.language || undefined,
       instructions: this.instructions,
       voice: this.voice,
       temperature: this.temperature,
-      connectTimeoutMs: this.connectTimeoutMs,
-      inputTranscriptionModel: this.inputTranscriptionModel,
       turnDetection: effectiveTurnDetection,
       turnDetectionEagerness: this.turnDetectionEagerness,
       vadThreshold: this.vadThreshold,
@@ -120,9 +126,14 @@ class BridgeRealtimeAdapter {
       vadPrefixPaddingMs: this.vadPrefixPaddingMs,
       interruptResponseOnTurn: this.interruptResponseOnTurn,
       bargeInMinMs: this.bargeInMinMs,
+      inputTranscriptionModel: this.inputTranscriptionModel,
       inputDeviceId: this.inputDeviceId || undefined,
       inputDeviceLabel: this.inputDeviceLabel || undefined,
-      inputPreferLoopback: this.inputPreferLoopback
+      inputPreferLoopback: this.inputPreferLoopback,
+      connectTimeoutMs: this.connectTimeoutMs,
+      controlApiHost: this.controlApiHost,
+      controlApiPort: this.controlApiPort,
+      controlApiToken: this.controlApiToken
     });
 
     if (!started) {
@@ -130,7 +141,7 @@ class BridgeRealtimeAdapter {
     }
     this.started = true;
     this.log(
-      `bridge realtime started (model=${this.model}, turn_detection=${effectiveTurnDetection}).`
+      `bridge realtime started (transport=core-ws, model=${this.model}, turn_detection=${effectiveTurnDetection}).`
     );
     return true;
   }
@@ -143,9 +154,9 @@ class BridgeRealtimeAdapter {
     try {
       if (
         this.transportAdapter &&
-        typeof this.transportAdapter.stopRealtime === "function"
+        typeof this.transportAdapter.stopCoreWs === "function"
       ) {
-        await this.transportAdapter.stopRealtime();
+        await this.transportAdapter.stopCoreWs();
       }
     } catch (_) {
       // Ignore stop errors during shutdown.
@@ -162,13 +173,19 @@ class BridgeRealtimeAdapter {
     if (!normalizedText) {
       return false;
     }
-    return Boolean(
-      await this.transportAdapter.realtimeCreateTextTurn({
-        text: normalizedText,
-        role: String(role || "user").trim().toLowerCase(),
-        createResponse: Boolean(createResponse)
-      })
-    );
+    if (
+      this.transportAdapter &&
+      typeof this.transportAdapter.coreCreateTextTurn === "function"
+    ) {
+      return Boolean(
+        await this.transportAdapter.coreCreateTextTurn({
+          text: normalizedText,
+          role: String(role || "user").trim().toLowerCase(),
+          createResponse: Boolean(createResponse)
+        })
+      );
+    }
+    return false;
   }
 
   async appendSystemContext(note = "") {
@@ -179,8 +196,10 @@ class BridgeRealtimeAdapter {
     if (!normalized) {
       return false;
     }
-    if (typeof this.transportAdapter.realtimeAppendSystemContext === "function") {
-      return Boolean(await this.transportAdapter.realtimeAppendSystemContext(normalized));
+    if (typeof this.transportAdapter.coreAppendSystemContext === "function") {
+      return Boolean(
+        await this.transportAdapter.coreAppendSystemContext(normalized)
+      );
     }
     return this.createTextTurn({
       role: "system",
@@ -193,16 +212,16 @@ class BridgeRealtimeAdapter {
     if (!this.started) {
       return false;
     }
+    let interrupted = false;
     if (
-      !this.transportAdapter ||
-      typeof this.transportAdapter.realtimeInterrupt !== "function"
+      this.transportAdapter &&
+      typeof this.transportAdapter.coreInterrupt === "function"
     ) {
-      return false;
+      interrupted = await this.transportAdapter.coreInterrupt({
+        reason: normalizeText(reason || "barge-in") || "barge-in",
+        clearInputBuffer: Boolean(clearInputBuffer)
+      });
     }
-    const interrupted = await this.transportAdapter.realtimeInterrupt({
-      reason: normalizeText(reason || "barge-in") || "barge-in",
-      clearInputBuffer: Boolean(clearInputBuffer)
-    });
     if (interrupted) {
       this.log(
         `bridge realtime interrupted (${normalizeText(reason) || "unknown"}).`

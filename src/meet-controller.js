@@ -183,30 +183,6 @@ async function warmUpBridgePage(page) {
   }
 }
 
-async function bridgeStartOpenAiStt(page, options = {}) {
-  return page.evaluate((opts) => {
-    if (!window.botBridge?.startOpenAiStt) {
-      return false;
-    }
-    return window.botBridge.startOpenAiStt(opts);
-  }, options);
-}
-
-async function bridgeStopOpenAiStt(page) {
-  return page.evaluate(() => {
-    if (!window.botBridge?.stopOpenAiStt) {
-      return false;
-    }
-    return window.botBridge.stopOpenAiStt();
-  });
-}
-
-async function bridgeSpeakAudio(page, payload) {
-  return page.evaluate((audioPayload) => {
-    return window.botBridge.playAudio(audioPayload);
-  }, payload);
-}
-
 async function bridgePrepareTtsOutput(page) {
   return page.evaluate(async () => {
     if (!window.botBridge?.prepareTtsOutput) {
@@ -238,49 +214,49 @@ async function bridgeSetTtsDucking(page, options = {}) {
   }, options);
 }
 
-async function bridgeStartRealtime(page, options = {}) {
-  return page.evaluate(async (realtimeOptions) => {
-    if (!window.botBridge?.startRealtime) {
+async function bridgeStartCoreWs(page, options = {}) {
+  return page.evaluate(async (coreOptions) => {
+    if (!window.botBridge?.startCoreWs) {
       return false;
     }
-    return window.botBridge.startRealtime(realtimeOptions || {});
+    return window.botBridge.startCoreWs(coreOptions || {});
   }, options);
 }
 
-async function bridgeStopRealtime(page) {
-  return page.evaluate(async () => {
-    if (!window.botBridge?.stopRealtime) {
+async function bridgeStopCoreWs(page, options = {}) {
+  return page.evaluate(async (coreOptions) => {
+    if (!window.botBridge?.stopCoreWs) {
       return false;
     }
-    return window.botBridge.stopRealtime();
-  });
+    return window.botBridge.stopCoreWs(coreOptions || {});
+  }, options);
 }
 
-async function bridgeRealtimeCreateTextTurn(page, payload = {}) {
-  return page.evaluate(async (turnPayload) => {
-    if (!window.botBridge?.realtimeCreateTextTurn) {
+async function bridgeCoreInterrupt(page, options = {}) {
+  return page.evaluate(async (interruptOptions) => {
+    if (!window.botBridge?.coreInterrupt) {
       return false;
     }
-    return window.botBridge.realtimeCreateTextTurn(turnPayload || {});
+    return window.botBridge.coreInterrupt(interruptOptions || {});
+  }, options);
+}
+
+async function bridgeCoreCreateTextTurn(page, payload = {}) {
+  return page.evaluate(async (turnPayload) => {
+    if (!window.botBridge?.coreCreateTextTurn) {
+      return false;
+    }
+    return window.botBridge.coreCreateTextTurn(turnPayload || {});
   }, payload);
 }
 
-async function bridgeRealtimeAppendSystemContext(page, note = "") {
+async function bridgeCoreAppendSystemContext(page, note = "") {
   return page.evaluate(async (text) => {
-    if (!window.botBridge?.realtimeAppendSystemContext) {
+    if (!window.botBridge?.coreAppendSystemContext) {
       return false;
     }
-    return window.botBridge.realtimeAppendSystemContext(String(text || ""));
+    return window.botBridge.coreAppendSystemContext(String(text || ""));
   }, note);
-}
-
-async function bridgeRealtimeInterrupt(page, options = {}) {
-  return page.evaluate(async (interruptOptions) => {
-    if (!window.botBridge?.realtimeInterrupt) {
-      return false;
-    }
-    return window.botBridge.realtimeInterrupt(interruptOptions || {});
-  }, options);
 }
 
 async function openMeetPage({ browser, config }) {
@@ -651,17 +627,14 @@ async function keepMicUnmuted(page, durationMs = 120000) {
 module.exports = {
   launchBrowser,
   setupBridgePage,
-  bridgeStartOpenAiStt,
-  bridgeStopOpenAiStt,
-  bridgeSpeakAudio,
   bridgePrepareTtsOutput,
   bridgeStopSpeaking,
   bridgeSetTtsDucking,
-  bridgeStartRealtime,
-  bridgeStopRealtime,
-  bridgeRealtimeCreateTextTurn,
-  bridgeRealtimeAppendSystemContext,
-  bridgeRealtimeInterrupt,
+  bridgeStartCoreWs,
+  bridgeStopCoreWs,
+  bridgeCoreInterrupt,
+  bridgeCoreCreateTextTurn,
+  bridgeCoreAppendSystemContext,
   openMeetPage,
   detectMeetJoinState,
   leaveMeetPage

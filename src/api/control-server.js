@@ -71,6 +71,19 @@ function normalizeOrigin(origin) {
   }
 }
 
+function isLoopbackOrigin(origin) {
+  if (!origin) {
+    return false;
+  }
+  try {
+    const parsed = new URL(String(origin));
+    const host = String(parsed.hostname || "").toLowerCase();
+    return host === "127.0.0.1" || host === "localhost" || host === "::1";
+  } catch (_) {
+    return false;
+  }
+}
+
 function buildCorsAllowlist(values = []) {
   if (!Array.isArray(values)) {
     return [];
@@ -515,7 +528,8 @@ async function startControlServer({
     authenticate: ({ request, url }) => {
       const origin = normalizeOrigin(request.headers.origin || "");
       if (origin && normalizedCorsAllowlist.length > 0) {
-        if (!normalizedCorsAllowlist.includes(origin)) {
+        const localBridgeOrigin = isLoopbackOrigin(origin);
+        if (!localBridgeOrigin && !normalizedCorsAllowlist.includes(origin)) {
           return { ok: false, reason: "origin_not_allowed" };
         }
       }

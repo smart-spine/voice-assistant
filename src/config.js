@@ -59,14 +59,8 @@ function parseCsvList(value) {
     .filter(Boolean);
 }
 
-function pickVoicePipelineMode(rawValue) {
-  const value = String(rawValue || "hybrid")
-    .trim()
-    .toLowerCase();
-  if (["hybrid", "realtime"].includes(value)) {
-    return value;
-  }
-  return "hybrid";
+function pickVoiceCoreMode(rawValue) {
+  return "server";
 }
 
 function pickRealtimeTurnDetection(rawValue) {
@@ -201,11 +195,8 @@ const config = {
     max: 4
   }),
   openaiTtsStreamFormat: pickTtsStreamFormat(process.env.OPENAI_TTS_STREAM_FORMAT),
-  voicePipelineMode: pickVoicePipelineMode(process.env.VOICE_PIPELINE_MODE),
-  voicePipelineFallbackToHybrid: asBoolean(
-    process.env.VOICE_PIPELINE_FALLBACK_TO_HYBRID,
-    true
-  ),
+  voiceCoreMode: pickVoiceCoreMode(process.env.VOICE_CORE_MODE),
+  voiceCoreVerboseLogs: asBoolean(process.env.VOICE_CORE_VERBOSE_LOGS, false),
   openaiRealtimeModel: cleanString(
     process.env.OPENAI_REALTIME_MODEL,
     "gpt-4o-mini-realtime-preview-2024-12-17"

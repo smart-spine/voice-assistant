@@ -1,14 +1,16 @@
 const crypto = require("crypto");
 const { WebSocketServer, WebSocket } = require("ws");
 const { log, warn } = require("../logger");
-
-function safeJsonParse(raw, fallback = null) {
-  try {
-    return JSON.parse(raw);
-  } catch (_) {
-    return fallback;
-  }
-}
+const {
+  VoiceEngine,
+  PROTOCOL_VERSION,
+  buildEnvelope,
+  parseEnvelope,
+  createId,
+  normalizeType,
+  normalizeAudioFrame,
+  encodeBinaryAudioFrame
+} = require("../voice-core");
 
 function nowMs() {
   return Date.now();
@@ -16,135 +18,6 @@ function nowMs() {
 
 function randomId(prefix = "voice") {
   return `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
-}
-
-function clampNumber(value, { fallback, min = -Infinity, max = Infinity, integer = false }) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-  const normalized = integer ? Math.trunc(parsed) : parsed;
-  return Math.min(max, Math.max(min, normalized));
-}
-
-function normalizeText(value) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeLanguageTag(rawValue) {
-  const value = String(rawValue || "").trim().toLowerCase();
-  if (!value) {
-    return "";
-  }
-  const [primary] = value.split("-");
-  if (!primary || primary.length < 2 || primary.length > 3) {
-    return "";
-  }
-  return primary;
-}
-
-function normalizeForEchoComparison(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function looksLikeEchoTranscript(userText, assistantText) {
-  const normalizedUser = normalizeForEchoComparison(userText);
-  const normalizedAssistant = normalizeForEchoComparison(assistantText);
-  if (!normalizedUser || !normalizedAssistant) {
-    return false;
-  }
-
-  if (normalizedUser.length < 12 || normalizedAssistant.length < 12) {
-    return false;
-  }
-
-  if (normalizedUser === normalizedAssistant) {
-    return true;
-  }
-
-  if (
-    normalizedUser.length >= 18 &&
-    (normalizedAssistant.includes(normalizedUser) || normalizedUser.includes(normalizedAssistant))
-  ) {
-    return true;
-  }
-
-  const userTokens = new Set(
-    normalizedUser
-      .split(" ")
-      .map((token) => token.trim())
-      .filter((token) => token.length > 2)
-  );
-  const assistantTokens = new Set(
-    normalizedAssistant
-      .split(" ")
-      .map((token) => token.trim())
-      .filter((token) => token.length > 2)
-  );
-
-  if (!userTokens.size || !assistantTokens.size) {
-    return false;
-  }
-
-  let overlap = 0;
-  for (const token of userTokens) {
-    if (assistantTokens.has(token)) {
-      overlap += 1;
-    }
-  }
-
-  const recall = overlap / userTokens.size;
-  return userTokens.size >= 4 && recall >= 0.82;
-}
-
-function buildRealtimeTurnDetection(options = {}) {
-  const type = String(options.turnDetection || "server_vad")
-    .trim()
-    .toLowerCase();
-  if (type === "server_vad") {
-    return {
-      type: "server_vad",
-      threshold: clampNumber(options.vadThreshold, {
-        fallback: 0.45,
-        min: 0,
-        max: 1
-      }),
-      silence_duration_ms: clampNumber(options.vadSilenceMs, {
-        fallback: 280,
-        min: 120,
-        max: 2000,
-        integer: true
-      }),
-      prefix_padding_ms: clampNumber(options.vadPrefixPaddingMs, {
-        fallback: 180,
-        min: 0,
-        max: 1000,
-        integer: true
-      }),
-      create_response: true,
-      interrupt_response: options.interruptResponseOnTurn !== false
-    };
-  }
-  if (type === "semantic_vad") {
-    const eagerness = String(options.turnDetectionEagerness || "auto")
-      .trim()
-      .toLowerCase();
-    return {
-      type: "semantic_vad",
-      eagerness: ["low", "medium", "high", "auto"].includes(eagerness)
-        ? eagerness
-        : "auto",
-      create_response: true,
-      interrupt_response: options.interruptResponseOnTurn !== false
-    };
-  }
-  return null;
 }
 
 function redactOpenAiError(message) {
@@ -157,691 +30,9 @@ function redactOpenAiError(message) {
     .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer ***");
 }
 
-class VoiceRealtimeBridgeSession {
-  constructor({ ws, getRuntimeConfig, onClose = () => {} }) {
-    this.ws = ws;
-    this.getRuntimeConfig = getRuntimeConfig;
-    this.onClose = onClose;
-
-    this.sessionId = randomId("voice_ws");
-    this.upstream = null;
-    this.started = false;
-    this.closed = false;
-    this.clientTurnDetection = "server_vad";
-    this.assistantInProgress = false;
-    this.ttsSeq = 0;
-    this.partialBufferByItem = new Map();
-    this.assistantTextByResponse = new Map();
-    this.lastUserSpeechStartedAt = 0;
-    this.lastAssistantAudioAt = 0;
-    this.lastAssistantTranscript = "";
-    this.lastResponseCreatedAt = 0;
-    this.pendingCommitResponseTimer = null;
-    this.pendingResponseAfterCommit = false;
-    this.lastCommitAt = 0;
-  }
-
-  clearPendingCommitResponseTimer() {
-    if (!this.pendingCommitResponseTimer) {
-      return;
-    }
-    clearTimeout(this.pendingCommitResponseTimer);
-    this.pendingCommitResponseTimer = null;
-  }
-
-  send(event = {}) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return false;
-    }
-    try {
-      this.ws.send(JSON.stringify(event));
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  sendError(code, message) {
-    const normalizedMessage = String(message || "").toLowerCase();
-    if (
-      normalizedMessage.includes("committing input audio buffer") ||
-      normalizedMessage.includes("buffer too small")
-    ) {
-      this.pendingResponseAfterCommit = false;
-      this.lastCommitAt = 0;
-      this.clearPendingCommitResponseTimer();
-    }
-
-    this.send({
-      type: "error",
-      code: String(code || "voice_error"),
-      message: redactOpenAiError(message)
-    });
-  }
-
-  sendUpstream(event = {}) {
-    if (!this.upstream || this.upstream.readyState !== WebSocket.OPEN) {
-      return false;
-    }
-    try {
-      this.upstream.send(JSON.stringify(event));
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  async startSession(payload = {}) {
-    await this.stopSession({ reason: "restart" });
-
-    const runtimeConfig = this.getRuntimeConfig();
-    const apiKey = String(runtimeConfig?.openaiApiKey || "").trim();
-    if (!apiKey) {
-      throw new Error("OPENAI_API_KEY is not configured.");
-    }
-
-    const model = normalizeText(payload.model || runtimeConfig?.openaiRealtimeModel);
-    if (!model) {
-      throw new Error("Realtime model is required.");
-    }
-
-    const instructions = normalizeText(
-      payload.instructions || runtimeConfig?.systemPrompt || ""
-    );
-    const voice = normalizeText(payload.voice || runtimeConfig?.openaiTtsVoice || "alloy");
-    const language = normalizeLanguageTag(payload.language || runtimeConfig?.language);
-    const temperature = clampNumber(payload.temperature, {
-      fallback: clampNumber(runtimeConfig?.openaiTemperature, {
-        fallback: 0.8,
-        min: 0.6,
-        max: 1.2
-      }),
-      min: 0.6,
-      max: 1.2
-    });
-
-    this.clientTurnDetection = String(
-      payload.turnDetection || runtimeConfig?.openaiRealtimeTurnDetection || "server_vad"
-    )
-      .trim()
-      .toLowerCase();
-
-    const wsUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`;
-    const upstream = new WebSocket(wsUrl, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
-    });
-
-    const connectTimeoutMs = clampNumber(payload.connectTimeoutMs, {
-      fallback: clampNumber(runtimeConfig?.openaiRealtimeConnectTimeoutMs, {
-        fallback: 8000,
-        min: 1000,
-        max: 30000,
-        integer: true
-      }),
-      min: 1000,
-      max: 30000,
-      integer: true
-    });
-
-    await new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (callback) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        clearTimeout(timer);
-        upstream.removeListener("open", onOpen);
-        upstream.removeListener("error", onError);
-        callback();
-      };
-
-      const onOpen = () => finish(resolve);
-      const onError = (error) => finish(() => reject(error));
-
-      const timer = setTimeout(() => {
-        finish(() => reject(new Error("Realtime upstream connection timed out.")));
-      }, connectTimeoutMs);
-
-      upstream.once("open", onOpen);
-      upstream.once("error", onError);
-    });
-
-    this.upstream = upstream;
-    this.started = true;
-    this.assistantInProgress = false;
-    this.ttsSeq = 0;
-    this.partialBufferByItem.clear();
-    this.assistantTextByResponse.clear();
-    this.lastResponseCreatedAt = 0;
-    this.clearPendingCommitResponseTimer();
-    this.pendingResponseAfterCommit = false;
-    this.lastCommitAt = 0;
-    this.lastAssistantAudioAt = 0;
-    this.lastAssistantTranscript = "";
-
-    upstream.on("message", (raw) => {
-      const event = safeJsonParse(String(raw || ""), {});
-      this.handleUpstreamEvent(event);
-    });
-
-    upstream.on("close", () => {
-      this.upstream = null;
-      this.started = false;
-      if (!this.closed) {
-        this.send({
-          type: "session_state",
-          state: "disconnected"
-        });
-      }
-    });
-
-    upstream.on("error", (error) => {
-      this.sendError("upstream_error", error?.message || "Realtime upstream error.");
-    });
-
-    this.sendUpstream({
-      type: "session.update",
-      session: {
-        modalities: ["audio", "text"],
-        instructions,
-        voice,
-        temperature,
-        input_audio_format: "pcm16",
-        output_audio_format: "pcm16",
-        input_audio_transcription: {
-          model: normalizeText(
-            payload.inputTranscriptionModel ||
-              runtimeConfig?.openaiRealtimeInputTranscriptionModel ||
-              "gpt-4o-mini-transcribe"
-          ),
-          language: language || undefined
-        },
-        turn_detection: buildRealtimeTurnDetection({
-          turnDetection: this.clientTurnDetection,
-          turnDetectionEagerness:
-            payload.turnDetectionEagerness || runtimeConfig?.openaiRealtimeTurnEagerness,
-          vadThreshold:
-            payload.vadThreshold ?? runtimeConfig?.openaiRealtimeVadThreshold,
-          vadSilenceMs:
-            payload.vadSilenceMs ?? runtimeConfig?.openaiRealtimeVadSilenceMs,
-          vadPrefixPaddingMs:
-            payload.vadPrefixPaddingMs ?? runtimeConfig?.openaiRealtimeVadPrefixPaddingMs,
-          interruptResponseOnTurn:
-            payload.interruptResponseOnTurn ??
-            runtimeConfig?.openaiRealtimeInterruptResponseOnTurn
-        })
-      }
-    });
-
-    this.send({
-      type: "session_started",
-      session_id: this.sessionId,
-      model,
-      turn_detection: this.clientTurnDetection,
-      t_ms: nowMs()
-    });
-  }
-
-  handleUpstreamEvent(event = {}) {
-    const type = String(event?.type || "").trim().toLowerCase();
-    if (!type) {
-      return;
-    }
-
-    if (type === "session.created" || type === "session.updated") {
-      this.send({
-        type: "session_state",
-        state: "ready",
-        model: String(event?.session?.model || "").trim() || undefined,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "input_audio_buffer.speech_started") {
-      this.lastUserSpeechStartedAt = nowMs();
-      this.send({ type: "vad", state: "start", t_ms: nowMs() });
-      if (this.assistantInProgress) {
-        this.interruptAssistant({ reason: "barge_in" });
-      }
-      return;
-    }
-
-    if (type === "input_audio_buffer.speech_stopped") {
-      const speechMs = this.lastUserSpeechStartedAt
-        ? Math.max(0, nowMs() - this.lastUserSpeechStartedAt)
-        : 0;
-      this.lastUserSpeechStartedAt = 0;
-      this.send({
-        type: "vad",
-        state: "stop",
-        speech_ms: speechMs,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "input_audio_buffer.committed") {
-      const committedAt = nowMs();
-      this.send({
-        type: "input_committed",
-        t_ms: committedAt
-      });
-      if (this.pendingResponseAfterCommit && !this.assistantInProgress) {
-        this.requestResponseFromCommit({
-          reason: "upstream_committed",
-          commitAt: this.lastCommitAt || committedAt
-        });
-      }
-      return;
-    }
-
-    if (type === "conversation.item.input_audio_transcription.delta") {
-      const itemId = String(event?.item_id || "").trim();
-      const delta = String(event?.delta || "").trim();
-      if (!itemId || !delta) {
-        return;
-      }
-      const prev = this.partialBufferByItem.get(itemId) || "";
-      const text = normalizeText(`${prev} ${delta}`);
-      if (!text) {
-        return;
-      }
-      this.partialBufferByItem.set(itemId, text);
-      this.send({
-        type: "stt_partial",
-        text,
-        turn_id: itemId,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "conversation.item.input_audio_transcription.completed") {
-      const itemId = String(event?.item_id || "").trim();
-      const transcript = normalizeText(event?.transcript || "");
-      if (itemId) {
-        this.partialBufferByItem.delete(itemId);
-      }
-      if (!transcript) {
-        return;
-      }
-
-      const now = nowMs();
-      const echoWindowMs = 2800;
-      const likelyEcho =
-        this.lastAssistantAudioAt > 0 &&
-        now - this.lastAssistantAudioAt <= echoWindowMs &&
-        looksLikeEchoTranscript(transcript, this.lastAssistantTranscript);
-
-      if (likelyEcho) {
-        this.send({
-          type: "input_rejected",
-          reason: "echo",
-          text: transcript,
-          t_ms: now
-        });
-        this.sendUpstream({ type: "response.cancel" });
-        this.sendUpstream({ type: "output_audio_buffer.clear" });
-        this.assistantInProgress = false;
-        warn(
-          "VOICE-WS",
-          `dropped probable echo transcript (session=${this.sessionId}): ${normalizeText(
-            transcript
-          )}`
-        );
-        return;
-      }
-
-      this.send({
-        type: "stt_final",
-        text: transcript,
-        turn_id: itemId || undefined,
-        t_ms: now
-      });
-
-      if (this.pendingResponseAfterCommit && !this.assistantInProgress) {
-        this.requestResponseFromCommit({
-          reason: "stt_final",
-          commitAt: this.lastCommitAt || now
-        });
-      }
-      return;
-    }
-
-    if (type === "response.created") {
-      this.assistantInProgress = true;
-      this.lastResponseCreatedAt = nowMs();
-      this.clearPendingCommitResponseTimer();
-      this.pendingResponseAfterCommit = false;
-      this.send({
-        type: "assistant_state",
-        state: "speaking",
-        response_id: String(event?.response?.id || "").trim() || undefined,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "response.audio_transcript.delta") {
-      const responseId = String(event?.response_id || "").trim();
-      const delta = String(event?.delta || "").trim();
-      if (!responseId || !delta) {
-        return;
-      }
-      const prev = this.assistantTextByResponse.get(responseId) || "";
-      const text = normalizeText(`${prev} ${delta}`);
-      this.assistantTextByResponse.set(responseId, text);
-      this.lastAssistantTranscript = text;
-      this.send({
-        type: "assistant_text",
-        response_id: responseId,
-        text,
-        is_final: false,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "response.audio_transcript.done") {
-      const responseId = String(event?.response_id || "").trim();
-      const text = normalizeText(event?.transcript || "");
-      if (!responseId || !text) {
-        return;
-      }
-      this.lastAssistantTranscript = text;
-      this.assistantTextByResponse.set(responseId, text);
-      this.send({
-        type: "assistant_text",
-        response_id: responseId,
-        text,
-        is_final: true,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "response.text.delta") {
-      const responseId = String(event?.response_id || "").trim();
-      const delta = String(event?.delta || "").trim();
-      if (!responseId || !delta) {
-        return;
-      }
-      const prev = this.assistantTextByResponse.get(responseId) || "";
-      const text = normalizeText(`${prev} ${delta}`);
-      this.assistantTextByResponse.set(responseId, text);
-      this.lastAssistantTranscript = text;
-      this.send({
-        type: "assistant_text",
-        response_id: responseId,
-        text,
-        is_final: false,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "response.text.done") {
-      const responseId = String(event?.response_id || "").trim();
-      const text = normalizeText(event?.text || "");
-      if (!responseId || !text) {
-        return;
-      }
-      this.lastAssistantTranscript = text;
-      this.assistantTextByResponse.set(responseId, text);
-      this.send({
-        type: "assistant_text",
-        response_id: responseId,
-        text,
-        is_final: true,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "response.audio.delta") {
-      const responseId = String(event?.response_id || "").trim();
-      const audioBase64 = String(event?.delta || "").trim();
-      if (!audioBase64) {
-        return;
-      }
-      this.lastAssistantAudioAt = nowMs();
-      this.ttsSeq += 1;
-      this.send({
-        type: "tts_audio_chunk",
-        response_id: responseId || undefined,
-        seq: this.ttsSeq,
-        format: String(event?.format || "pcm16"),
-        audio_base64: audioBase64,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "response.done") {
-      this.assistantInProgress = false;
-      const responseId = String(event?.response?.id || "").trim();
-      const status = String(event?.response?.status || event?.status || "unknown").trim();
-      this.send({
-        type: "assistant_state",
-        state: "done",
-        response_id: responseId || undefined,
-        status,
-        t_ms: nowMs()
-      });
-      return;
-    }
-
-    if (type === "error") {
-      this.sendError(
-        String(event?.error?.code || "upstream_error"),
-        event?.error?.message || event?.message || "Realtime upstream error."
-      );
-    }
-  }
-
-  handleAudioChunk({ audioBase64 = "", commit = false, createResponse = false } = {}) {
-    if (!this.started || !this.upstream) {
-      throw new Error("Voice session is not started.");
-    }
-    const normalizedAudio = String(audioBase64 || "").trim();
-    if (!normalizedAudio) {
-      return;
-    }
-
-    this.sendUpstream({
-      type: "input_audio_buffer.append",
-      audio: normalizedAudio
-    });
-
-    if (commit) {
-      this.commitInput({
-        createResponse,
-        reason: "audio_chunk_commit"
-      });
-    }
-  }
-
-  requestResponseFromCommit({ reason = "client_commit", commitAt = nowMs() } = {}) {
-    this.clearPendingCommitResponseTimer();
-    this.pendingCommitResponseTimer = setTimeout(() => {
-      this.pendingCommitResponseTimer = null;
-      if (!this.started || !this.upstream) {
-        return;
-      }
-
-      if (this.assistantInProgress) {
-        return;
-      }
-
-      if (this.lastResponseCreatedAt >= commitAt) {
-        return;
-      }
-
-      this.sendUpstream({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"]
-        }
-      });
-      this.pendingResponseAfterCommit = false;
-
-      this.send({
-        type: "assistant_state",
-        state: "requested",
-        reason: normalizeText(reason) || "client_commit",
-        t_ms: nowMs()
-      });
-    }, 140);
-  }
-
-  commitInput({ createResponse = false, reason = "client_commit" } = {}) {
-    if (!this.started) {
-      return;
-    }
-    const commitAt = nowMs();
-    this.lastCommitAt = commitAt;
-    this.pendingResponseAfterCommit = true;
-    this.clearPendingCommitResponseTimer();
-    this.sendUpstream({ type: "input_audio_buffer.commit" });
-
-    // We intentionally do not force response.create here.
-    // It is only requested after commit is accepted (input_audio_buffer.committed)
-    // or after transcription final arrives for this turn.
-    void reason;
-    void createResponse;
-    void commitAt;
-  }
-
-  interruptAssistant({ reason = "interrupt" } = {}) {
-    if (!this.started) {
-      return;
-    }
-    this.clearPendingCommitResponseTimer();
-    this.sendUpstream({ type: "response.cancel" });
-    this.sendUpstream({ type: "output_audio_buffer.clear" });
-    this.assistantInProgress = false;
-    this.send({
-      type: "assistant_state",
-      state: "interrupted",
-      reason: normalizeText(reason) || "interrupt",
-      t_ms: nowMs()
-    });
-  }
-
-  async stopSession({ reason = "stop" } = {}) {
-    this.clearPendingCommitResponseTimer();
-    if (this.upstream) {
-      try {
-        this.upstream.close();
-      } catch (_) {
-        // Ignore close races.
-      }
-      this.upstream = null;
-    }
-    this.started = false;
-    this.assistantInProgress = false;
-    this.partialBufferByItem.clear();
-    this.assistantTextByResponse.clear();
-    this.lastAssistantAudioAt = 0;
-    this.lastAssistantTranscript = "";
-    this.lastResponseCreatedAt = 0;
-    this.pendingResponseAfterCommit = false;
-    this.lastCommitAt = 0;
-    this.send({
-      type: "session_state",
-      state: "stopped",
-      reason,
-      t_ms: nowMs()
-    });
-  }
-
-  async handleClientMessage(rawMessage, isBinary = false) {
-    if (isBinary) {
-      const buffer = Buffer.isBuffer(rawMessage)
-        ? rawMessage
-        : Buffer.from(rawMessage || []);
-      if (!buffer.length) {
-        return;
-      }
-      this.handleAudioChunk({
-        audioBase64: buffer.toString("base64"),
-        commit: false
-      });
-      return;
-    }
-
-    const payload = safeJsonParse(String(rawMessage || ""), null);
-    if (!payload || typeof payload !== "object") {
-      throw new Error("Invalid JSON message.");
-    }
-
-    const type = String(payload.type || "").trim().toLowerCase();
-    if (!type) {
-      throw new Error("Message `type` is required.");
-    }
-
-    if (type === "start_session") {
-      await this.startSession(payload);
-      return;
-    }
-
-    if (type === "audio_chunk") {
-      this.handleAudioChunk({
-        audioBase64: payload.audio_base64 || payload.audioBase64 || "",
-        commit: payload.commit === true,
-        createResponse:
-          payload.create_response !== false && payload.createResponse !== false
-      });
-      return;
-    }
-
-    if (type === "commit") {
-      this.commitInput({
-        createResponse:
-          payload.create_response !== false && payload.createResponse !== false,
-        reason: "client_commit"
-      });
-      return;
-    }
-
-    if (type === "interrupt") {
-      this.interruptAssistant({ reason: payload.reason || "client_interrupt" });
-      return;
-    }
-
-    if (type === "stop_session") {
-      await this.stopSession({ reason: "client_stop" });
-      return;
-    }
-
-    if (type === "ping") {
-      this.send({ type: "pong", t_ms: nowMs() });
-      return;
-    }
-
-    throw new Error(`Unsupported message type: ${type}`);
-  }
-
-  async close(reason = "socket_closed") {
-    if (this.closed) {
-      return;
-    }
-    this.closed = true;
-    await this.stopSession({ reason });
-    this.onClose();
-  }
-}
-
 function closeWithHttpError(socket, statusCode, statusText) {
   try {
-    socket.write(
-      `HTTP/1.1 ${statusCode} ${statusText}\r\nConnection: close\r\n\r\n`
-    );
+    socket.write(`HTTP/1.1 ${statusCode} ${statusText}\r\nConnection: close\r\n\r\n`);
   } catch (_) {
     // Ignore socket write errors.
   }
@@ -849,6 +40,278 @@ function closeWithHttpError(socket, statusCode, statusText) {
     socket.destroy();
   } catch (_) {
     // Ignore destroy errors.
+  }
+}
+
+class VoiceCoreWsSession {
+  constructor({
+    ws,
+    actor = "unknown",
+    getRuntimeConfig,
+    voiceEngine,
+    onClose = () => {}
+  }) {
+    this.ws = ws;
+    this.actor = String(actor || "unknown");
+    this.getRuntimeConfig = getRuntimeConfig;
+    this.voiceEngine = voiceEngine;
+    this.onClose = onClose;
+
+    this.connectionId = randomId("voice_core_ws");
+    this.engineSessionId = "";
+    this.closed = false;
+    this.lastSessionState = "stopped";
+
+    this.transport = {
+      sendControl: async (envelope) => {
+        await this.sendCoreControlToClient(envelope);
+      },
+      sendAudio: async (frame) => {
+        await this.sendCoreAudioToClient(frame);
+      },
+      close: async () => {
+        // Connection lifecycle is managed by ws close handlers.
+      }
+    };
+  }
+
+  getRuntimeSnapshot() {
+    const runtime = this.getRuntimeConfig?.();
+    return runtime && typeof runtime === "object" ? runtime : {};
+  }
+
+  sendRawJson(payload = {}) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    try {
+      this.ws.send(JSON.stringify(payload));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  sendRawBinary(binaryPayload) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    try {
+      this.ws.send(binaryPayload, { binary: true });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  sendError(code, message, { fatal = false, replyTo = undefined } = {}) {
+    const envelope = buildEnvelope({
+      v: PROTOCOL_VERSION,
+      type: "error",
+      sessionId: this.engineSessionId || this.connectionId,
+      msgId: createId("core"),
+      replyTo: replyTo || undefined,
+      tsMs: nowMs(),
+      payload: {
+        code: String(code || "voice_error").trim() || "voice_error",
+        message: redactOpenAiError(message || "Voice session error."),
+        fatal: Boolean(fatal),
+        t_ms: nowMs()
+      }
+    });
+    this.sendRawJson(envelope);
+  }
+
+  sendWelcome() {
+    this.sendRawJson(
+      buildEnvelope({
+        v: PROTOCOL_VERSION,
+        type: "welcome",
+        sessionId: this.connectionId,
+        msgId: createId("core"),
+        tsMs: nowMs(),
+        payload: {
+          session_id: this.connectionId,
+          actor: this.actor,
+          protocol: "voice.core.v1",
+          t_ms: nowMs()
+        }
+      })
+    );
+  }
+
+  maybeLogStateTransition(envelope) {
+    if (!envelope || envelope.type !== "session.state") {
+      return;
+    }
+    const nextState = String(envelope?.payload?.state || "")
+      .trim()
+      .toLowerCase();
+    if (!nextState) {
+      return;
+    }
+    const fromState = this.lastSessionState || "unknown";
+    if (fromState !== nextState) {
+      log(
+        "VOICE-WS",
+        `[${this.engineSessionId || this.connectionId}] transition: ${fromState} -> ${nextState}`
+      );
+      this.lastSessionState = nextState;
+    }
+  }
+
+  async sendCoreControlToClient(envelope = {}) {
+    this.maybeLogStateTransition(envelope);
+    this.sendRawJson(envelope);
+  }
+
+  async sendCoreAudioToClient(frame = {}) {
+    const normalized = normalizeAudioFrame(
+      {
+        ...frame,
+        kind: "output_audio"
+      },
+      {
+        defaultKind: "output_audio"
+      }
+    );
+    const binary = encodeBinaryAudioFrame(normalized);
+    this.sendRawBinary(binary);
+  }
+
+  refreshEngineRuntimeConfig() {
+    const runtimeConfig = this.getRuntimeSnapshot();
+    this.voiceEngine.runtimeConfig = runtimeConfig;
+    if (this.voiceEngine.sessionManager) {
+      this.voiceEngine.sessionManager.runtimeConfig = runtimeConfig;
+    }
+  }
+
+  async startEngineSession(startEnvelope) {
+    if (this.engineSessionId) {
+      throw new Error("Voice session is already started.");
+    }
+
+    this.refreshEngineRuntimeConfig();
+    const requestedSessionId = String(startEnvelope?.session_id || "").trim();
+    const status = await this.voiceEngine.createSession(this.transport, {
+      sessionId: requestedSessionId,
+      startEnvelope
+    });
+
+    this.engineSessionId = String(
+      status?.session_id || requestedSessionId || this.connectionId
+    ).trim();
+  }
+
+  async routeCoreControl(payload = {}) {
+    const parsed = parseEnvelope(payload, {
+      requireSessionId: false,
+      strictType: false,
+      allowUnknownType: true
+    });
+
+    if (!parsed.ok) {
+      throw new Error(parsed.message);
+    }
+
+    const envelope = parsed.value;
+    if (envelope.type === "session.start") {
+      await this.startEngineSession(envelope);
+      return;
+    }
+
+    if (envelope.type === "ping" && !this.engineSessionId) {
+      this.sendRawJson(
+        buildEnvelope({
+          v: PROTOCOL_VERSION,
+          type: "pong",
+          sessionId: this.connectionId,
+          msgId: createId("core"),
+          replyTo: envelope.msg_id,
+          tsMs: nowMs(),
+          payload: {
+            nonce: envelope?.payload?.nonce,
+            t_ms: nowMs()
+          }
+        })
+      );
+      return;
+    }
+
+    if (envelope.type === "session.stop") {
+      await this.stop(String(envelope?.payload?.reason || "client_stop"));
+      return;
+    }
+
+    if (!this.engineSessionId) {
+      throw new Error("Voice session is not started.");
+    }
+
+    const normalizedSessionId = String(envelope.session_id || "").trim();
+    const routedEnvelope =
+      normalizedSessionId && normalizedSessionId === this.engineSessionId
+        ? envelope
+        : {
+            ...envelope,
+            session_id: this.engineSessionId
+          };
+
+    await this.voiceEngine.routeControl(this.engineSessionId, routedEnvelope);
+  }
+
+  async handleClientMessage(rawMessage, isBinary = false) {
+    if (isBinary) {
+      if (!this.engineSessionId) {
+        throw new Error("Voice session is not started.");
+      }
+      await this.voiceEngine.routeBinaryAudio(this.engineSessionId, rawMessage);
+      return;
+    }
+
+    let payload = null;
+    try {
+      payload = JSON.parse(String(rawMessage || ""));
+    } catch (_) {
+      throw new Error("Control frame is not valid JSON.");
+    }
+
+    if (!payload || typeof payload !== "object") {
+      throw new Error("Envelope must be a JSON object.");
+    }
+
+    await this.routeCoreControl(payload);
+  }
+
+  async stop(reason = "socket_closed") {
+    const normalizedReason = String(reason || "socket_closed").trim() || "socket_closed";
+    if (!this.engineSessionId) {
+      return;
+    }
+
+    const sessionId = this.engineSessionId;
+    this.engineSessionId = "";
+    this.lastSessionState = "stopped";
+
+    try {
+      await this.voiceEngine.stopSession(sessionId, normalizedReason);
+    } catch (stopError) {
+      warn(
+        "VOICE-WS",
+        `failed to stop voice-core session ${sessionId}: ${redactOpenAiError(
+          stopError?.message || stopError
+        )}`
+      );
+    }
+  }
+
+  async close(reason = "socket_closed") {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    await this.stop(reason);
+    this.onClose();
   }
 }
 
@@ -860,7 +323,35 @@ function attachVoiceWsServer({
   getRateLimiterKey = () => "voice:global",
   maxConnectionsPerKey = 4
 } = {}) {
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+  const baseRuntimeConfig = getRuntimeConfig() || {};
+  const voiceEngine = new VoiceEngine({
+    runtimeConfig: baseRuntimeConfig
+  });
+
+  void voiceEngine
+    .init()
+    .then(() => {
+      log("VOICE-WS", "VoiceEngine initialized.");
+    })
+    .catch((initError) => {
+      warn(
+        "VOICE-WS",
+        `VoiceEngine initialization failed: ${redactOpenAiError(
+          initError?.message || initError
+        )}`
+      );
+    });
+
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: 8 * 1024 * 1024,
+    handleProtocols: (protocols) => {
+      if (protocols && typeof protocols.has === "function" && protocols.has("voice.core.v1")) {
+        return "voice.core.v1";
+      }
+      return undefined;
+    }
+  });
 
   const liveConnectionsByKey = new Map();
 
@@ -883,6 +374,17 @@ function attachVoiceWsServer({
       return;
     }
 
+    const requestedProtocols = String(request.headers["sec-websocket-protocol"] || "");
+    const requestedProtocolList = requestedProtocols
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const hasRequestedCoreProtocol = requestedProtocolList.includes("voice.core.v1");
+    if (!hasRequestedCoreProtocol) {
+      closeWithHttpError(socket, 426, "Upgrade Required");
+      return;
+    }
+
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit("connection", ws, request, auth, limiterKey);
     });
@@ -896,10 +398,17 @@ function attachVoiceWsServer({
 
     log("VOICE-WS", `connected actor=${auth?.actor || "unknown"} remote=${remote}`);
 
-    const session = new VoiceRealtimeBridgeSession({
+    const session = new VoiceCoreWsSession({
       ws,
-      getRuntimeConfig
+      actor: auth?.actor || "unknown",
+      getRuntimeConfig,
+      voiceEngine
     });
+
+    log(
+      "VOICE-WS",
+      `voice core mode=server (subprotocol=${String(ws.protocol || "none") || "none"})`
+    );
 
     ws.on("message", async (data, isBinary) => {
       try {
@@ -930,16 +439,12 @@ function attachVoiceWsServer({
       warn("VOICE-WS", `socket error: ${redactOpenAiError(err?.message || err)}`);
     });
 
-    session.send({
-      type: "welcome",
-      session_id: session.sessionId,
-      actor: auth?.actor || "unknown",
-      t_ms: nowMs()
-    });
+    session.sendWelcome();
   });
 
   return {
     wss,
+    voiceEngine,
     stop: async () =>
       new Promise((resolve) => {
         for (const client of wss.clients) {
@@ -949,7 +454,19 @@ function attachVoiceWsServer({
             // Ignore close errors.
           }
         }
-        wss.close(() => resolve());
+        wss.close(() => {
+          voiceEngine
+            .shutdown("voice_ws_server_stop")
+            .catch((shutdownError) => {
+              warn(
+                "VOICE-WS",
+                `voice engine shutdown failed: ${redactOpenAiError(
+                  shutdownError?.message || shutdownError
+                )}`
+              );
+            })
+            .finally(() => resolve());
+        });
       })
   };
 }

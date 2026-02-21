@@ -126,12 +126,12 @@ function buildBaseSchema() {
       multiline: true,
       restartRequired: false
     },
-    VOICE_PIPELINE_MODE: {
+    VOICE_CORE_MODE: {
       type: "enum",
-      allowedValues: ["realtime", "hybrid"],
+      allowedValues: ["server"],
       restartRequired: false
     },
-    VOICE_PIPELINE_FALLBACK_TO_HYBRID: {
+    VOICE_CORE_VERBOSE_LOGS: {
       type: "boolean",
       restartRequired: false
     },
@@ -169,31 +169,6 @@ function buildBaseSchema() {
       type: "boolean",
       restartRequired: false
     },
-    OPENAI_STT_CHUNK_MS: {
-      type: "number",
-      min: 120,
-      max: 10000,
-      integer: true,
-      restartRequired: false
-    },
-    OPENAI_STT_TIMEOUT_MS: {
-      type: "number",
-      min: 1000,
-      max: 60000,
-      integer: true,
-      restartRequired: false
-    },
-    OPENAI_STT_PARTIALS_ENABLED: {
-      type: "boolean",
-      restartRequired: false
-    },
-    OPENAI_STT_PARTIAL_EMIT_MS: {
-      type: "number",
-      min: 120,
-      max: 5000,
-      integer: true,
-      restartRequired: false
-    },
     OPENAI_STT_LOG_FINALS: {
       type: "boolean",
       restartRequired: false
@@ -206,65 +181,7 @@ function buildBaseSchema() {
       type: "boolean",
       restartRequired: false
     },
-    OPENAI_STT_MIN_SIGNAL_PEAK: {
-      type: "number",
-      min: 0,
-      max: 1,
-      restartRequired: false
-    },
-    OPENAI_STT_VAD_THRESHOLD: {
-      type: "number",
-      min: 0,
-      max: 1,
-      restartRequired: false
-    },
-    OPENAI_STT_HANGOVER_MS: {
-      type: "number",
-      min: 120,
-      max: 8000,
-      integer: true,
-      restartRequired: false
-    },
-    OPENAI_STT_SEGMENT_MIN_MS: {
-      type: "number",
-      min: 120,
-      max: 12000,
-      integer: true,
-      restartRequired: false
-    },
-    OPENAI_STT_SEGMENT_MAX_MS: {
-      type: "number",
-      min: 400,
-      max: 30000,
-      integer: true,
-      restartRequired: false
-    },
-    TURN_SILENCE_MS: {
-      type: "number",
-      min: 120,
-      max: 6000,
-      integer: true,
-      restartRequired: false
-    },
-    TURN_CONTINUATION_SILENCE_MS: {
-      type: "number",
-      min: 120,
-      max: 10000,
-      integer: true,
-      restartRequired: false
-    },
-    POST_TURN_RESPONSE_DELAY_MS: {
-      type: "number",
-      min: 0,
-      max: 10000,
-      integer: true,
-      restartRequired: false
-    },
     BARGE_IN_ENABLED: {
-      type: "boolean",
-      restartRequired: false
-    },
-    BARGE_IN_ON_PARTIALS: {
       type: "boolean",
       restartRequired: false
     },
@@ -277,12 +194,6 @@ function buildBaseSchema() {
       min: 0,
       max: 10000,
       integer: true,
-      restartRequired: false
-    },
-    BARGE_IN_VAD_MIN_PEAK: {
-      type: "number",
-      min: 0,
-      max: 1,
       restartRequired: false
     },
     SOFT_INTERRUPT_ENABLED: {
@@ -411,6 +322,8 @@ function buildBaseSchema() {
     "OPENAI_TTS_SPEED",
     "OPENAI_TTS_STREAM_FORMAT",
     "OPENAI_TTS_VOICE_ID",
+    "VOICE_CORE_MODE",
+    "VOICE_CORE_VERBOSE_LOGS",
     "CONTROL_API_CORS_ALLOWLIST",
     "CONFIG_ENCRYPTION_KEY",
     "CONFIG_OVERRIDES_FILE",

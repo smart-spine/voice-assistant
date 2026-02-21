@@ -3,7 +3,6 @@ const { OpenAIResponder } = require("../openai-service");
 const { launchBrowser } = require("../meet-controller");
 const { createTransportAdapter } = require("../transports/transport-factory");
 const { BridgeRealtimeAdapter } = require("../transports/bridge-realtime-adapter");
-const { OpenAiSttTurnStream } = require("../openai-stt-service");
 const { SemanticTurnDetector } = require("../semantic-turn-detector");
 const {
   extractCommandByWakeWord,
@@ -329,9 +328,8 @@ class BotSession {
     this.isAssistantAudioPlaying = false;
     this.lastAssistantAudioAtMs = 0;
     this.bridgeBindings = null;
-    this.openAiSttStream = null;
     this.realtimeAdapter = null;
-    this.requestedVoicePipelineMode = "hybrid";
+    this.requestedVoicePipelineMode = "realtime";
     this.activeVoicePipelineMode = "";
     this.realtimeResponseInProgress = false;
     this.realtimeCurrentResponseId = "";
@@ -365,8 +363,7 @@ class BotSession {
       voicePipelineMode:
         this.activeVoicePipelineMode ||
         this.requestedVoicePipelineMode ||
-        this.sessionConfig?.voicePipelineMode ||
-        "hybrid",
+        "realtime",
       sttSource: this.activeSttSource || this.sessionConfig?.openaiSttSource || null,
       hasProjectContext: Boolean(this.sessionConfig?.projectContext),
       queueSize: this.queue.length,
@@ -406,10 +403,8 @@ class BotSession {
     this.isAssistantAudioPlaying = false;
     this.lastAssistantAudioAtMs = 0;
     this.bridgeBindings = null;
-    this.openAiSttStream = null;
     this.realtimeAdapter = null;
-    this.requestedVoicePipelineMode =
-      this.sessionConfig?.voicePipelineMode || "hybrid";
+    this.requestedVoicePipelineMode = "realtime";
     this.activeVoicePipelineMode = "";
     this.realtimeResponseInProgress = false;
     this.realtimeCurrentResponseId = "";
@@ -447,7 +442,7 @@ class BotSession {
     this.stoppedAt = null;
     this.lastError = null;
     this.trace(
-      `Session config: source=${this.sessionConfig.openaiSttSource}, sttModel=${this.sessionConfig.openaiSttModel}, voicePipelineMode=${this.requestedVoicePipelineMode}, turnSilenceMs=${this.sessionConfig.turnSilenceMs}, continuationSilenceMs=${this.sessionConfig.turnContinuationSilenceMs}, postTurnDelayMs=${this.sessionConfig.postTurnResponseDelayMs}, bargeInEnabled=${this.sessionConfig.bargeInEnabled}, softInterruptEnabled=${this.sessionConfig.softInterruptEnabled}.`
+      `Session config: voiceCoreMode=${this.sessionConfig.voiceCoreMode}, model=${this.sessionConfig.openaiRealtimeModel}, turnDetection=${this.sessionConfig.openaiRealtimeTurnDetection}, vadSilenceMs=${this.sessionConfig.openaiRealtimeVadSilenceMs}, bargeInMinMs=${this.sessionConfig.bargeInMinMs}, semanticEotEnabled=${this.sessionConfig.semanticEotEnabled}.`
     );
 
     this.info("Starting bridge server...");
@@ -718,9 +713,6 @@ class BotSession {
       this.browser = await launchBrowser(this.sessionConfig);
 
       this.bridgeBindings = {
-        onAudioChunk: (payload) => {
-          this.openAiSttStream?.enqueueChunk(payload);
-        },
         onBridgeLog: (line) => this.bridge(line),
         onBridgeEvent: handleBridgeEvent
       };
@@ -763,127 +755,49 @@ class BotSession {
         );
       }
 
-      const buildBridgeSttOptions = () => ({
-        chunkMs: this.sessionConfig.openaiSttChunkMs,
-        partialsEnabled: this.sessionConfig.openaiSttPartialsEnabled,
-        partialEmitMs: this.sessionConfig.openaiSttPartialEmitMs,
-        mimeType: this.sessionConfig.openaiSttMimeType,
-        deviceId: this.sessionConfig.openaiSttDeviceId,
-        deviceLabel: this.sessionConfig.openaiSttDeviceLabel,
-        preferLoopback: this.sessionConfig.openaiSttPreferLoopback,
-        audioBitsPerSecond: this.sessionConfig.openaiSttAudioBitsPerSecond,
-        minSignalPeak: this.sessionConfig.openaiSttMinSignalPeak,
-        vadThreshold: this.sessionConfig.openaiSttVadThreshold,
-        hangoverMs: this.sessionConfig.openaiSttHangoverMs,
-        segmentMinMs: this.sessionConfig.openaiSttSegmentMinMs,
-        segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs,
-        bargeInMinMs: this.sessionConfig.bargeInMinMs
+      this.info(
+        `Starting realtime voice pipeline via server voice-core (model=${this.sessionConfig.openaiRealtimeModel}, turnDetection=${this.sessionConfig.openaiRealtimeTurnDetection}).`
+      );
+      this.realtimeAdapter = new BridgeRealtimeAdapter({
+        transportAdapter: this.transportAdapter,
+        model: this.sessionConfig.openaiRealtimeModel,
+        language: this.sessionConfig.openaiSttLanguage,
+        instructions: sessionSystemPrompt,
+        voice: this.sessionConfig.openaiTtsVoice,
+        temperature: this.sessionConfig.openaiTemperature,
+        connectTimeoutMs: this.sessionConfig.openaiRealtimeConnectTimeoutMs,
+        inputTranscriptionModel:
+          this.sessionConfig.openaiRealtimeInputTranscriptionModel,
+        turnDetection: this.sessionConfig.openaiRealtimeTurnDetection,
+        turnDetectionEagerness:
+          this.sessionConfig.openaiRealtimeTurnEagerness,
+        vadThreshold: this.sessionConfig.openaiRealtimeVadThreshold,
+        vadSilenceMs: this.sessionConfig.openaiRealtimeVadSilenceMs,
+        vadPrefixPaddingMs: this.sessionConfig.openaiRealtimeVadPrefixPaddingMs,
+        interruptResponseOnTurn:
+          this.sessionConfig.openaiRealtimeInterruptResponseOnTurn,
+        bargeInMinMs: this.sessionConfig.bargeInMinMs,
+        controlApiHost: this.sessionConfig.controlApiHost,
+        controlApiPort: this.sessionConfig.controlApiPort,
+        controlApiToken: this.sessionConfig.controlApiToken,
+        inputDeviceId: this.sessionConfig.openaiSttDeviceId,
+        inputDeviceLabel: this.sessionConfig.openaiSttDeviceLabel,
+        inputPreferLoopback: this.sessionConfig.openaiSttPreferLoopback,
+        onLog: (line) => this.bridge(line)
       });
+      await this.realtimeAdapter.start();
 
-      const requestedRealtime = this.requestedVoicePipelineMode === "realtime";
-      if (requestedRealtime) {
-        try {
-          this.info(
-            `Starting realtime voice pipeline via bridge WebRTC (model=${this.sessionConfig.openaiRealtimeModel}, turnDetection=${this.sessionConfig.openaiRealtimeTurnDetection}).`
-          );
-          this.realtimeAdapter = new BridgeRealtimeAdapter({
-            transportAdapter: this.transportAdapter,
-            model: this.sessionConfig.openaiRealtimeModel,
-            language: this.sessionConfig.openaiSttLanguage,
-            instructions: sessionSystemPrompt,
-            voice: this.sessionConfig.openaiTtsVoice,
-            temperature: this.sessionConfig.openaiTemperature,
-            connectTimeoutMs: this.sessionConfig.openaiRealtimeConnectTimeoutMs,
-            inputTranscriptionModel:
-              this.sessionConfig.openaiRealtimeInputTranscriptionModel,
-            turnDetection: this.sessionConfig.openaiRealtimeTurnDetection,
-            turnDetectionEagerness:
-              this.sessionConfig.openaiRealtimeTurnEagerness,
-            vadThreshold: this.sessionConfig.openaiRealtimeVadThreshold,
-            vadSilenceMs: this.sessionConfig.openaiRealtimeVadSilenceMs,
-            vadPrefixPaddingMs: this.sessionConfig.openaiRealtimeVadPrefixPaddingMs,
-            interruptResponseOnTurn:
-              this.sessionConfig.openaiRealtimeInterruptResponseOnTurn,
-            bargeInMinMs: this.sessionConfig.bargeInMinMs,
-            inputDeviceId: this.sessionConfig.openaiSttDeviceId,
-            inputDeviceLabel: this.sessionConfig.openaiSttDeviceLabel,
-            inputPreferLoopback: this.sessionConfig.openaiSttPreferLoopback,
-            onLog: (line) => this.bridge(line)
-          });
-          await this.realtimeAdapter.start();
-
-          this.activeVoicePipelineMode = "realtime";
-          this.activeSttSource = "bridge-webrtc-realtime";
-          this.openAiSttStream = null;
-          this.info(
-            "Realtime voice pipeline is active (browser WebRTC direct track)."
-          );
-          if (normalizeText(this.sessionConfig?.wakeWord)) {
-            this.warn(
-              "WAKE_WORD filtering is not enforced in realtime mode; apply wake-word behavior in system prompt if needed."
-            );
-          }
-        } catch (realtimeError) {
-          const message = realtimeError?.message || realtimeError;
-          if (!this.sessionConfig.voicePipelineFallbackToHybrid) {
-            throw realtimeError;
-          }
-
-          this.warn(
-            `Realtime pipeline failed (${message}); falling back to hybrid STT->LLM->TTS pipeline.`
-          );
-          if (this.realtimeAdapter) {
-            try {
-              await this.realtimeAdapter.stop();
-            } catch (_) {
-              // Ignore realtime adapter shutdown errors during fallback.
-            }
-            this.realtimeAdapter = null;
-          }
-        }
-      }
-
-      if (this.activeVoicePipelineMode !== "realtime") {
-        const openAiTurnSilenceMs = Math.max(
-          150,
-          Number(this.sessionConfig.turnSilenceMs || 700)
+      this.activeVoicePipelineMode = "realtime";
+      this.activeSttSource = "voice-core";
+      this.info("Realtime voice pipeline is active (server-core).");
+      if (normalizeText(this.sessionConfig?.wakeWord)) {
+        this.warn(
+          "WAKE_WORD filtering is not enforced in realtime mode; apply wake-word behavior in system prompt if needed."
         );
-        this.openAiSttStream = new OpenAiSttTurnStream({
-          turnSilenceMs: openAiTurnSilenceMs,
-          apiKey: this.sessionConfig.openaiApiKey,
-          model: this.sessionConfig.openaiSttModel,
-          language: this.sessionConfig.openaiSttLanguage,
-          timeoutMs: this.sessionConfig.openaiSttTimeoutMs,
-          maxRetries: this.sessionConfig.openaiSttMaxRetries,
-          minChunkBytes: this.sessionConfig.openaiSttMinChunkBytes,
-          maxQueueChunks: this.sessionConfig.openaiSttMaxQueueChunks,
-          onEvent: handleBridgeEvent,
-          onLog: (line) => this.bridge(line)
-        });
-        this.info(
-          `OpenAI STT turn settings: turnSilenceMs=${openAiTurnSilenceMs}, vadThreshold=${this.sessionConfig.openaiSttVadThreshold}, hangoverMs=${this.sessionConfig.openaiSttHangoverMs}, segmentMinMs=${this.sessionConfig.openaiSttSegmentMinMs}, segmentMaxMs=${this.sessionConfig.openaiSttSegmentMaxMs}, partialsEnabled=${this.sessionConfig.openaiSttPartialsEnabled}, partialEmitMs=${this.sessionConfig.openaiSttPartialEmitMs}.`
-        );
-        const started = await this.transportAdapter.startStt(buildBridgeSttOptions());
-        if (!started) {
-          throw new Error(
-            "OpenAI STT audio capture could not be started in bridge page."
-          );
-        }
-        this.info(
-          `OpenAI STT turn streaming enabled (model=${this.sessionConfig.openaiSttModel}).`
-        );
-        this.activeVoicePipelineMode = "hybrid";
-        this.activeSttSource = "bridge-input";
       }
 
       this.status = "running";
-      if (this.activeVoicePipelineMode === "realtime") {
-        this.info("Bot is running in realtime mode.");
-      } else {
-        this.info(
-          "Bot is running. If WAKE_WORD is set, only phrases containing it will be processed."
-        );
-      }
+      this.info("Bot is running in realtime mode.");
       this.startJoinStateMonitor({ responder });
       void this.runAutoGreeting({ responder });
       return this.getStatus();
@@ -915,14 +829,6 @@ class BotSession {
         this.clearSoftInterrupt({ resumeAudio: true });
         await this.interruptAssistantRun("session-stop");
         await this.stopJoinStateMonitor();
-        if (this.openAiSttStream) {
-          try {
-            this.openAiSttStream.stop({ flush: false });
-          } catch (_) {
-            // Ignore OpenAI STT stop errors.
-          }
-          this.openAiSttStream = null;
-        }
         if (this.realtimeAdapter) {
           try {
             await this.realtimeAdapter.stop();
@@ -943,7 +849,7 @@ class BotSession {
         this.isAssistantAudioPlaying = false;
         this.lastAssistantAudioAtMs = 0;
         this.bridgeBindings = null;
-        this.requestedVoicePipelineMode = "hybrid";
+        this.requestedVoicePipelineMode = "realtime";
         this.activeVoicePipelineMode = "";
         this.realtimeResponseInProgress = false;
         this.realtimeCurrentResponseId = "";
@@ -1029,7 +935,7 @@ class BotSession {
         this.bridgePage = null;
         this.meetPage = null;
         this.meetJoinState = null;
-        this.requestedVoicePipelineMode = "hybrid";
+        this.requestedVoicePipelineMode = "realtime";
         this.activeVoicePipelineMode = "";
         this.realtimeResponseInProgress = false;
         this.realtimeCurrentResponseId = "";
@@ -1518,7 +1424,10 @@ class BotSession {
           createResponse: true
         });
         if (!delivered) {
-          throw new Error("Realtime auto greeting was not delivered.");
+          this.trace(
+            "Auto greeting skipped: realtime transport does not support direct text-turn injection."
+          );
+          return;
         }
       } else {
         await this.respondToCommand({
@@ -1782,33 +1691,15 @@ class BotSession {
 
     try {
       this.bridgePage = await this.transportAdapter.reopenBridge();
-      if (this.isRealtimePipelineActive()) {
-        if (this.realtimeAdapter) {
-          try {
-            await this.realtimeAdapter.stop();
-          } catch (_) {
-            // Ignore best-effort realtime restart stop errors.
-          }
-          await this.realtimeAdapter.start();
-        }
-      } else {
-        await this.transportAdapter.startStt({
-          chunkMs: this.sessionConfig.openaiSttChunkMs,
-          partialsEnabled: this.sessionConfig.openaiSttPartialsEnabled,
-          partialEmitMs: this.sessionConfig.openaiSttPartialEmitMs,
-          mimeType: this.sessionConfig.openaiSttMimeType,
-          deviceId: this.sessionConfig.openaiSttDeviceId,
-          deviceLabel: this.sessionConfig.openaiSttDeviceLabel,
-          preferLoopback: this.sessionConfig.openaiSttPreferLoopback,
-          audioBitsPerSecond: this.sessionConfig.openaiSttAudioBitsPerSecond,
-          minSignalPeak: this.sessionConfig.openaiSttMinSignalPeak,
-          vadThreshold: this.sessionConfig.openaiSttVadThreshold,
-          hangoverMs: this.sessionConfig.openaiSttHangoverMs,
-          segmentMinMs: this.sessionConfig.openaiSttSegmentMinMs,
-          segmentMaxMs: this.sessionConfig.openaiSttSegmentMaxMs,
-          bargeInMinMs: this.sessionConfig.bargeInMinMs
-        });
+      if (!this.realtimeAdapter) {
+        throw new Error("Realtime adapter is not initialized.");
       }
+      try {
+        await this.realtimeAdapter.stop();
+      } catch (_) {
+        // Ignore best-effort realtime restart stop errors.
+      }
+      await this.realtimeAdapter.start();
       this.setBridgeTtsDucking(this.softInterruptActive);
 
       this.info("Bridge page recovered.");

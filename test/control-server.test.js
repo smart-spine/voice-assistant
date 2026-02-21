@@ -245,7 +245,8 @@ test("voice websocket rejects unauthenticated clients and accepts signed tickets
 
   const welcome = await new Promise((resolve, reject) => {
     const ws = new WebSocket(
-      `${baseWs}/ws/voice?ticket=${encodeURIComponent(ticketPayload.data.ticket)}`
+      `${baseWs}/ws/voice?ticket=${encodeURIComponent(ticketPayload.data.ticket)}`,
+      "voice.core.v1"
     );
     const timeout = setTimeout(() => {
       ws.close();

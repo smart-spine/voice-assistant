@@ -295,6 +295,101 @@ function coerceBoolean(value, fallback = false) {
   return fallback;
 }
 
+const VOICE_CORE_PROTOCOL = "voice.core.v1";
+const VOICE_CORE_VERSION = 1;
+const VOICE_BINARY_HEADER_BYTES = 16;
+const VOICE_AUDIO_KIND_INPUT = 1;
+const VOICE_AUDIO_KIND_OUTPUT = 2;
+const VOICE_AUDIO_CODEC_PCM16 = 1;
+
+function createVoiceMsgId(prefix = "ui") {
+  return `${String(prefix || "ui")}_${Date.now()}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+}
+
+function buildVoiceCoreEnvelope({ type, payload = {}, sessionId = "", replyTo = null } = {}) {
+  return {
+    v: VOICE_CORE_VERSION,
+    type: String(type || "").trim().toLowerCase(),
+    msg_id: createVoiceMsgId("ui"),
+    session_id: String(sessionId || "").trim() || undefined,
+    reply_to: String(replyTo || "").trim() || undefined,
+    ts_ms: Date.now(),
+    payload: payload && typeof payload === "object" ? payload : {}
+  };
+}
+
+function decodeVoiceBinaryAudioFrame(data) {
+  const bytes =
+    data instanceof Uint8Array
+      ? data
+      : data instanceof ArrayBuffer
+        ? new Uint8Array(data)
+        : new Uint8Array(0);
+  if (bytes.byteLength < VOICE_BINARY_HEADER_BYTES) {
+    throw new Error("Binary frame is too short.");
+  }
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const version = view.getUint8(0);
+  if (version !== VOICE_CORE_VERSION) {
+    throw new Error(`Unsupported binary frame version: ${version}.`);
+  }
+
+  const kindCode = view.getUint8(1);
+  const codecCode = view.getUint16(2, false);
+  const seq = view.getUint32(4, false);
+  const sampleRateHz = view.getUint32(8, false);
+  const channels = view.getUint8(12);
+
+  if (codecCode !== VOICE_AUDIO_CODEC_PCM16) {
+    throw new Error(`Unsupported audio codec code: ${codecCode}.`);
+  }
+
+  return {
+    kindCode,
+    codecCode,
+    seq,
+    sampleRateHz: Math.max(8000, Number(sampleRateHz) || 24000),
+    channels: Math.max(1, Number(channels) || 1),
+    bytes: bytes.subarray(VOICE_BINARY_HEADER_BYTES)
+  };
+}
+
+function encodeVoiceInputBinaryAudioFrame({
+  seq = 0,
+  sampleRateHz = 24000,
+  channels = 1,
+  pcmBytes
+} = {}) {
+  const bytes =
+    pcmBytes instanceof Uint8Array
+      ? pcmBytes
+      : pcmBytes instanceof ArrayBuffer
+        ? new Uint8Array(pcmBytes)
+        : new Uint8Array(0);
+  if (!bytes.byteLength) {
+    return null;
+  }
+
+  const header = new ArrayBuffer(VOICE_BINARY_HEADER_BYTES);
+  const view = new DataView(header);
+  view.setUint8(0, VOICE_CORE_VERSION);
+  view.setUint8(1, VOICE_AUDIO_KIND_INPUT);
+  view.setUint16(2, VOICE_AUDIO_CODEC_PCM16, false);
+  view.setUint32(4, Number(seq) >>> 0, false);
+  view.setUint32(8, Math.max(1, Math.trunc(Number(sampleRateHz) || 24000)) >>> 0, false);
+  view.setUint8(12, Math.max(1, Math.min(2, Math.trunc(Number(channels) || 1))));
+  view.setUint8(13, 0);
+  view.setUint16(14, 0, false);
+
+  const binary = new Uint8Array(VOICE_BINARY_HEADER_BYTES + bytes.byteLength);
+  binary.set(new Uint8Array(header), 0);
+  binary.set(bytes, VOICE_BINARY_HEADER_BYTES);
+  return binary.buffer;
+}
+
 export default function HomePage() {
   const [activeTab, setActiveTab] = useState(TAB_DASHBOARD);
 
@@ -331,11 +426,11 @@ export default function HomePage() {
   const [voiceConversation, setVoiceConversation] = useState([]);
   const [voiceDebugLogs, setVoiceDebugLogs] = useState([]);
   const [voiceDebugAutoScroll, setVoiceDebugAutoScroll] = useState(true);
-  const [voiceEchoGuardEnabled, setVoiceEchoGuardEnabled] = useState(true);
   const [voiceMetrics, setVoiceMetrics] = useState({
     sttPartialMs: null,
     sttFinalMs: null,
-    firstAudioMs: null
+    firstAudioMs: null,
+    turnId: ""
   });
   const [voiceLevel, setVoiceLevel] = useState(0);
   const [voiceBusy, setVoiceBusy] = useState({
@@ -371,23 +466,17 @@ export default function HomePage() {
   const voiceAudioContextRef = useRef(null);
   const voiceAnalyserTimerRef = useRef(null);
   const voiceAudioPlaybackChainRef = useRef(Promise.resolve());
-  const voiceUserSpeechStartRef = useRef(0);
-  const voiceLastUserFinalAtRef = useRef(0);
-  const voiceFirstAudioAfterFinalRef = useRef(false);
-  const voiceLastAutoCommitAtRef = useRef(0);
-  const voiceLocalSpeechActiveRef = useRef(false);
-  const voiceLocalSpeechStartedAtRef = useRef(0);
-  const voiceLocalLastSpeechAtRef = useRef(0);
+  const voiceSessionIdRef = useRef("");
+  const voiceInputSeqRef = useRef(0);
+  const voiceHasPendingInputRef = useRef(false);
   const voicePlaybackActiveCountRef = useRef(0);
-  const voiceLastPlaybackEndedAtRef = useRef(0);
-  const voiceEchoDropsRef = useRef(0);
-  const voiceBackpressureDropsRef = useRef(0);
+  const voiceCurrentAssistantResponseIdRef = useRef("");
+  const voicePlaybackGenerationRef = useRef(0);
+  const voiceActiveSourceNodesRef = useRef(new Set());
+  const voiceActiveHtmlAudioRef = useRef(new Set());
   const voiceLastPartialLogAtRef = useRef(0);
   const voiceLastAssistantPartialLogAtRef = useRef(0);
   const voiceLastChunkLogAtRef = useRef(0);
-  const voiceLastTtsChunkAtRef = useRef(0);
-  const voiceHasUncommittedAudioRef = useRef(false);
-  const voiceLastAudioChunkAtRef = useRef(0);
   const voicePlaybackChunkBufferRef = useRef([]);
   const voicePlaybackFlushTimerRef = useRef(null);
   const voicePlaybackContextRef = useRef(null);
@@ -535,16 +624,13 @@ export default function HomePage() {
     }
 
     voicePlaybackActiveCountRef.current = 0;
-    voiceLastPlaybackEndedAtRef.current = 0;
-    voiceEchoDropsRef.current = 0;
-    voiceBackpressureDropsRef.current = 0;
-    voiceLastTtsChunkAtRef.current = 0;
-    voiceHasUncommittedAudioRef.current = false;
-    voiceLastAudioChunkAtRef.current = 0;
-    voiceLocalSpeechActiveRef.current = false;
-    voiceLocalSpeechStartedAtRef.current = 0;
-    voiceLocalLastSpeechAtRef.current = 0;
-    voiceLastAutoCommitAtRef.current = 0;
+    voiceInputSeqRef.current = 0;
+    voiceHasPendingInputRef.current = false;
+    voiceCurrentAssistantResponseIdRef.current = "";
+    voiceSessionIdRef.current = "";
+    voicePlaybackGenerationRef.current += 1;
+    voiceActiveSourceNodesRef.current.clear();
+    voiceActiveHtmlAudioRef.current.clear();
 
     if (voicePlaybackFlushTimerRef.current) {
       clearTimeout(voicePlaybackFlushTimerRef.current);
@@ -569,14 +655,36 @@ export default function HomePage() {
     setVoiceOrbLevel(0);
   }, [teardownVoiceAnalyser]);
 
-  const sendVoiceMessage = useCallback((payload) => {
+  const sendVoiceEnvelope = useCallback((type, payload = {}, { replyTo = null } = {}) => {
     const socket = voiceSocketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return false;
     }
 
     try {
-      socket.send(JSON.stringify(payload));
+      const envelope = buildVoiceCoreEnvelope({
+        type,
+        payload,
+        sessionId: voiceSessionIdRef.current,
+        replyTo
+      });
+      socket.send(JSON.stringify(envelope));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }, []);
+
+  const sendVoiceBinaryFrame = useCallback((binaryFrame) => {
+    const socket = voiceSocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    if (!(binaryFrame instanceof ArrayBuffer)) {
+      return false;
+    }
+    try {
+      socket.send(binaryFrame);
       return true;
     } catch (_) {
       return false;
@@ -617,19 +725,22 @@ export default function HomePage() {
         return;
       }
 
+      const generation = voicePlaybackGenerationRef.current;
       const normalizedFormat = String(format || "pcm16").trim().toLowerCase();
       const markPlaybackStart = () => {
+        if (generation !== voicePlaybackGenerationRef.current) {
+          return false;
+        }
         voicePlaybackActiveCountRef.current += 1;
-        voiceLastTtsChunkAtRef.current = Date.now();
         setVoicePlaybackActive(true);
         setVoiceAssistantSpeaking(true);
+        return true;
       };
 
       const markPlaybackEnd = () => {
         const nextActive = Math.max(0, voicePlaybackActiveCountRef.current - 1);
         voicePlaybackActiveCountRef.current = nextActive;
         if (nextActive === 0) {
-          voiceLastPlaybackEndedAtRef.current = Date.now();
           setVoicePlaybackActive(false);
         }
       };
@@ -640,15 +751,18 @@ export default function HomePage() {
         const resolvedSampleRate = Math.max(8000, Number(sampleRate) || 24000);
         if (samples.length > 0) {
           const playbackContext = await ensureVoicePlaybackContext();
-          if (playbackContext) {
-            markPlaybackStart();
+          if (playbackContext && markPlaybackStart()) {
             await new Promise((resolve) => {
               let done = false;
+              let sourceNode = null;
               const finish = () => {
                 if (done) {
                   return;
                 }
                 done = true;
+                if (sourceNode) {
+                  voiceActiveSourceNodesRef.current.delete(sourceNode);
+                }
                 markPlaybackEnd();
                 resolve();
               };
@@ -660,10 +774,11 @@ export default function HomePage() {
                   resolvedSampleRate
                 );
                 audioBuffer.copyToChannel(samples, 0, 0);
-                const sourceNode = playbackContext.createBufferSource();
+                sourceNode = playbackContext.createBufferSource();
                 sourceNode.buffer = audioBuffer;
                 sourceNode.connect(playbackContext.destination);
                 sourceNode.onended = finish;
+                voiceActiveSourceNodesRef.current.add(sourceNode);
 
                 const currentTime = playbackContext.currentTime;
                 const startAt = Math.max(
@@ -671,6 +786,10 @@ export default function HomePage() {
                   voicePlaybackScheduledAtRef.current || currentTime
                 );
                 voicePlaybackScheduledAtRef.current = startAt + audioBuffer.duration;
+                if (generation !== voicePlaybackGenerationRef.current) {
+                  finish();
+                  return;
+                }
                 sourceNode.start(startAt);
 
                 const fallbackMs =
@@ -694,11 +813,14 @@ export default function HomePage() {
         blob = new Blob([bytes], { type: audioMimeFromFormat(normalizedFormat) });
       }
 
-      markPlaybackStart();
+      if (!markPlaybackStart()) {
+        return;
+      }
 
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
       audio.preload = "auto";
+      voiceActiveHtmlAudioRef.current.add(audio);
 
       if (voiceSelectedOutputId && typeof audio.setSinkId === "function") {
         try {
@@ -716,6 +838,7 @@ export default function HomePage() {
             return;
           }
           done = true;
+          voiceActiveHtmlAudioRef.current.delete(audio);
           markPlaybackEnd();
           URL.revokeObjectURL(url);
           callback();
@@ -753,6 +876,46 @@ export default function HomePage() {
     clearTimeout(voicePlaybackFlushTimerRef.current);
     voicePlaybackFlushTimerRef.current = null;
   }, []);
+
+  const stopAllVoicePlayback = useCallback(
+    (reason = "audio.clear") => {
+      clearVoicePlaybackFlushTimer();
+      voicePlaybackGenerationRef.current += 1;
+      voicePlaybackChunkBufferRef.current = [];
+      voicePlaybackScheduledAtRef.current = 0;
+      voiceAudioPlaybackChainRef.current = Promise.resolve();
+
+      const sourceNodes = [...voiceActiveSourceNodesRef.current];
+      voiceActiveSourceNodesRef.current.clear();
+      for (const sourceNode of sourceNodes) {
+        try {
+          sourceNode.onended = null;
+          sourceNode.stop();
+        } catch (_) {
+          // Ignore source stop races.
+        }
+      }
+
+      const htmlAudios = [...voiceActiveHtmlAudioRef.current];
+      voiceActiveHtmlAudioRef.current.clear();
+      for (const audio of htmlAudios) {
+        try {
+          audio.pause();
+          audio.currentTime = 0;
+          audio.src = "";
+          audio.load();
+        } catch (_) {
+          // Ignore audio teardown races.
+        }
+      }
+
+      voicePlaybackActiveCountRef.current = 0;
+      setVoicePlaybackActive(false);
+      setVoiceAssistantSpeaking(false);
+      appendVoiceDebugLog("event", `playback cleared (${String(reason || "unknown")})`);
+    },
+    [appendVoiceDebugLog, clearVoicePlaybackFlushTimer]
+  );
 
   const flushVoicePlaybackBuffer = useCallback(
     ({ force = false } = {}) => {
@@ -895,96 +1058,73 @@ export default function HomePage() {
   }, []);
 
   const handleVoiceWsEvent = useCallback(
-    (event) => {
-      const type = String(event?.type || "").trim().toLowerCase();
-      if (!type) {
+    (incoming) => {
+      if (!incoming || typeof incoming !== "object") {
         return;
       }
 
-      if (type === "session_started") {
+      const type = String(incoming?.type || "").trim().toLowerCase();
+      if (!type) {
+        return;
+      }
+      const payload =
+        incoming?.payload && typeof incoming.payload === "object"
+          ? incoming.payload
+          : incoming;
+
+      const readMetric = (...values) => {
+        for (const value of values) {
+          const parsed = Number(value);
+          if (Number.isFinite(parsed) && parsed >= 0) {
+            return Math.round(parsed);
+          }
+        }
+        return null;
+      };
+
+      if (type === "welcome") {
+        appendVoiceDebugLog("event", "event: welcome");
+        return;
+      }
+
+      if (type === "session.started") {
+        const sessionId = String(payload?.session_id || incoming?.session_id || "").trim();
+        if (sessionId) {
+          voiceSessionIdRef.current = sessionId;
+        }
         setVoiceStatus("ready");
         appendVoiceDebugLog(
           "info",
-          `session started (model=${String(event?.model || "unknown")}, turn=${String(
-            event?.turn_detection || "n/a"
+          `session started (id=${sessionId || "unknown"}, model=${String(
+            payload?.model || "unknown"
           )})`
         );
         return;
       }
 
-      if (type === "session_state") {
-        const state = String(event?.state || "").trim().toLowerCase();
-        setVoiceStatus(state || "ready");
-        if (["stopped", "disconnected"].includes(state)) {
+      if (type === "session.state") {
+        const nextState = String(payload?.state || "").trim().toLowerCase() || "ready";
+        setVoiceStatus(nextState);
+        setVoiceUserSpeaking(nextState === "listening");
+        if (["stopped", "disconnected"].includes(nextState)) {
           setVoiceUserSpeaking(false);
           setVoiceAssistantSpeaking(false);
-          setVoicePlaybackActive(false);
+          stopAllVoicePlayback(`session.state:${nextState}`);
         }
         appendVoiceDebugLog(
-          state === "stopped" ? "warn" : "info",
-          `session state: ${state || "ready"}`
+          nextState === "stopped" ? "warn" : "info",
+          `session state: ${nextState}`
         );
         return;
       }
 
-      if (type === "vad") {
-        const vadState = String(event?.state || "").trim().toLowerCase();
-        if (vadState === "start") {
-          voiceUserSpeechStartRef.current = Date.now();
-          voiceFirstAudioAfterFinalRef.current = false;
-          setVoiceUserSpeaking(true);
-          voiceLocalSpeechActiveRef.current = true;
-          voiceLocalSpeechStartedAtRef.current = Date.now();
-          voiceLocalLastSpeechAtRef.current = Date.now();
-          appendVoiceDebugLog("event", "vad:start");
-        } else if (vadState === "stop") {
-          setVoiceUserSpeaking(false);
-          voiceLocalSpeechActiveRef.current = false;
-          appendVoiceDebugLog(
-            "event",
-            `vad:stop (speechMs=${Number(event?.speech_ms || event?.speechMs || 0) || 0})`
-          );
-
-          const speechMs = Number(event?.speech_ms || event?.speechMs || 0) || 0;
-          const now = Date.now();
-          const assistantPlaybackActive =
-            voicePlaybackActiveCountRef.current > 0 ||
-            now - voiceLastTtsChunkAtRef.current < 520;
-          if (
-            voiceRecording &&
-            speechMs >= 180 &&
-            !assistantPlaybackActive &&
-            voiceHasUncommittedAudioRef.current &&
-            now - voiceLastAutoCommitAtRef.current > 700
-          ) {
-            voiceLastAutoCommitAtRef.current = now;
-            const committed = sendVoiceMessage({
-              type: "commit",
-              create_response: true
-            });
-            if (committed) {
-              voiceHasUncommittedAudioRef.current = false;
-              appendVoiceDebugLog("event", "auto-commit on vad stop");
-            }
-          }
-        }
-        return;
-      }
-
-      if (type === "stt_partial") {
-        const text = String(event?.text || "").trim();
+      if (type === "stt.partial") {
+        const text = String(payload?.text || "").trim();
         if (!text) {
           return;
         }
         setVoiceUserPartial(text);
-
-        if (voiceUserSpeechStartRef.current && voiceMetrics.sttPartialMs == null) {
-          setVoiceMetrics((prev) => ({
-            ...prev,
-            sttPartialMs: Math.max(0, Date.now() - voiceUserSpeechStartRef.current)
-          }));
-        }
-
+        setVoiceUserSpeaking(true);
         const now = Date.now();
         if (now - voiceLastPartialLogAtRef.current >= 650) {
           voiceLastPartialLogAtRef.current = now;
@@ -993,123 +1133,119 @@ export default function HomePage() {
         return;
       }
 
-      if (type === "stt_final") {
-        const text = String(event?.text || "").trim();
+      if (type === "stt.final") {
+        const text = String(payload?.text || "").trim();
         if (!text) {
           return;
         }
-
         setVoiceUserPartial("");
+        setVoiceUserSpeaking(false);
         appendVoiceConversation("user", text, true);
-        voiceLastUserFinalAtRef.current = Date.now();
-        voiceFirstAudioAfterFinalRef.current = false;
-        voiceHasUncommittedAudioRef.current = false;
-
-        if (voiceUserSpeechStartRef.current) {
-          setVoiceMetrics((prev) => ({
-            ...prev,
-            sttFinalMs: Math.max(0, Date.now() - voiceUserSpeechStartRef.current),
-            firstAudioMs: null
-          }));
-        }
         appendVoiceDebugLog("info", `stt final: ${truncateText(text, 180)}`);
         return;
       }
 
-      if (type === "assistant_text") {
-        const text = String(event?.text || "").trim();
+      if (type === "assistant.text.delta") {
+        const text = String(payload?.text || "").trim();
         if (!text) {
           return;
         }
-
-        if (coerceBoolean(event?.is_final, false)) {
-          setVoiceAssistantPartial("");
-          appendVoiceConversation("assistant", text, true);
-          appendVoiceDebugLog("info", `assistant final: ${truncateText(text, 180)}`);
-        } else {
-          setVoiceAssistantPartial(text);
-          const now = Date.now();
-          if (now - voiceLastAssistantPartialLogAtRef.current >= 750) {
-            voiceLastAssistantPartialLogAtRef.current = now;
-            appendVoiceDebugLog("event", `assistant partial: ${truncateText(text, 120)}`);
-          }
-        }
-        return;
-      }
-
-      if (type === "tts_audio_chunk") {
-        voiceLastTtsChunkAtRef.current = Date.now();
-        setVoiceAssistantSpeaking(true);
-        if (
-          !voiceFirstAudioAfterFinalRef.current &&
-          voiceLastUserFinalAtRef.current > 0
-        ) {
-          voiceFirstAudioAfterFinalRef.current = true;
-          setVoiceMetrics((prev) => ({
-            ...prev,
-            firstAudioMs: Math.max(0, Date.now() - voiceLastUserFinalAtRef.current)
-          }));
-          appendVoiceDebugLog("info", "assistant audio: first chunk");
-        }
-
+        setVoiceAssistantPartial(text);
         const now = Date.now();
-        if (now - voiceLastChunkLogAtRef.current >= 1200) {
-          voiceLastChunkLogAtRef.current = now;
-          const chunkMs = estimateAudioChunkDurationMs({
-            audioBase64: event?.audio_base64 || event?.audioBase64 || "",
-            format: event?.format || "pcm16",
-            sampleRate: Number(event?.sample_rate || event?.sampleRate || 24000)
-          });
-          appendVoiceDebugLog(
-            "event",
-            `assistant audio chunk (format=${String(event?.format || "pcm16")}, ~${chunkMs}ms)`
-          );
+        if (now - voiceLastAssistantPartialLogAtRef.current >= 750) {
+          voiceLastAssistantPartialLogAtRef.current = now;
+          appendVoiceDebugLog("event", `assistant partial: ${truncateText(text, 120)}`);
         }
-
-        bufferVoicePlaybackChunk({
-          audioBase64: event?.audio_base64 || event?.audioBase64 || "",
-          format: event?.format || "pcm16",
-          sampleRate: Number(event?.sample_rate || event?.sampleRate || 24000)
-        });
         return;
       }
 
-      if (type === "assistant_state") {
-        const state = String(event?.state || "").trim().toLowerCase();
-        if (state) {
-          setVoiceStatus(state);
-          if (["speaking"].includes(state)) {
-            setVoiceAssistantSpeaking(true);
-          } else if (["done", "interrupted", "stopped", "idle", "ready"].includes(state)) {
-            setVoiceAssistantSpeaking(false);
+      if (type === "assistant.text.final") {
+        const text = String(payload?.text || "").trim();
+        if (!text) {
+          return;
+        }
+        setVoiceAssistantPartial("");
+        appendVoiceConversation("assistant", text, true);
+        appendVoiceDebugLog("info", `assistant final: ${truncateText(text, 180)}`);
+        return;
+      }
+
+      if (type === "assistant.state") {
+        const state = String(payload?.state || "").trim().toLowerCase();
+        if (!state) {
+          return;
+        }
+        if (state === "speaking") {
+          setVoiceAssistantSpeaking(true);
+          setVoiceStatus("speaking");
+          voiceCurrentAssistantResponseIdRef.current = String(payload?.response_id || "").trim();
+        } else if (["done", "interrupted", "stopped", "idle", "ready"].includes(state)) {
+          setVoiceAssistantSpeaking(false);
+          if (state === "interrupted") {
+            stopAllVoicePlayback("assistant.interrupted");
+          } else {
             flushVoicePlaybackBuffer({ force: true });
           }
-          appendVoiceDebugLog("info", `assistant state: ${state}`);
+          setVoiceStatus(state === "done" ? "ready" : state);
+          if (state === "done") {
+            voiceCurrentAssistantResponseIdRef.current = "";
+          }
+        } else if (state === "requested" || state === "thinking") {
+          setVoiceStatus(state);
         }
+        appendVoiceDebugLog("info", `assistant state: ${state}`);
         return;
       }
 
-      if (type === "input_committed") {
-        voiceHasUncommittedAudioRef.current = false;
+      if (type === "audio.committed") {
+        voiceHasPendingInputRef.current = false;
         appendVoiceDebugLog("event", "upstream input buffer committed");
         return;
       }
 
-      if (type === "input_rejected") {
+      if (type === "audio.clear") {
+        stopAllVoicePlayback(String(payload?.reason || "audio.clear"));
+        return;
+      }
+
+      if (type === "turn.eot") {
+        appendVoiceDebugLog(
+          "event",
+          `turn.eot (${String(payload?.reason || "vad_silence")}, delayMs=${
+            Number(payload?.delay_ms || 0) || 0
+          })`
+        );
+        return;
+      }
+
+      if (type === "metrics.tick") {
+        setVoiceMetrics((prev) => ({
+          ...prev,
+          sttPartialMs: readMetric(payload?.stt_partial_ms, payload?.sttPartialMs),
+          sttFinalMs: readMetric(payload?.stt_final_ms, payload?.sttFinalMs),
+          firstAudioMs: readMetric(payload?.first_audio_ms, payload?.firstAudioMs),
+          turnId: String(payload?.turn_id || payload?.turnId || prev.turnId || "").trim()
+        }));
+        return;
+      }
+
+      if (type === "warning") {
         appendVoiceDebugLog(
           "warn",
-          `input rejected (${String(event?.reason || "unknown")}): ${truncateText(
-            event?.text || "",
-            140
-          )}`
+          `warning: ${String(payload?.message || payload?.code || "voice warning")}`
         );
         return;
       }
 
       if (type === "error") {
-        const message = String(event?.message || "Voice session error.").trim();
+        const message = String(payload?.message || "Voice session error.").trim();
         appendVoiceDebugLog("error", `voice error: ${message}`);
         pushNotice("error", message);
+        return;
+      }
+
+      if (type === "pong") {
+        appendVoiceDebugLog("event", "pong");
         return;
       }
 
@@ -1118,12 +1254,9 @@ export default function HomePage() {
     [
       appendVoiceConversation,
       appendVoiceDebugLog,
-      bufferVoicePlaybackChunk,
       flushVoicePlaybackBuffer,
       pushNotice,
-      sendVoiceMessage,
-      voiceRecording,
-      voiceMetrics.sttPartialMs
+      stopAllVoicePlayback
     ]
   );
 
@@ -1202,19 +1335,14 @@ export default function HomePage() {
       setVoiceMetrics({
         sttPartialMs: null,
         sttFinalMs: null,
-        firstAudioMs: null
+        firstAudioMs: null,
+        turnId: ""
       });
-      voiceUserSpeechStartRef.current = 0;
-      voiceLastUserFinalAtRef.current = 0;
-      voiceFirstAudioAfterFinalRef.current = false;
-      voiceHasUncommittedAudioRef.current = false;
-      voiceLastAudioChunkAtRef.current = 0;
+      voiceHasPendingInputRef.current = false;
 
       appendVoiceDebugLog(
         "info",
-        `mic start (sampleRate=${Number(context.sampleRate) || "unknown"}, echoGuard=${
-          voiceEchoGuardEnabled ? "on" : "off"
-        })`
+        `mic start (sampleRate=${Number(context.sampleRate) || "unknown"})`
       );
 
       const processor = context.createScriptProcessor(2048, 1, 1);
@@ -1228,13 +1356,7 @@ export default function HomePage() {
             return;
           }
           if (ws.bufferedAmount > 2 * 1024 * 1024) {
-            voiceBackpressureDropsRef.current += 1;
-            if (voiceBackpressureDropsRef.current % 50 === 0) {
-              appendVoiceDebugLog(
-                "warn",
-                `audio backpressure: dropped ${voiceBackpressureDropsRef.current} chunks`
-              );
-            }
+            appendVoiceDebugLog("warn", "audio backpressure: frame skipped");
             return;
           }
 
@@ -1248,102 +1370,24 @@ export default function HomePage() {
             return;
           }
 
-          const rms = computeRms(normalized);
-          if (rms < 0.004) {
-            return;
-          }
-
-          const now = Date.now();
-          const isPlaybackActive = voicePlaybackActiveCountRef.current > 0;
-          const isRecentPlayback =
-            !isPlaybackActive &&
-            voiceLastPlaybackEndedAtRef.current > 0 &&
-            now - voiceLastPlaybackEndedAtRef.current < 260;
-          const assistantPlaybackActive =
-            isPlaybackActive || now - voiceLastTtsChunkAtRef.current < 420;
-
-          const speechGateRms = voiceEchoGuardEnabled ? 0.011 : 0.009;
-          const localHangoverMs = 240;
-          const minSpeechMsForCommit = 180;
-          const allowBargeInRms = 0.075;
-
-          const speechFrameDetected =
-            rms >= speechGateRms &&
-            (!assistantPlaybackActive || !voiceEchoGuardEnabled || rms >= allowBargeInRms);
-
-          if (speechFrameDetected) {
-            if (!voiceLocalSpeechActiveRef.current) {
-              voiceLocalSpeechActiveRef.current = true;
-              voiceLocalSpeechStartedAtRef.current = now;
-            }
-            voiceLocalLastSpeechAtRef.current = now;
-          } else if (voiceLocalSpeechActiveRef.current) {
-            const sinceLastSpeech = now - voiceLocalLastSpeechAtRef.current;
-            if (sinceLastSpeech > localHangoverMs) {
-              const speechMs = voiceLocalSpeechStartedAtRef.current
-                ? Math.max(0, now - voiceLocalSpeechStartedAtRef.current)
-                : 0;
-              voiceLocalSpeechActiveRef.current = false;
-              voiceLocalSpeechStartedAtRef.current = 0;
-              if (
-                speechMs >= minSpeechMsForCommit &&
-                !assistantPlaybackActive &&
-                voiceHasUncommittedAudioRef.current &&
-                now - voiceLastAutoCommitAtRef.current > 700
-              ) {
-                voiceLastAutoCommitAtRef.current = now;
-                const committed = sendVoiceMessage({
-                  type: "commit",
-                  create_response: true
-                });
-                if (committed) {
-                  voiceHasUncommittedAudioRef.current = false;
-                  appendVoiceDebugLog(
-                    "event",
-                    `auto-commit on local silence (${speechMs}ms speech)`
-                  );
-                }
-              }
-            }
-          }
-
-          const withinSpeechHangover =
-            voiceLocalSpeechActiveRef.current &&
-            now - voiceLocalLastSpeechAtRef.current <= localHangoverMs;
-          if (!speechFrameDetected && !withinSpeechHangover) {
-            return;
-          }
-
-          if (voiceEchoGuardEnabled) {
-            if (assistantPlaybackActive && rms < allowBargeInRms) {
-              voiceEchoDropsRef.current += 1;
-              if (voiceEchoDropsRef.current % 80 === 0) {
-                appendVoiceDebugLog(
-                  "warn",
-                  `echo guard: filtered ${voiceEchoDropsRef.current} low-level chunks`
-                );
-              }
-              return;
-            }
-            if (isRecentPlayback && rms < 0.022) {
-              return;
-            }
-          }
-
           const pcmBytes = float32ToPcm16Bytes(normalized);
           if (!pcmBytes.length) {
             return;
           }
 
-          voiceEchoDropsRef.current = 0;
-          voiceBackpressureDropsRef.current = 0;
-          const sent = sendVoiceMessage({
-            type: "audio_chunk",
-            audio_base64: bytesToBase64(pcmBytes)
+          voiceInputSeqRef.current += 1;
+          const binaryFrame = encodeVoiceInputBinaryAudioFrame({
+            seq: voiceInputSeqRef.current,
+            sampleRateHz: 24000,
+            channels: 1,
+            pcmBytes
           });
+          if (!binaryFrame) {
+            return;
+          }
+          const sent = sendVoiceBinaryFrame(binaryFrame);
           if (sent) {
-            voiceHasUncommittedAudioRef.current = true;
-            voiceLastAudioChunkAtRef.current = now;
+            voiceHasPendingInputRef.current = true;
           }
         } catch (_) {
           // Ignore per-chunk audio processing errors.
@@ -1370,8 +1414,7 @@ export default function HomePage() {
     appendVoiceDebugLog,
     ensureVoiceMedia,
     pushNotice,
-    sendVoiceMessage,
-    voiceEchoGuardEnabled
+    sendVoiceBinaryFrame
   ]);
 
   const stopVoiceRecording = useCallback(
@@ -1399,25 +1442,20 @@ export default function HomePage() {
 
         setVoiceRecording(false);
         setVoiceUserSpeaking(false);
-        voiceLocalSpeechActiveRef.current = false;
-        voiceLocalSpeechStartedAtRef.current = 0;
-        voiceLocalLastSpeechAtRef.current = 0;
         setVoiceLevel(0);
         appendVoiceDebugLog("info", `mic stop (commit=${commit ? "yes" : "no"})`);
 
         if (commit) {
-          const hasPendingAudio =
-            voiceHasUncommittedAudioRef.current &&
-            Date.now() - voiceLastAudioChunkAtRef.current < 20000;
+          const hasPendingAudio = voiceHasPendingInputRef.current;
           if (!hasPendingAudio) {
             appendVoiceDebugLog("event", "commit skipped: no pending audio");
           } else {
-            const committed = sendVoiceMessage({
-              type: "commit",
-              create_response: true
+            const committed = sendVoiceEnvelope("audio.commit", {
+              reason: "ui_manual_commit",
+              force_response: true
             });
             if (committed) {
-              voiceHasUncommittedAudioRef.current = false;
+              voiceHasPendingInputRef.current = false;
               appendVoiceDebugLog("event", "input committed + response requested");
             }
           }
@@ -1426,7 +1464,7 @@ export default function HomePage() {
         setVoiceBusy((prev) => ({ ...prev, stoppingMic: false }));
       }
     },
-    [appendVoiceDebugLog, sendVoiceMessage]
+    [appendVoiceDebugLog, sendVoiceEnvelope]
   );
 
   const disconnectVoiceSocket = useCallback(async () => {
@@ -1442,6 +1480,8 @@ export default function HomePage() {
 
     appendVoiceDebugLog("info", "voice websocket disconnected");
 
+    voiceSessionIdRef.current = "";
+    voiceHasPendingInputRef.current = false;
     setVoiceConnected(false);
     setVoiceStatus("disconnected");
     setVoiceUserPartial("");
@@ -1450,9 +1490,10 @@ export default function HomePage() {
     setVoiceAssistantSpeaking(false);
     setVoicePlaybackActive(false);
     setVoiceSettingsOpen(false);
+    stopAllVoicePlayback("manual_disconnect");
 
     await teardownVoiceMedia();
-  }, [appendVoiceDebugLog, teardownVoiceMedia]);
+  }, [appendVoiceDebugLog, stopAllVoicePlayback, teardownVoiceMedia]);
 
   const connectVoiceSocket = useCallback(async () => {
     if (voiceSocketRef.current && voiceSocketRef.current.readyState === WebSocket.OPEN) {
@@ -1479,7 +1520,8 @@ export default function HomePage() {
 
       const wsUrl = `${wsBaseUrl}${wsPath}?ticket=${encodeURIComponent(ticket)}`;
       appendVoiceDebugLog("info", `connecting websocket: ${wsBaseUrl}${wsPath}`);
-      const socket = new WebSocket(wsUrl);
+      const socket = new WebSocket(wsUrl, VOICE_CORE_PROTOCOL);
+      socket.binaryType = "arraybuffer";
 
       await new Promise((resolve, reject) => {
         let settled = false;
@@ -1507,16 +1549,72 @@ export default function HomePage() {
       });
 
       voiceSocketRef.current = socket;
+      voiceSessionIdRef.current = "";
+      voiceHasPendingInputRef.current = false;
       setVoiceConnected(true);
       setVoiceStatus("connected");
       appendVoiceDebugLog("info", "voice websocket connected");
 
-      socket.onmessage = (message) => {
+      socket.onmessage = async (message) => {
+        const data = message?.data;
+        if (data instanceof ArrayBuffer) {
+          try {
+            const frame = decodeVoiceBinaryAudioFrame(data);
+            if (frame.kindCode !== VOICE_AUDIO_KIND_OUTPUT || frame.bytes.byteLength === 0) {
+              return;
+            }
+
+            const now = Date.now();
+            if (now - voiceLastChunkLogAtRef.current >= 1200) {
+              voiceLastChunkLogAtRef.current = now;
+              appendVoiceDebugLog(
+                "event",
+                `assistant audio chunk (format=pcm16, ~${estimateAudioChunkDurationMs({
+                  audioBase64: bytesToBase64(frame.bytes),
+                  format: "pcm16",
+                  sampleRate: frame.sampleRateHz
+                })}ms)`
+              );
+            }
+            bufferVoicePlaybackChunk({
+              audioBase64: bytesToBase64(frame.bytes),
+              format: "pcm16",
+              sampleRate: frame.sampleRateHz
+            });
+          } catch (binaryError) {
+            appendVoiceDebugLog(
+              "warn",
+              `invalid binary audio frame: ${binaryError?.message || "decode failed"}`
+            );
+          }
+          return;
+        }
+
+        if (typeof Blob !== "undefined" && data instanceof Blob) {
+          try {
+            const raw = await data.arrayBuffer();
+            const frame = decodeVoiceBinaryAudioFrame(raw);
+            if (frame.kindCode !== VOICE_AUDIO_KIND_OUTPUT || frame.bytes.byteLength === 0) {
+              return;
+            }
+            bufferVoicePlaybackChunk({
+              audioBase64: bytesToBase64(frame.bytes),
+              format: "pcm16",
+              sampleRate: frame.sampleRateHz
+            });
+          } catch (blobError) {
+            appendVoiceDebugLog(
+              "warn",
+              `invalid blob audio frame: ${blobError?.message || "decode failed"}`
+            );
+          }
+          return;
+        }
+
         try {
-          const event = JSON.parse(String(message?.data || "{}"));
+          const event = JSON.parse(String(data || "{}"));
           handleVoiceWsEvent(event);
         } catch (err) {
-          // Ignore malformed messages.
           appendVoiceDebugLog(
             "warn",
             `invalid websocket payload: ${err?.message || "json parse failed"}`
@@ -1538,6 +1636,9 @@ export default function HomePage() {
         setVoiceAssistantSpeaking(false);
         setVoicePlaybackActive(false);
         setVoiceSettingsOpen(false);
+        voiceSessionIdRef.current = "";
+        voiceHasPendingInputRef.current = false;
+        stopAllVoicePlayback("ws_close");
       };
 
       socket.onerror = () => {
@@ -1545,17 +1646,22 @@ export default function HomePage() {
         pushNotice("error", "Voice websocket connection error.");
       };
 
-      sendVoiceMessage({
-        type: "start_session",
+      sendVoiceEnvelope("session.start", {
+        client: {
+          kind: "control-ui",
+          actor: "human",
+          protocol: VOICE_CORE_PROTOCOL
+        },
         language: "en-US",
-        turnDetection: "semantic_vad",
-        turnDetectionEagerness: "auto",
-        vadThreshold: 0.45,
-        vadSilenceMs: 280,
-        vadPrefixPaddingMs: 180,
-        interruptResponseOnTurn: false
+        openaiRealtimeTurnDetection: "semantic_vad",
+        openaiRealtimeTurnEagerness: "auto",
+        openaiRealtimeVadThreshold: 0.45,
+        openaiRealtimeVadSilenceMs: 280,
+        openaiRealtimeVadPrefixPaddingMs: 180,
+        openaiRealtimeInterruptResponseOnTurn: true,
+        openaiRealtimeUpstreamTurnDetectionEnabled: false
       });
-      appendVoiceDebugLog("event", "start_session sent");
+      appendVoiceDebugLog("event", "session.start sent");
 
       await loadVoiceDevices();
       pushNotice("success", "Voice bot connected.");
@@ -1568,11 +1674,13 @@ export default function HomePage() {
     }
   }, [
     appendVoiceDebugLog,
+    bufferVoicePlaybackChunk,
     disconnectVoiceSocket,
     handleVoiceWsEvent,
     loadVoiceDevices,
     pushNotice,
-    sendVoiceMessage
+    sendVoiceEnvelope,
+    stopAllVoicePlayback
   ]);
 
   const loadSettingsSchema = useCallback(async () => {
@@ -1690,11 +1798,8 @@ export default function HomePage() {
 
   useEffect(() => {
     const timer = setInterval(() => {
-      const now = Date.now();
-      const ttsRecentlyActive = now - voiceLastTtsChunkAtRef.current < 520;
       const playbackCurrentlyActive = voicePlaybackActiveCountRef.current > 0;
-      const assistantActive =
-        voiceAssistantSpeaking || playbackCurrentlyActive || ttsRecentlyActive;
+      const assistantActive = voiceAssistantSpeaking || playbackCurrentlyActive;
       const userActive = voiceUserSpeaking || (voiceRecording && voiceLevel > 0.05);
 
       const target = !voiceConnected
@@ -2242,7 +2347,14 @@ export default function HomePage() {
                   void startVoiceRecording();
                 }
               }}
-              disabled={!voiceConnected || voiceBusy.startMic || voiceBusy.stoppingMic}
+              disabled={
+                !voiceConnected ||
+                !["ready", "listening", "thinking", "speaking", "interrupted"].includes(
+                  String(voiceStatus || "").toLowerCase()
+                ) ||
+                voiceBusy.startMic ||
+                voiceBusy.stoppingMic
+              }
               aria-label={voiceRecording ? "Stop microphone" : "Start microphone"}
               title={voiceRecording ? "Stop microphone" : "Start microphone"}
             >
@@ -2282,17 +2394,6 @@ export default function HomePage() {
                     <option value="toggle">Toggle</option>
                     <option value="ptt">Push-to-talk</option>
                   </select>
-                </label>
-
-                <label className="checkbox voice-inline-check">
-                  <input
-                    type="checkbox"
-                    checked={voiceEchoGuardEnabled}
-                    onChange={(event) => {
-                      setVoiceEchoGuardEnabled(event.target.checked);
-                    }}
-                  />
-                  <span>Echo guard</span>
                 </label>
               </div>
 
@@ -2365,7 +2466,12 @@ export default function HomePage() {
             <div className="voice-ptt-wrap">
               <button
                 className="btn btn-ptt"
-                disabled={!voiceConnected}
+                disabled={
+                  !voiceConnected ||
+                  !["ready", "listening", "thinking", "speaking", "interrupted"].includes(
+                    String(voiceStatus || "").toLowerCase()
+                  )
+                }
                 onMouseDown={() => {
                   void startVoiceRecording();
                 }}
@@ -2393,6 +2499,7 @@ export default function HomePage() {
             <span>STT partial: {voiceMetrics.sttPartialMs == null ? "-" : `${voiceMetrics.sttPartialMs} ms`}</span>
             <span>STT final: {voiceMetrics.sttFinalMs == null ? "-" : `${voiceMetrics.sttFinalMs} ms`}</span>
             <span>First audio: {voiceMetrics.firstAudioMs == null ? "-" : `${voiceMetrics.firstAudioMs} ms`}</span>
+            <span>Turn: {voiceMetrics.turnId || "-"}</span>
           </div>
 
           <div className="voice-conversation">

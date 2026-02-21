@@ -16,18 +16,6 @@ class BaseTransportAdapter {
     throw new Error("reopenBridge() is not implemented for this transport adapter.");
   }
 
-  async startStt() {
-    throw new Error("startStt() is not implemented for this transport adapter.");
-  }
-
-  async stopStt() {
-    throw new Error("stopStt() is not implemented for this transport adapter.");
-  }
-
-  async playAudio() {
-    throw new Error("playAudio() is not implemented for this transport adapter.");
-  }
-
   async stopSpeaking() {
     throw new Error("stopSpeaking() is not implemented for this transport adapter.");
   }
@@ -36,25 +24,23 @@ class BaseTransportAdapter {
     return false;
   }
 
-  async startRealtime() {
-    throw new Error("startRealtime() is not implemented for this transport adapter.");
+  async startCoreWs() {
+    throw new Error("startCoreWs() is not implemented for this transport adapter.");
   }
 
-  async stopRealtime() {
+  async stopCoreWs() {
     return false;
   }
 
-  async realtimeCreateTextTurn() {
-    throw new Error(
-      "realtimeCreateTextTurn() is not implemented for this transport adapter."
-    );
-  }
-
-  async realtimeAppendSystemContext() {
+  async coreInterrupt() {
     return false;
   }
 
-  async realtimeInterrupt() {
+  async coreCreateTextTurn() {
+    return false;
+  }
+
+  async coreAppendSystemContext() {
     return false;
   }
 
